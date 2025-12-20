@@ -1,6 +1,6 @@
 # Agent Guidelines
 
-See [DESIGN.md](DESIGN.md) for architecture and design decisions.
+teslausb-ng is a Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb). See [DESIGN.md](DESIGN.md) for architecture and design decisions.
 
 ## Code Style
 

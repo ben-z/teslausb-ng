@@ -2,7 +2,7 @@
 
 ## Why Rewrite?
 
-The original bash implementation had:
+The [original TeslaUSB](https://github.com/marcone/teslausb) bash implementation had:
 
 1. **Race conditions**: `freespacemanager` deletes snapshots while `archiveloop` reads them
 2. **No reference counting**: Snapshots have no concept of "in use"
