@@ -114,17 +114,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
 
-    coord_config = CoordinatorConfig(
-        archive_delay=float(config.archive_delay),
-    )
-
     coordinator = Coordinator(
         fs=fs,
         snapshot_manager=snapshot_manager,
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
-        config=coord_config,
     )
 
     logger.info("Starting TeslaUSB coordinator")
@@ -137,17 +132,12 @@ def cmd_archive(args: argparse.Namespace) -> int:
     config = load_config(args)
     fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
 
-    coord_config = CoordinatorConfig(
-        archive_delay=0.0,  # No delay for manual archive
-    )
-
     coordinator = Coordinator(
         fs=fs,
         snapshot_manager=snapshot_manager,
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
-        config=coord_config,
     )
 
     success = coordinator.run_once()

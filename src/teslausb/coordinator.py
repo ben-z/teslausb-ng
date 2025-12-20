@@ -52,7 +52,6 @@ class CoordinatorConfig:
     """Configuration for the Coordinator."""
 
     # Timing
-    archive_delay: float = 20.0  # Seconds to wait before archiving after connection
     poll_interval: float = 5.0  # Seconds between archive reachability checks
     disconnect_poll_interval: float = 30.0  # Seconds between disconnect checks
     idle_timeout: float = 90.0  # Seconds to wait for idle before snapshot
@@ -211,7 +210,7 @@ class Coordinator:
     def _do_archive_cycle(self) -> bool:
         """Perform one archive cycle.
 
-        1. Wait for delay
+        1. Wait for idle (car stops writing)
         2. Ensure space is available
         3. Take snapshot
         4. Archive snapshot
@@ -221,16 +220,6 @@ class Coordinator:
             True if successful, False on error or stop
         """
         self._set_state(CoordinatorState.ARCHIVING)
-
-        # Wait archive delay
-        logger.info(f"Waiting {self.config.archive_delay}s before archiving")
-        if not self._wait_interruptible(self.config.archive_delay):
-            return False
-
-        # Check if still reachable after delay
-        if not self.backend.is_reachable():
-            logger.warning("Archive became unreachable during delay")
-            return False
 
         # Wait for car to stop writing (if enabled)
         if self.config.wait_for_idle and self.config.idle_detector:

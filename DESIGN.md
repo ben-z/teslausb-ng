@@ -174,7 +174,6 @@ Environment variables (compatible with original):
 - `ARCHIVE_SYSTEM` - "rclone" or "none"
 - `RCLONE_DRIVE` - rclone remote name
 - `RCLONE_PATH` - Path within remote
-- `ARCHIVE_DELAY` - Seconds to wait before archiving
 
 ## Testing
 

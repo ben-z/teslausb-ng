@@ -86,7 +86,6 @@ class TestConfig:
 
         assert config.cam_size == 40 * GB
         assert config.music_size == 0
-        assert config.archive_delay == 20
         assert config.reserve == 10 * GB
 
     def test_derived_paths(self):
@@ -158,7 +157,7 @@ class TestLoadFromEnv:
         # Clear relevant env vars
         env_vars = [
             "CAM_SIZE", "MUSIC_SIZE", "ARCHIVE_SYSTEM",
-            "ARCHIVE_DELAY", "ARCHIVE_RECENTCLIPS",
+            "ARCHIVE_RECENTCLIPS",
         ]
         old_values = {k: os.environ.pop(k, None) for k in env_vars}
 

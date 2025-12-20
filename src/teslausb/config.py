@@ -100,9 +100,6 @@ class Config:
     lightshow_size: int = 0
     boombox_size: int = 0
 
-    # Timing
-    archive_delay: int = 20  # seconds
-
     # Space management
     reserve: int = 10 * GB
 
@@ -165,7 +162,6 @@ def load_from_env() -> Config:
     - CAM_SIZE, MUSIC_SIZE, LIGHTSHOW_SIZE, BOOMBOX_SIZE
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
-    - ARCHIVE_DELAY
 
     Returns:
         Config instance
@@ -212,13 +208,6 @@ def load_from_env() -> Config:
     archive.archive_track = os.environ.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false"
 
     config.archive = archive
-
-    # Timing
-    if delay := os.environ.get("ARCHIVE_DELAY"):
-        try:
-            config.archive_delay = int(delay)
-        except ValueError:
-            raise ConfigError(f"Invalid ARCHIVE_DELAY: {delay}")
 
     return config
 

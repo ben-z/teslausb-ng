@@ -45,7 +45,6 @@ teslausb gadget     # Manage USB mass storage
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
 | `RCLONE_PATH` | Path within remote | |
-| `ARCHIVE_DELAY` | Seconds before archiving | `20` |
 
 ## Development
 
