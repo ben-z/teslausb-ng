@@ -1,4 +1,4 @@
-# TeslaUSB-NG
+# teslausb-ng
 
 A Python rewrite of TeslaUSB's dashcam archiving system. Focused on correctness, simplicity, and testability.
 

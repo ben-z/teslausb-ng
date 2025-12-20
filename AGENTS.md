@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-TeslaUSB-NG is a Python rewrite of TeslaUSB's dashcam archiving system. It runs on a Raspberry Pi connected to a Tesla vehicle via USB, presenting as a mass storage device and archiving footage to cloud storage.
+teslausb-ng is a Python rewrite of TeslaUSB's dashcam archiving system. It runs on a Raspberry Pi connected to a Tesla vehicle via USB, presenting as a mass storage device and archiving footage to cloud storage.
 
 ## Architecture
 
