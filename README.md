@@ -52,6 +52,16 @@ Or export environment variables directly.
 
 ## Running
 
+### Setup USB Gadget
+
+Before running, set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
+
+```bash
+teslausb gadget setup --enable
+```
+
+This creates the virtual USB drive from your `cam_disk.bin` and binds it to the USB controller.
+
 ### Manual
 
 ```bash
