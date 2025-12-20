@@ -78,7 +78,6 @@ class UsbGadget:
         gadget = UsbGadget()
         gadget.setup({
             0: LunConfig(disk_path=Path("/backingfiles/cam_disk.bin")),
-            1: LunConfig(disk_path=Path("/backingfiles/music_disk.bin")),
         })
         gadget.enable()
     """

@@ -96,7 +96,3 @@ def mount_image(image_path: Path) -> Iterator[Path]:
                 logger.warning(f"losetup -d failed: {result.stderr.decode()}")
 
         logger.debug(f"Cleaned up mount for {image_path}")
-
-
-# Type alias for mount function (for dependency injection in tests)
-MountFn = type(mount_image)

@@ -294,11 +294,8 @@ class SnapshotManager:
         """Generate snapshot directory name."""
         return f"snap-{snap_id:06d}"
 
-    def create_snapshot(self, fsck: bool = True) -> Snapshot:
+    def create_snapshot(self) -> Snapshot:
         """Create a new COW snapshot of the camera disk.
-
-        Args:
-            fsck: Whether to run filesystem check on the snapshot
 
         Returns:
             The created snapshot
@@ -473,7 +470,7 @@ class SnapshotManager:
             return False
 
     @contextmanager
-    def snapshot_session(self, fsck: bool = True) -> Iterator[SnapshotHandle]:
+    def snapshot_session(self) -> Iterator[SnapshotHandle]:
         """Context manager that creates a snapshot and acquires it.
 
         Creates a new snapshot, acquires a handle to it, and ensures
@@ -485,13 +482,10 @@ class SnapshotManager:
                 archive_files(handle.snapshot)
             # handle automatically released
 
-        Args:
-            fsck: Whether to run filesystem check on the snapshot
-
         Yields:
             SnapshotHandle for the new snapshot
         """
-        snapshot = self.create_snapshot(fsck=fsck)
+        snapshot = self.create_snapshot()
         handle = self.acquire(snapshot.id)
         try:
             yield handle

@@ -57,7 +57,6 @@ class CoordinatorConfig:
     idle_timeout: float = 90.0  # Seconds to wait for idle before snapshot
 
     # Archive settings
-    fsck_on_snapshot: bool = True
     mount_fn: Callable[[Path], Iterator[Path]] | None = None  # None = use mock path for testing
     wait_for_idle: bool = True  # Wait for car to stop writing before snapshot
 
@@ -78,7 +77,7 @@ class Coordinator:
 
     The main loop:
     1. Wait for archive to become reachable (WiFi connected, server up)
-    2. Wait archive_delay seconds (let things settle)
+    2. Wait for car to stop writing (idle detection)
     3. Take snapshot
     4. Archive snapshot
     5. Clean up old snapshots if needed
@@ -245,7 +244,6 @@ class Coordinator:
         try:
             result = self.archive_manager.archive_new_snapshot(
                 mount_fn=self.config.mount_fn,
-                fsck=self.config.fsck_on_snapshot,
             )
             self._last_archive = result
             self._archive_count += 1

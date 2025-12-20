@@ -488,7 +488,6 @@ class ArchiveManager:
     def archive_new_snapshot(
         self,
         mount_fn: Callable[[Path], Iterator[Path]] | None = None,
-        fsck: bool = True,
     ) -> ArchiveResult:
         """Create a new snapshot, mount it, and archive.
 
@@ -502,12 +501,11 @@ class ArchiveManager:
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
                       If None, uses snapshot.path / "mnt" (for testing with mock filesystem).
-            fsck: Whether to run filesystem check on the snapshot
 
         Returns:
             ArchiveResult with details of the operation
         """
-        snapshot = self.snapshot_manager.create_snapshot(fsck=fsck)
+        snapshot = self.snapshot_manager.create_snapshot()
         handle = self.snapshot_manager.acquire(snapshot.id)
 
         try:
