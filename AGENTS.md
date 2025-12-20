@@ -1,57 +1,50 @@
 # Agent Guidelines
 
-## Project Overview
-
-teslausb-ng is a Python rewrite of TeslaUSB's dashcam archiving system. It runs on a Raspberry Pi connected to a Tesla vehicle via USB, presenting as a mass storage device and archiving footage to cloud storage.
-
-## Architecture
-
-```
-Coordinator → SnapshotManager → Filesystem (protocol)
-            → ArchiveManager  → RcloneBackend
-            → SpaceManager
-```
-
-All I/O goes through protocol abstractions (`Filesystem`, `ArchiveBackend`, etc.) with mock implementations for testing.
-
-## Key Design Decisions
-
-1. **Derived state**: Snapshot state (READY/ARCHIVING) is computed from refcount, not stored
-2. **Single source of truth**: The `.toc` file marks snapshot completion
-3. **Reference counting**: Prevents deletion of in-use snapshots
-4. **On-demand snapshots**: Only taken when WiFi available (no timer-based accumulation)
+See [DESIGN.md](DESIGN.md) for architecture and design decisions.
 
 ## Code Style
 
 - Python 3.11+, type hints everywhere
 - Dataclasses for data, protocols for abstractions
 - Each module has one clear purpose
-- Tests use mock implementations, not real filesystem
+- Tests use `MockFilesystem`, not real filesystem
+
+## Modules
+
+| Module | Purpose |
+|--------|---------|
+| `coordinator.py` | Main orchestration loop |
+| `snapshot.py` | Snapshot lifecycle with refcounting |
+| `archive.py` | Archive via rclone |
+| `space.py` | Disk space management |
+| `filesystem.py` | Filesystem abstraction (protocol + real + mock) |
+| `config.py` | Configuration from env/file |
+| `gadget.py` | USB mass storage gadget |
+| `mount.py` | Loop device mounting |
+| `idle.py` | Detect when car stops writing |
+| `led.py` | Status LED control |
+| `temperature.py` | CPU temperature monitoring |
+| `cli.py` | Command-line interface |
 
 ## Testing
 
 ```bash
-PYTHONPATH=src pytest tests/ -v
+pytest tests/ -v
 ```
-
-All 181 tests should pass. When modifying code, ensure tests still pass.
 
 ## Common Tasks
 
-### Adding a new archive backend
-
-1. Implement `ArchiveBackend` protocol in `archive.py`
-2. Add backend creation logic in `cli.py:create_components()`
+**Adding a new archive backend:**
+1. Implement `ArchiveBackend` in `archive.py`
+2. Add creation logic in `cli.py:create_components()`
 3. Add tests in `test_archive.py`
 
-### Modifying snapshot behavior
+**Modifying snapshot behavior:**
+1. Core logic in `snapshot.py`
+2. `.toc` handling is critical for crash safety
+3. Test with `MockFilesystem`
 
-1. Core logic is in `snapshot.py`
-2. `.toc` file handling is critical for crash safety
-3. Always test with `MockFilesystem`
-
-### Changing space management
-
-1. Logic is in `space.py`
+**Changing space management:**
+1. Logic in `space.py`
 2. Reserve is fixed at 10GB
-3. Formula: `recommended_cam_size = (total - other_drives - reserve) / 2`
+3. Formula: `recommended_cam_size = (total - other_drives - 10GB) / 2`
