@@ -27,7 +27,7 @@ sudo apt install -y python3-pip rclone xfsprogs
 rclone config
 
 # Install teslausb-ng
-pip install git+https://github.com/yourusername/teslausb-ng.git
+pip install git+https://github.com/ben-z/teslausb-ng.git
 ```
 
 ## Configuration
@@ -102,7 +102,7 @@ sudo systemctl start teslausb
 ## Development
 
 ```bash
-git clone https://github.com/yourusername/teslausb-ng.git
+git clone https://github.com/ben-z/teslausb-ng.git
 cd teslausb-ng
 pip install -e .
 pytest tests/ -v
