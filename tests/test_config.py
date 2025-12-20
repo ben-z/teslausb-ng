@@ -85,7 +85,6 @@ class TestConfig:
         config = Config()
 
         assert config.cam_size == 40 * GB
-        assert config.music_size == 0
         assert config.reserve == 10 * GB
 
     def test_derived_paths(self):
@@ -94,17 +93,6 @@ class TestConfig:
 
         assert config.cam_disk_path == Path("/test/cam_disk.bin")
         assert config.snapshots_path == Path("/test/snapshots")
-        assert config.music_disk_path == Path("/test/music_disk.bin")
-
-    def test_other_drives_size(self):
-        """Test other_drives_size calculation."""
-        config = Config(
-            music_size=20 * GB,
-            lightshow_size=4 * GB,
-            boombox_size=2 * GB,
-        )
-
-        assert config.other_drives_size == 26 * GB
 
     def test_validate_good_config(self):
         """Test validation of good config."""
@@ -156,8 +144,7 @@ class TestLoadFromEnv:
         """Test loading with no environment variables set."""
         # Clear relevant env vars
         env_vars = [
-            "CAM_SIZE", "MUSIC_SIZE", "ARCHIVE_SYSTEM",
-            "ARCHIVE_RECENTCLIPS",
+            "CAM_SIZE", "ARCHIVE_SYSTEM", "ARCHIVE_RECENTCLIPS",
         ]
         old_values = {k: os.environ.pop(k, None) for k in env_vars}
 
@@ -224,7 +211,6 @@ class TestLoadFromFile:
         """Test loading a simple config file."""
         config_content = """
 CAM_SIZE=40G
-MUSIC_SIZE=20G
 ARCHIVE_SYSTEM=rclone
 RCLONE_DRIVE=gdrive
 RCLONE_PATH=/TeslaCam
@@ -237,7 +223,6 @@ RCLONE_PATH=/TeslaCam
             config = load_from_file(config_path)
 
             assert config.cam_size == 40 * GB
-            assert config.music_size == 20 * GB
             assert config.archive.system == "rclone"
             assert config.archive.rclone_drive == "gdrive"
             assert config.archive.rclone_path == "/TeslaCam"

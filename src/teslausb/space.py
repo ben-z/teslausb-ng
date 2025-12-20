@@ -75,12 +75,12 @@ class SpaceManager:
     """Manages disk space and coordinates cleanup.
 
     The space model:
-    - Total backingfiles space contains: cam_disk, other drives, snapshots, free space
+    - Total backingfiles space contains: cam_disk, snapshots, free space
     - Reserve = 10GB (for filesystem overhead and safety margin)
     - Snapshot budget = free_space - reserve
 
     For reliable operation:
-    - Recommended: total >= 2 * cam_size + other_drives + reserve
+    - Recommended: total >= 2 * cam_size + reserve
     - This allows for 1 full snapshot while maintaining reserve
     """
 
@@ -216,10 +216,10 @@ class SpaceManager:
 
         return True
 
-    def get_recommended_cam_size(self, total_space: int, other_drives_size: int = 0) -> int:
+    def get_recommended_cam_size(self, total_space: int) -> int:
         """Calculate recommended maximum cam_size for given total space.
 
-        Formula: cam_size <= (total - other_drives - reserve) / 2
+        Formula: cam_size <= (total - reserve) / 2
 
         This ensures space for:
         - cam_disk (1x cam_size)
@@ -228,15 +228,14 @@ class SpaceManager:
 
         Args:
             total_space: Total available space in bytes
-            other_drives_size: Size of music, lightshow, boombox drives in bytes
 
         Returns:
             Recommended maximum cam_size in bytes
         """
-        available = total_space - other_drives_size - self.reserve
+        available = total_space - self.reserve
         return int(available / 2)
 
-    def validate_configuration(self, total_space: int, other_drives_size: int = 0) -> list[str]:
+    def validate_configuration(self, total_space: int) -> list[str]:
         """Validate current cam_size configuration.
 
         Returns:
@@ -244,7 +243,7 @@ class SpaceManager:
         """
         warnings: list[str] = []
 
-        recommended = self.get_recommended_cam_size(total_space, other_drives_size)
+        recommended = self.get_recommended_cam_size(total_space)
 
         if self.cam_size > recommended:
             warnings.append(
@@ -254,7 +253,7 @@ class SpaceManager:
             )
 
         # Check minimum viable space
-        min_required = self.cam_size + self.reserve_bytes + other_drives_size
+        min_required = self.cam_size + self.reserve_bytes
         if total_space < min_required:
             warnings.append(
                 f"Total space ({total_space / GB:.1f}GB) is less than minimum required "

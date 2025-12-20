@@ -275,7 +275,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
             space_warnings = space_manager.validate_configuration(
                 total_space=total_space,
-                other_drives_size=config.other_drives_size,
             )
             warnings.extend(space_warnings)
         except Exception as e:
@@ -299,13 +298,6 @@ def cmd_gadget(args: argparse.Namespace) -> int:
         config = load_config(args)
 
         luns = {0: LunConfig(disk_path=config.cam_disk_path)}
-
-        if config.music_size > 0:
-            luns[1] = LunConfig(disk_path=config.music_disk_path)
-        if config.lightshow_size > 0:
-            luns[2] = LunConfig(disk_path=config.lightshow_disk_path)
-        if config.boombox_size > 0:
-            luns[3] = LunConfig(disk_path=config.boombox_disk_path)
 
         try:
             gadget.setup(luns)

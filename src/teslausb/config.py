@@ -96,9 +96,6 @@ class Config:
 
     # Sizes
     cam_size: int = 40 * GB
-    music_size: int = 0
-    lightshow_size: int = 0
-    boombox_size: int = 0
 
     # Space management
     reserve: int = 10 * GB
@@ -114,23 +111,6 @@ class Config:
     @property
     def snapshots_path(self) -> Path:
         return self.backingfiles_path / "snapshots"
-
-    @property
-    def music_disk_path(self) -> Path:
-        return self.backingfiles_path / "music_disk.bin"
-
-    @property
-    def lightshow_disk_path(self) -> Path:
-        return self.backingfiles_path / "lightshow_disk.bin"
-
-    @property
-    def boombox_disk_path(self) -> Path:
-        return self.backingfiles_path / "boombox_disk.bin"
-
-    @property
-    def other_drives_size(self) -> int:
-        """Total size of non-cam drives."""
-        return self.music_size + self.lightshow_size + self.boombox_size
 
     def validate(self) -> list[str]:
         """Validate configuration.
@@ -158,8 +138,8 @@ class Config:
 def load_from_env() -> Config:
     """Load configuration from environment variables.
 
-    Reads the same environment variables as the bash scripts:
-    - CAM_SIZE, MUSIC_SIZE, LIGHTSHOW_SIZE, BOOMBOX_SIZE
+    Reads environment variables:
+    - CAM_SIZE
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
 
@@ -169,30 +149,11 @@ def load_from_env() -> Config:
     config = Config()
     archive = ArchiveConfig()
 
-    # Sizes
     if size := os.environ.get("CAM_SIZE"):
         try:
             config.cam_size = parse_size(size)
         except ConfigError as e:
             raise ConfigError(f"Invalid CAM_SIZE: {e}") from e
-
-    if size := os.environ.get("MUSIC_SIZE"):
-        try:
-            config.music_size = parse_size(size)
-        except ConfigError as e:
-            raise ConfigError(f"Invalid MUSIC_SIZE: {e}") from e
-
-    if size := os.environ.get("LIGHTSHOW_SIZE"):
-        try:
-            config.lightshow_size = parse_size(size)
-        except ConfigError as e:
-            raise ConfigError(f"Invalid LIGHTSHOW_SIZE: {e}") from e
-
-    if size := os.environ.get("BOOMBOX_SIZE"):
-        try:
-            config.boombox_size = parse_size(size)
-        except ConfigError as e:
-            raise ConfigError(f"Invalid BOOMBOX_SIZE: {e}") from e
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()

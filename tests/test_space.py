@@ -202,34 +202,12 @@ class TestSpaceManager:
             cam_size=40 * GB,
         )
 
-        # 256GB total, 0 other drives
+        # 256GB total
         # Available = 256 - 10 = 246GB
         # Recommended = 246 / 2 = 123GB
-        recommended = manager.get_recommended_cam_size(
-            total_space=256 * GB,
-            other_drives_size=0,
-        )
+        recommended = manager.get_recommended_cam_size(total_space=256 * GB)
 
         assert recommended == 123 * GB
-
-    def test_get_recommended_cam_size_with_other_drives(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test recommended cam_size with other drives."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        # 256GB total, 26GB other drives (music + lightshow + boombox)
-        recommended = manager.get_recommended_cam_size(
-            total_space=256 * GB,
-            other_drives_size=26 * GB,
-        )
-
-        # Available = 256 - 26 - 10 = 220GB
-        # Recommended = 220 / 2 = 110GB
-        assert recommended == 110 * GB
 
     def test_validate_configuration_good(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
         """Test configuration validation with good config."""
@@ -241,10 +219,7 @@ class TestSpaceManager:
         )
 
         # 256GB is plenty for 40GB cam
-        warnings = manager.validate_configuration(
-            total_space=256 * GB,
-            other_drives_size=0,
-        )
+        warnings = manager.validate_configuration(total_space=256 * GB)
 
         assert len(warnings) == 0
 
@@ -258,10 +233,7 @@ class TestSpaceManager:
         )
 
         # 128GB is too small for 100GB cam
-        warnings = manager.validate_configuration(
-            total_space=128 * GB,
-            other_drives_size=0,
-        )
+        warnings = manager.validate_configuration(total_space=128 * GB)
 
         assert len(warnings) > 0
         assert any("exceeds recommended" in w for w in warnings)
@@ -276,10 +248,7 @@ class TestSpaceManager:
         )
 
         # Total space less than cam + reserve
-        warnings = manager.validate_configuration(
-            total_space=100 * GB,  # Same as cam size, no room for reserve
-            other_drives_size=0,
-        )
+        warnings = manager.validate_configuration(total_space=100 * GB)
 
         assert len(warnings) > 0
         assert any("less than minimum" in w for w in warnings)
