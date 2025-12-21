@@ -29,10 +29,6 @@ class ArchiveError(Exception):
     """Base exception for archive errors."""
 
 
-class ArchiveConnectionError(ArchiveError):
-    """Failed to connect to archive destination."""
-
-
 class ArchiveState(Enum):
     """State of an archive operation."""
 
@@ -49,10 +45,7 @@ class ArchiveResult:
 
     snapshot_id: int
     state: ArchiveState
-    files_total: int = 0
-    files_archived: int = 0
-    files_skipped: int = 0
-    files_failed: int = 0
+    files_transferred: int = 0
     bytes_transferred: int = 0
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -69,98 +62,56 @@ class ArchiveResult:
         return None
 
 
+@dataclass
+class CopyResult:
+    """Result of a directory copy operation."""
+
+    success: bool
+    files_transferred: int = 0
+    bytes_transferred: int = 0
+    error: str | None = None
+
+
 class ArchiveBackend(ABC):
     """Abstract base class for archive backends."""
 
     @abstractmethod
     def is_reachable(self) -> bool:
-        """Check if archive destination is reachable.
-
-        Returns:
-            True if destination can be reached
-        """
+        """Check if archive destination is reachable."""
 
     @abstractmethod
-    def connect(self) -> None:
-        """Connect to archive destination.
-
-        Raises:
-            ArchiveConnectionError: If connection fails
-        """
-
-    @abstractmethod
-    def disconnect(self) -> None:
-        """Disconnect from archive destination."""
-
-    @abstractmethod
-    def archive_file(self, src: Path, dst_relative: Path) -> bool:
-        """Archive a single file.
+    def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
+        """Copy a directory to the archive.
 
         Args:
-            src: Source file path (absolute)
-            dst_relative: Destination path relative to archive root
+            src: Source directory path (absolute)
+            dst_name: Destination directory name in archive
 
         Returns:
-            True if successful, False otherwise
-        """
-
-    @abstractmethod
-    def file_exists(self, dst_relative: Path) -> bool:
-        """Check if file already exists in archive.
-
-        Args:
-            dst_relative: Destination path relative to archive root
-
-        Returns:
-            True if file exists
-        """
-
-    @abstractmethod
-    def get_file_size(self, dst_relative: Path) -> int | None:
-        """Get size of file in archive.
-
-        Args:
-            dst_relative: Destination path relative to archive root
-
-        Returns:
-            File size in bytes, or None if file doesn't exist
+            CopyResult with transfer details
         """
 
 
 class MockArchiveBackend(ArchiveBackend):
     """Mock archive backend for testing."""
 
-    def __init__(self, reachable: bool = True, fail_files: set[str] | None = None):
+    def __init__(
+        self,
+        reachable: bool = True,
+        fail_dirs: set[str] | None = None,
+    ):
         self.reachable = reachable
-        self.connected = False
-        self.fail_files = fail_files or set()
-        self.archived_files: dict[Path, bytes] = {}
+        self.fail_dirs = fail_dirs or set()
+        self.copied_dirs: list[tuple[Path, str]] = []
 
     def is_reachable(self) -> bool:
         return self.reachable
 
-    def connect(self) -> None:
-        if not self.reachable:
-            raise ArchiveConnectionError("Archive not reachable")
-        self.connected = True
-
-    def disconnect(self) -> None:
-        self.connected = False
-
-    def archive_file(self, src: Path, dst_relative: Path) -> bool:
-        if str(dst_relative) in self.fail_files:
-            return False
-        # In mock, just record that the file was "archived"
-        self.archived_files[dst_relative] = b"mock content"
-        return True
-
-    def file_exists(self, dst_relative: Path) -> bool:
-        return dst_relative in self.archived_files
-
-    def get_file_size(self, dst_relative: Path) -> int | None:
-        if dst_relative in self.archived_files:
-            return len(self.archived_files[dst_relative])
-        return None
+    def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
+        if dst_name in self.fail_dirs:
+            return CopyResult(success=False, error=f"Mock failure for {dst_name}")
+        self.copied_dirs.append((src, dst_name))
+        return CopyResult(success=True, files_transferred=10, bytes_transferred=1000000)
 
 
 class RcloneBackend(ArchiveBackend):
@@ -175,7 +126,7 @@ class RcloneBackend(ArchiveBackend):
         remote: str,
         path: str = "",
         flags: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int = 3600,
         stop_event: Event | None = None,
     ):
         """Initialize rclone backend.
@@ -184,8 +135,8 @@ class RcloneBackend(ArchiveBackend):
             remote: Rclone remote name (e.g., "gdrive", "s3", "dropbox")
             path: Path within the remote (e.g., "TeslaCam/archive")
             flags: Additional rclone flags (e.g., ["--fast-list"])
-            timeout: Timeout per file operation in seconds
-            stop_event: Optional event to signal shutdown (for interruptible operations)
+            timeout: Timeout for copy operations in seconds
+            stop_event: Optional event to signal shutdown
         """
         self.remote = remote
         self.path = path.strip("/")
@@ -193,22 +144,16 @@ class RcloneBackend(ArchiveBackend):
         self.timeout = timeout
         self.stop_event = stop_event
 
-    def _dest(self, dst_relative: Path | str = "") -> str:
+    def _dest(self, subpath: str = "") -> str:
         """Build rclone destination path."""
-        if self.path and dst_relative:
-            return f"{self.remote}:{self.path}/{dst_relative}"
-        elif self.path:
-            return f"{self.remote}:{self.path}"
-        elif dst_relative:
-            return f"{self.remote}:{dst_relative}"
-        else:
-            return f"{self.remote}:"
+        parts = [p for p in [self.path, subpath] if p]
+        path_str = "/".join(parts)
+        if path_str:
+            return f"{self.remote}:{path_str}"
+        return f"{self.remote}:"
 
     def is_reachable(self) -> bool:
-        """Check if rclone remote is reachable.
-
-        Uses polling with short intervals so stop events can be checked.
-        """
+        """Check if rclone remote is reachable."""
         proc = None
         try:
             proc = subprocess.Popen(
@@ -216,43 +161,37 @@ class RcloneBackend(ArchiveBackend):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            # Poll with short intervals to allow stop event to interrupt
-            for _ in range(300):  # 30 seconds total (300 * 0.1s)
-                # Check if we should stop
+            for _ in range(300):  # 30 seconds total
                 if self.stop_event and self.stop_event.is_set():
                     return False
-
                 returncode = proc.poll()
                 if returncode is not None:
-                    # Log any output for debugging
                     stdout, stderr = proc.communicate()
                     if stderr:
                         for line in stderr.decode().splitlines():
                             logger.debug(f"rclone: {line}")
                     return returncode == 0
                 time.sleep(0.1)
-            # Timeout
             return False
         except (OSError, FileNotFoundError):
             return False
         finally:
             if proc is not None:
-                proc.kill()  # No-op if already exited
-                proc.wait()  # Reap zombie, returns immediately if already done
+                proc.kill()
+                proc.wait()
 
-    def connect(self) -> None:
-        """Verify rclone remote is accessible."""
-        if not self.is_reachable():
-            raise ArchiveConnectionError(f"Cannot reach rclone remote: {self.remote}")
+    def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
+        """Copy a directory using rclone copy."""
+        dest = self._dest(dst_name)
+        cmd = [
+            "rclone", "copy",
+            str(src),
+            dest,
+            "--stats-one-line",
+            "-v",
+        ] + self.flags
 
-    def disconnect(self) -> None:
-        """No-op for rclone (stateless)."""
-        pass
-
-    def archive_file(self, src: Path, dst_relative: Path) -> bool:
-        """Archive a single file using rclone copyto."""
-        dest = self._dest(dst_relative)
-        cmd = ["rclone", "copyto", str(src), dest] + self.flags
+        logger.info(f"Running: {' '.join(cmd)}")
 
         try:
             result = subprocess.run(
@@ -262,68 +201,41 @@ class RcloneBackend(ArchiveBackend):
                 timeout=self.timeout,
                 check=False,
             )
-            if result.stderr:
-                for line in result.stderr.decode().splitlines():
-                    logger.debug(f"rclone: {line}")
+
+            # Parse output for stats
+            files_transferred = 0
+            bytes_transferred = 0
+            output = result.stderr.decode() if result.stderr else ""
+
+            for line in output.splitlines():
+                logger.debug(f"rclone: {line}")
+                # Look for transfer stats in output
+                if "Transferred:" in line:
+                    # Parse lines like "Transferred: 5 / 5, 100%, 1.234 MiB/s"
+                    try:
+                        parts = line.split("Transferred:")[1].strip().split(",")
+                        if "/" in parts[0]:
+                            files_transferred = int(parts[0].split("/")[0].strip())
+                    except (IndexError, ValueError):
+                        pass
+
             if result.returncode != 0:
-                logger.warning(f"rclone copyto failed for {src}")
-            return result.returncode == 0
+                error_msg = output.strip().split("\n")[-1] if output else "Unknown error"
+                logger.error(f"rclone copy failed: {error_msg}")
+                return CopyResult(success=False, error=error_msg)
+
+            return CopyResult(
+                success=True,
+                files_transferred=files_transferred,
+                bytes_transferred=bytes_transferred,
+            )
+
         except subprocess.TimeoutExpired:
-            logger.error(f"rclone timeout archiving {src}")
-            return False
+            logger.error(f"rclone timeout copying {src}")
+            return CopyResult(success=False, error="Timeout")
         except (OSError, FileNotFoundError) as e:
             logger.error(f"rclone error: {e}")
-            return False
-
-    def file_exists(self, dst_relative: Path) -> bool:
-        """Check if file exists in remote."""
-        dest = self._dest(dst_relative)
-        try:
-            result = subprocess.run(
-                ["rclone", "lsf", dest],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                check=False,
-            )
-            if result.stderr:
-                for line in result.stderr.decode().splitlines():
-                    logger.debug(f"rclone: {line}")
-            # lsf returns empty output if file doesn't exist
-            return result.returncode == 0 and bool(result.stdout.strip())
-        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
-            return False
-
-    def get_file_size(self, dst_relative: Path) -> int | None:
-        """Get size of file in remote."""
-        dest = self._dest(dst_relative)
-        try:
-            result = subprocess.run(
-                ["rclone", "size", dest, "--json"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                check=False,
-            )
-            if result.stderr:
-                for line in result.stderr.decode().splitlines():
-                    logger.debug(f"rclone: {line}")
-            if result.returncode == 0:
-                import json
-                data = json.loads(result.stdout)
-                return data.get("bytes")
-        except (subprocess.TimeoutExpired, OSError, FileNotFoundError, ValueError):
-            pass
-        return None
-
-
-@dataclass
-class FileToArchive:
-    """Represents a file that needs to be archived."""
-
-    src_path: Path
-    dst_relative: Path
-    size: int
+            return CopyResult(success=False, error=str(e))
 
 
 class ArchiveManager:
@@ -331,9 +243,8 @@ class ArchiveManager:
 
     Coordinates with SnapshotManager to:
     1. Acquire snapshot (locks it from deletion)
-    2. Find files to archive
-    3. Archive files via backend
-    4. Release snapshot
+    2. Archive clip directories
+    3. Release snapshot
     """
 
     def __init__(
@@ -345,8 +256,6 @@ class ArchiveManager:
         archive_saved: bool = True,
         archive_sentry: bool = True,
         archive_track: bool = True,
-        min_file_size: int = 100_000,  # 100KB minimum (skip short recordings)
-        progress_callback: Callable[[int, int], None] | None = None,
     ):
         """Initialize ArchiveManager.
 
@@ -358,8 +267,6 @@ class ArchiveManager:
             archive_saved: Whether to archive SavedClips
             archive_sentry: Whether to archive SentryClips
             archive_track: Whether to archive TrackMode clips
-            min_file_size: Minimum file size to archive (skip smaller files)
-            progress_callback: Optional callback(files_done, files_total)
         """
         self.fs = fs
         self.snapshot_manager = snapshot_manager
@@ -368,79 +275,42 @@ class ArchiveManager:
         self.archive_saved = archive_saved
         self.archive_sentry = archive_sentry
         self.archive_track = archive_track
-        self.min_file_size = min_file_size
-        self.progress_callback = progress_callback
 
-        # Track previously archived files to avoid re-archiving
-        self._archived_files: set[str] = set()
-
-    def _find_files_to_archive(self, snapshot_mount: Path) -> list[FileToArchive]:
-        """Find all files that need to be archived from a snapshot.
+    def _get_dirs_to_archive(self, snapshot_mount: Path) -> list[tuple[Path, str]]:
+        """Get list of directories to archive.
 
         Args:
             snapshot_mount: Path where snapshot is mounted
 
         Returns:
-            List of files to archive
+            List of (source_path, dest_name) tuples
         """
-        files: list[FileToArchive] = []
-
-        # Define directories to scan based on settings
-        dirs_to_scan: list[tuple[Path, str]] = []
+        dirs: list[tuple[Path, str]] = []
 
         if self.archive_saved:
-            dirs_to_scan.append((snapshot_mount / "TeslaCam" / "SavedClips", "SavedClips"))
+            path = snapshot_mount / "TeslaCam" / "SavedClips"
+            if self.fs.exists(path):
+                dirs.append((path, "SavedClips"))
+
         if self.archive_sentry:
-            dirs_to_scan.append((snapshot_mount / "TeslaCam" / "SentryClips", "SentryClips"))
+            path = snapshot_mount / "TeslaCam" / "SentryClips"
+            if self.fs.exists(path):
+                dirs.append((path, "SentryClips"))
+
         if self.archive_recent:
-            dirs_to_scan.append((snapshot_mount / "TeslaCam" / "RecentClips", "RecentClips"))
+            path = snapshot_mount / "TeslaCam" / "RecentClips"
+            if self.fs.exists(path):
+                dirs.append((path, "RecentClips"))
+
         if self.archive_track:
-            dirs_to_scan.append((snapshot_mount / "TeslaTrackMode", "TrackMode"))
+            path = snapshot_mount / "TeslaTrackMode"
+            if self.fs.exists(path):
+                dirs.append((path, "TrackMode"))
 
-        for scan_dir, archive_prefix in dirs_to_scan:
-            if not self.fs.exists(scan_dir):
-                continue
-
-            for dirpath, _, filenames in self.fs.walk(scan_dir):
-                for filename in filenames:
-                    if not filename.lower().endswith(".mp4"):
-                        continue
-
-                    src_path = dirpath / filename
-                    try:
-                        stat = self.fs.stat(src_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to stat {src_path}: {e}")
-                        continue
-
-                    # Skip small files (likely incomplete recordings)
-                    if stat.size < self.min_file_size:
-                        continue
-
-                    # Calculate relative path for archive
-                    rel_to_scan = src_path.relative_to(scan_dir)
-                    dst_relative = Path(archive_prefix) / rel_to_scan
-
-                    # Skip already archived files
-                    archive_key = str(dst_relative)
-                    if archive_key in self._archived_files:
-                        continue
-
-                    files.append(FileToArchive(
-                        src_path=src_path,
-                        dst_relative=dst_relative,
-                        size=stat.size,
-                    ))
-
-        # Sort by path for deterministic ordering
-        files.sort(key=lambda f: str(f.dst_relative))
-        return files
+        return dirs
 
     def archive_snapshot(self, handle: SnapshotHandle, mount_path: Path) -> ArchiveResult:
-        """Archive all files from an acquired snapshot.
-
-        The snapshot must already be acquired (handle obtained from SnapshotManager).
-        This ensures the snapshot cannot be deleted during archiving.
+        """Archive all clip directories from a snapshot.
 
         Args:
             handle: Acquired snapshot handle
@@ -458,70 +328,54 @@ class ArchiveManager:
 
         logger.info(f"Starting archive of snapshot {snapshot.id} from {mount_path}")
 
-        # Connect to backend
+        # Check reachability
         result.state = ArchiveState.CONNECTING
-        try:
-            self.backend.connect()
-        except ArchiveConnectionError as e:
-            logger.error(f"Failed to connect to archive: {e}")
+        if not self.backend.is_reachable():
+            logger.error("Archive backend not reachable")
             result.state = ArchiveState.FAILED
-            result.error = str(e)
+            result.error = "Archive not reachable"
             result.completed_at = datetime.now()
             return result
 
-        try:
-            result.state = ArchiveState.ARCHIVING
-            files = self._find_files_to_archive(mount_path)
-            result.files_total = len(files)
+        result.state = ArchiveState.ARCHIVING
+        dirs_to_archive = self._get_dirs_to_archive(mount_path)
 
-            logger.info(f"Found {len(files)} files to archive")
-
-            # Archive each file
-            for i, file_info in enumerate(files):
-                if self.progress_callback:
-                    self.progress_callback(i, len(files))
-
-                # Check if already exists in archive (same size)
-                existing_size = self.backend.get_file_size(file_info.dst_relative)
-                if existing_size == file_info.size:
-                    logger.debug(f"Skipping {file_info.dst_relative} (already archived)")
-                    result.files_skipped += 1
-                    self._archived_files.add(str(file_info.dst_relative))
-                    continue
-
-                # Archive the file
-                logger.debug(f"Archiving {file_info.src_path} -> {file_info.dst_relative}")
-                success = self.backend.archive_file(file_info.src_path, file_info.dst_relative)
-
-                if success:
-                    result.files_archived += 1
-                    result.bytes_transferred += file_info.size
-                    self._archived_files.add(str(file_info.dst_relative))
-                else:
-                    logger.warning(f"Failed to archive {file_info.src_path}")
-                    result.files_failed += 1
-
-            if self.progress_callback:
-                self.progress_callback(len(files), len(files))
-
+        if not dirs_to_archive:
+            logger.info("No directories to archive")
             result.state = ArchiveState.COMPLETED
-            logger.info(
-                f"Archive complete: {result.files_archived} archived, "
-                f"{result.files_skipped} skipped, {result.files_failed} failed"
-            )
+            result.completed_at = datetime.now()
+            return result
 
-        except Exception as e:
-            logger.error(f"Archive failed: {e}")
-            result.state = ArchiveState.FAILED
-            result.error = str(e)
+        logger.info(f"Archiving {len(dirs_to_archive)} directories")
 
-        finally:
-            try:
-                self.backend.disconnect()
-            except Exception as e:
-                logger.warning(f"Failed to disconnect from archive: {e}")
+        total_files = 0
+        total_bytes = 0
+        errors: list[str] = []
 
+        for src_path, dst_name in dirs_to_archive:
+            logger.info(f"Archiving {dst_name}...")
+            copy_result = self.backend.copy_directory(src_path, dst_name)
+
+            if copy_result.success:
+                total_files += copy_result.files_transferred
+                total_bytes += copy_result.bytes_transferred
+                logger.info(f"  {dst_name}: {copy_result.files_transferred} files")
+            else:
+                errors.append(f"{dst_name}: {copy_result.error}")
+                logger.error(f"  {dst_name}: failed - {copy_result.error}")
+
+        result.files_transferred = total_files
+        result.bytes_transferred = total_bytes
         result.completed_at = datetime.now()
+
+        if errors:
+            result.state = ArchiveState.FAILED
+            result.error = "; ".join(errors)
+        else:
+            result.state = ArchiveState.COMPLETED
+
+        logger.info(f"Archive complete: {total_files} files transferred")
+
         return result
 
     def archive_new_snapshot(
@@ -530,16 +384,9 @@ class ArchiveManager:
     ) -> ArchiveResult:
         """Create a new snapshot, mount it, and archive.
 
-        This is a convenience method that:
-        1. Creates a new snapshot
-        2. Acquires it
-        3. Mounts it (if mount_fn provided)
-        4. Archives all files
-        5. Unmounts and releases
-
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
-                      If None, uses snapshot.path / "mnt" (for testing with mock filesystem).
+                      If None, uses snapshot.path / "mnt" (for testing).
 
         Returns:
             ArchiveResult with details of the operation
@@ -549,19 +396,10 @@ class ArchiveManager:
 
         try:
             if mount_fn:
-                # Production: mount the snapshot image
                 with mount_fn(snapshot.image_path) as mount_path:
                     return self.archive_snapshot(handle, mount_path)
             else:
-                # Testing: assume files are at snapshot.path / "mnt"
                 mount_path = snapshot.path / "mnt"
                 return self.archive_snapshot(handle, mount_path)
         finally:
             handle.release()
-
-    def clear_archived_cache(self) -> None:
-        """Clear the cache of previously archived files.
-
-        Call this if you want to re-archive files that were already archived.
-        """
-        self._archived_files.clear()

@@ -228,7 +228,7 @@ class Coordinator:
             if result.state == ArchiveState.COMPLETED:
                 logger.info(
                     f"Archive cycle {self._archive_count} complete: "
-                    f"{result.files_archived} files archived"
+                    f"{result.files_transferred} files transferred"
                 )
             else:
                 logger.warning(f"Archive cycle {self._archive_count} had issues: {result.error}")

@@ -93,7 +93,4 @@ def mock_fs_with_teslacam(mock_fs: MockFilesystem) -> MockFilesystem:
     fs.mkdir(event2, parents=True)
     fs.write_bytes(event2 / "2024-01-15_11-00-00-front.mp4", b"x" * 600_000)
 
-    # Create a small file that should be skipped
-    fs.write_bytes(event1 / "2024-01-15_10-30-00-small.mp4", b"x" * 50_000)
-
     return fs

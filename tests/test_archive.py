@@ -8,9 +8,9 @@ from teslausb.archive import (
     ArchiveManager,
     ArchiveResult,
     ArchiveState,
+    CopyResult,
     MockArchiveBackend,
     RcloneBackend,
-    FileToArchive,
 )
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
@@ -27,87 +27,41 @@ class TestMockArchiveBackend:
         backend = MockArchiveBackend(reachable=False)
         assert not backend.is_reachable()
 
-    def test_connect_when_reachable(self):
-        """Test connecting when reachable."""
+    def test_copy_directory_success(self):
+        """Test copying a directory."""
         backend = MockArchiveBackend(reachable=True)
 
-        backend.connect()
-        assert backend.connected
-
-    def test_connect_when_unreachable(self):
-        """Test connecting when unreachable raises error."""
-        from teslausb.archive import ArchiveConnectionError
-
-        backend = MockArchiveBackend(reachable=False)
-
-        with pytest.raises(ArchiveConnectionError):
-            backend.connect()
-
-    def test_disconnect(self):
-        """Test disconnecting."""
-        backend = MockArchiveBackend(reachable=True)
-        backend.connect()
-        assert backend.connected
-
-        backend.disconnect()
-        assert not backend.connected
-
-    def test_archive_file(self):
-        """Test archiving a file."""
-        backend = MockArchiveBackend(reachable=True)
-        backend.connect()
-
-        success = backend.archive_file(
-            src=Path("/some/file.mp4"),
-            dst_relative=Path("SavedClips/event/file.mp4"),
+        result = backend.copy_directory(
+            src=Path("/some/SavedClips"),
+            dst_name="SavedClips",
         )
 
-        assert success
-        assert backend.file_exists(Path("SavedClips/event/file.mp4"))
+        assert result.success
+        assert result.files_transferred > 0
+        assert len(backend.copied_dirs) == 1
+        assert backend.copied_dirs[0] == (Path("/some/SavedClips"), "SavedClips")
 
-    def test_archive_file_fails(self):
-        """Test archiving a file that should fail."""
+    def test_copy_directory_fails(self):
+        """Test copying a directory that should fail."""
         backend = MockArchiveBackend(
             reachable=True,
-            fail_files={"SavedClips/bad.mp4"},
-        )
-        backend.connect()
-
-        success = backend.archive_file(
-            src=Path("/some/bad.mp4"),
-            dst_relative=Path("SavedClips/bad.mp4"),
+            fail_dirs={"SavedClips"},
         )
 
-        assert not success
+        result = backend.copy_directory(
+            src=Path("/some/SavedClips"),
+            dst_name="SavedClips",
+        )
 
-    def test_file_exists(self):
-        """Test checking file existence."""
-        backend = MockArchiveBackend(reachable=True)
-        backend.connect()
-
-        assert not backend.file_exists(Path("nonexistent.mp4"))
-
-        backend.archive_file(Path("/src"), Path("test.mp4"))
-        assert backend.file_exists(Path("test.mp4"))
-
-    def test_get_file_size(self):
-        """Test getting file size."""
-        backend = MockArchiveBackend(reachable=True)
-        backend.connect()
-
-        assert backend.get_file_size(Path("nonexistent.mp4")) is None
-
-        backend.archive_file(Path("/src"), Path("test.mp4"))
-        size = backend.get_file_size(Path("test.mp4"))
-        assert size is not None
-        assert size > 0
+        assert not result.success
+        assert result.error is not None
 
 
 class TestArchiveManager:
     """Tests for ArchiveManager."""
 
-    def test_find_files_to_archive(self, mock_fs_with_teslacam: MockFilesystem):
-        """Test finding files to archive."""
+    def test_get_dirs_to_archive(self, mock_fs_with_teslacam: MockFilesystem):
+        """Test finding directories to archive."""
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
@@ -120,24 +74,19 @@ class TestArchiveManager:
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
-            min_file_size=100_000,  # 100KB
         )
 
-        # Find files in the pre-created snapshot structure
         snapshot_mount = Path("/backingfiles/snapshots/snap-000000/mnt")
-        files = manager._find_files_to_archive(snapshot_mount)
+        dirs = manager._get_dirs_to_archive(snapshot_mount)
 
-        # Should find 3 files (2 in SavedClips, 1 in SentryClips)
-        # The small file should be skipped
-        assert len(files) == 3
+        # Should find SavedClips and SentryClips (RecentClips exists but not enabled by default)
+        assert len(dirs) == 2
+        dir_names = [d[1] for d in dirs]
+        assert "SavedClips" in dir_names
+        assert "SentryClips" in dir_names
 
-        # Check file paths
-        paths = [str(f.dst_relative) for f in files]
-        assert any("SavedClips" in p for p in paths)
-        assert any("SentryClips" in p for p in paths)
-
-    def test_find_files_respects_settings(self, mock_fs_with_teslacam: MockFilesystem):
-        """Test that file finding respects archive settings."""
+    def test_get_dirs_respects_settings(self, mock_fs_with_teslacam: MockFilesystem):
+        """Test that directory selection respects archive settings."""
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
@@ -158,11 +107,10 @@ class TestArchiveManager:
         )
 
         snapshot_mount = Path("/backingfiles/snapshots/snap-000000/mnt")
-        files = manager._find_files_to_archive(snapshot_mount)
+        dirs = manager._get_dirs_to_archive(snapshot_mount)
 
-        # Should only find SavedClips files
-        assert len(files) == 2  # 2 large files in SavedClips
-        assert all("SavedClips" in str(f.dst_relative) for f in files)
+        assert len(dirs) == 1
+        assert dirs[0][1] == "SavedClips"
 
     def test_archive_snapshot(self, mock_fs_with_teslacam: MockFilesystem):
         """Test archiving a snapshot."""
@@ -196,7 +144,6 @@ class TestArchiveManager:
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
-            min_file_size=100_000,
         )
 
         # Get the snapshot and acquire it
@@ -210,13 +157,14 @@ class TestArchiveManager:
             result = manager.archive_snapshot(handle, mount_path)
 
             assert result.state == ArchiveState.COMPLETED
-            assert result.files_archived == 3
-            assert result.files_failed == 0
+            assert result.files_transferred > 0
+            # Should have copied SavedClips and SentryClips
+            assert len(backend.copied_dirs) == 2
         finally:
             handle.release()
 
-    def test_archive_snapshot_skips_existing(self, mock_fs_with_teslacam: MockFilesystem):
-        """Test that archive skips files that already exist with same size."""
+    def test_archive_snapshot_handles_failure(self, mock_fs_with_teslacam: MockFilesystem):
+        """Test archive handles directory copy failures."""
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
@@ -240,69 +188,16 @@ class TestArchiveManager:
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        backend = MockArchiveBackend(reachable=True)
-
-        # Pre-archive one file (simulating it already being in archive)
-        # The file has 500000 bytes
-        backend.archived_files[Path("SavedClips/2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4")] = b"x" * 500_000
-
-        manager = ArchiveManager(
-            fs=mock_fs_with_teslacam,
-            snapshot_manager=snapshot_manager,
-            backend=backend,
-            min_file_size=100_000,
-        )
-
-        snapshots = snapshot_manager.get_snapshots()
-        handle = snapshot_manager.acquire(snapshots[0].id)
-
-        try:
-            mount_path = Path("/backingfiles/snapshots/snap-000000/mnt")
-            result = manager.archive_snapshot(handle, mount_path)
-
-            assert result.state == ArchiveState.COMPLETED
-            # 2 archived + 1 skipped = 3 total
-            assert result.files_skipped == 1
-            assert result.files_archived == 2
-        finally:
-            handle.release()
-
-    def test_archive_handles_backend_failure(self, mock_fs_with_teslacam: MockFilesystem):
-        """Test archive handles file transfer failures."""
-        snapshot_manager = SnapshotManager(
-            fs=mock_fs_with_teslacam,
-            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
-            snapshots_path=Path("/backingfiles/snapshots"),
-        )
-
-        # Set up snapshot
-        mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
-        mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.bin"),
-            "mock"
-        )
-        mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.toc"),
-            ""
-        )
-
-        snapshot_manager = SnapshotManager(
-            fs=mock_fs_with_teslacam,
-            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
-            snapshots_path=Path("/backingfiles/snapshots"),
-        )
-
-        # Backend that fails on specific files
+        # Backend that fails on SavedClips
         backend = MockArchiveBackend(
             reachable=True,
-            fail_files={"SavedClips/2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4"},
+            fail_dirs={"SavedClips"},
         )
 
         manager = ArchiveManager(
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
-            min_file_size=100_000,
         )
 
         snapshots = snapshot_manager.get_snapshots()
@@ -312,38 +207,56 @@ class TestArchiveManager:
             mount_path = Path("/backingfiles/snapshots/snap-000000/mnt")
             result = manager.archive_snapshot(handle, mount_path)
 
-            # Should complete but with one failure
-            assert result.state == ArchiveState.COMPLETED
-            assert result.files_failed == 1
-            assert result.files_archived == 2
+            # Should fail because SavedClips failed
+            assert result.state == ArchiveState.FAILED
+            assert result.error is not None
+            assert "SavedClips" in result.error
         finally:
             handle.release()
 
-    def test_clear_archived_cache(self, mock_fs: MockFilesystem):
-        """Test clearing the archived files cache."""
+    def test_archive_when_unreachable(self, mock_fs_with_teslacam: MockFilesystem):
+        """Test archive fails gracefully when backend unreachable."""
         snapshot_manager = SnapshotManager(
-            fs=mock_fs,
+            fs=mock_fs_with_teslacam,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        backend = MockArchiveBackend(reachable=True)
+        mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
+        mock_fs_with_teslacam.write_text(
+            Path("/backingfiles/snapshots/snap-000000/snap.bin"),
+            "mock"
+        )
+        mock_fs_with_teslacam.write_text(
+            Path("/backingfiles/snapshots/snap-000000/snap.toc"),
+            ""
+        )
+
+        snapshot_manager = SnapshotManager(
+            fs=mock_fs_with_teslacam,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        backend = MockArchiveBackend(reachable=False)
 
         manager = ArchiveManager(
-            fs=mock_fs,
+            fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
         )
 
-        # Add some entries to the cache
-        manager._archived_files.add("file1.mp4")
-        manager._archived_files.add("file2.mp4")
+        snapshots = snapshot_manager.get_snapshots()
+        handle = snapshot_manager.acquire(snapshots[0].id)
 
-        assert len(manager._archived_files) == 2
+        try:
+            mount_path = Path("/backingfiles/snapshots/snap-000000/mnt")
+            result = manager.archive_snapshot(handle, mount_path)
 
-        manager.clear_archived_cache()
-
-        assert len(manager._archived_files) == 0
+            assert result.state == ArchiveState.FAILED
+            assert "not reachable" in result.error
+        finally:
+            handle.release()
 
 
 class TestArchiveResult:
@@ -389,6 +302,23 @@ class TestArchiveResult:
         assert result.duration_seconds is None
 
 
+class TestCopyResult:
+    """Tests for CopyResult."""
+
+    def test_success_result(self):
+        """Test successful copy result."""
+        result = CopyResult(success=True, files_transferred=10, bytes_transferred=1000000)
+        assert result.success
+        assert result.files_transferred == 10
+        assert result.error is None
+
+    def test_failed_result(self):
+        """Test failed copy result."""
+        result = CopyResult(success=False, error="Connection failed")
+        assert not result.success
+        assert result.error == "Connection failed"
+
+
 class TestRcloneBackend:
     """Tests for RcloneBackend destination path building."""
 
@@ -404,15 +334,15 @@ class TestRcloneBackend:
         assert backend._dest() == "gdrive:TeslaCam/archive"
         assert backend._dest("") == "gdrive:TeslaCam/archive"
 
-    def test_dest_with_relative_file(self):
-        """Test destination with relative file path."""
+    def test_dest_with_subpath(self):
+        """Test destination with subpath."""
         backend = RcloneBackend(remote="gdrive", path="TeslaCam")
-        assert backend._dest(Path("SavedClips/event/file.mp4")) == "gdrive:TeslaCam/SavedClips/event/file.mp4"
+        assert backend._dest("SavedClips") == "gdrive:TeslaCam/SavedClips"
 
     def test_dest_no_base_path(self):
         """Test destination without base path."""
         backend = RcloneBackend(remote="s3")
-        assert backend._dest(Path("SavedClips/file.mp4")) == "s3:SavedClips/file.mp4"
+        assert backend._dest("SavedClips") == "s3:SavedClips"
 
     def test_dest_strips_slashes_from_path(self):
         """Test that leading/trailing slashes are stripped from path."""
