@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from threading import Event
 from typing import Callable, Iterator
 
 from .filesystem import Filesystem
@@ -175,6 +176,7 @@ class RcloneBackend(ArchiveBackend):
         path: str = "",
         flags: list[str] | None = None,
         timeout: int = 300,
+        stop_event: Event | None = None,
     ):
         """Initialize rclone backend.
 
@@ -183,11 +185,13 @@ class RcloneBackend(ArchiveBackend):
             path: Path within the remote (e.g., "TeslaCam/archive")
             flags: Additional rclone flags (e.g., ["--fast-list"])
             timeout: Timeout per file operation in seconds
+            stop_event: Optional event to signal shutdown (for interruptible operations)
         """
         self.remote = remote
         self.path = path.strip("/")
         self.flags = flags or []
         self.timeout = timeout
+        self.stop_event = stop_event
 
     def _dest(self, dst_relative: Path | str = "") -> str:
         """Build rclone destination path."""
@@ -203,7 +207,7 @@ class RcloneBackend(ArchiveBackend):
     def is_reachable(self) -> bool:
         """Check if rclone remote is reachable.
 
-        Uses polling with short intervals so signals can be handled promptly.
+        Uses polling with short intervals so stop events can be checked.
         """
         proc = None
         try:
@@ -212,8 +216,12 @@ class RcloneBackend(ArchiveBackend):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            # Poll with short intervals to allow signal handling
+            # Poll with short intervals to allow stop event to interrupt
             for _ in range(300):  # 30 seconds total (300 * 0.1s)
+                # Check if we should stop
+                if self.stop_event and self.stop_event.is_set():
+                    return False
+
                 returncode = proc.poll()
                 if returncode is not None:
                     # Log any output for debugging

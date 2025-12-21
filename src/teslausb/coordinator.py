@@ -123,6 +123,10 @@ class Coordinator:
         self._archive_count = 0
         self._error_count = 0
 
+        # Share stop event with backend if it supports it (for interruptible operations)
+        if hasattr(self.backend, 'stop_event'):
+            self.backend.stop_event = self._stop_event
+
     @property
     def state(self) -> CoordinatorState:
         """Current coordinator state."""
