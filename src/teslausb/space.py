@@ -18,15 +18,6 @@ logger = logging.getLogger(__name__)
 
 # Constants
 GB = 1024 * 1024 * 1024
-MB = 1024 * 1024
-
-
-class SpaceError(Exception):
-    """Base exception for space errors."""
-
-
-class SpaceExhaustedError(SpaceError):
-    """No space available and cannot free any."""
 
 
 @dataclass

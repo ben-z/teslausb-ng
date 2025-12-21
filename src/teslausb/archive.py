@@ -25,10 +25,6 @@ from .snapshot import SnapshotHandle, SnapshotManager
 logger = logging.getLogger(__name__)
 
 
-class ArchiveError(Exception):
-    """Base exception for archive errors."""
-
-
 class ArchiveState(Enum):
     """State of an archive operation."""
 
@@ -380,13 +376,12 @@ class ArchiveManager:
 
     def archive_new_snapshot(
         self,
-        mount_fn: Callable[[Path], Iterator[Path]] | None = None,
+        mount_fn: Callable[[Path], Iterator[Path]],
     ) -> ArchiveResult:
         """Create a new snapshot, mount it, and archive.
 
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
-                      If None, uses snapshot.path / "mnt" (for testing).
 
         Returns:
             ArchiveResult with details of the operation
@@ -395,11 +390,7 @@ class ArchiveManager:
         handle = self.snapshot_manager.acquire(snapshot.id)
 
         try:
-            if mount_fn:
-                with mount_fn(snapshot.image_path) as mount_path:
-                    return self.archive_snapshot(handle, mount_path)
-            else:
-                mount_path = snapshot.path / "mnt"
+            with mount_fn(snapshot.image_path) as mount_path:
                 return self.archive_snapshot(handle, mount_path)
         finally:
             handle.release()

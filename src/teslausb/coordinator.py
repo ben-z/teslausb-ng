@@ -27,7 +27,6 @@ from .archive import ArchiveBackend, ArchiveManager, ArchiveResult, ArchiveState
 from .filesystem import Filesystem
 from .idle import IdleDetector
 from .led import LedController, LedPattern
-from .mount import mount_image
 from .snapshot import SnapshotManager
 from .space import SpaceManager
 from .temperature import TemperatureMonitor
@@ -50,17 +49,16 @@ class CoordinatorState(Enum):
 class CoordinatorConfig:
     """Configuration for the Coordinator."""
 
+    # Required - function to mount snapshot images
+    mount_fn: Callable[[Path], Iterator[Path]]
+
     # Timing
     poll_interval: float = 5.0  # Seconds between archive reachability checks
     idle_timeout: float = 90.0  # Seconds to wait for idle before snapshot
 
-    # Archive settings
-    mount_fn: Callable[[Path], Iterator[Path]] | None = None  # None = use mock path for testing
-    wait_for_idle: bool = True  # Wait for car to stop writing before snapshot
-
     # Optional components (None = disabled)
     led_controller: LedController | None = None
-    idle_detector: IdleDetector | None = None
+    idle_detector: IdleDetector | None = None  # If set, waits for car to stop writing before snapshot
     temperature_monitor: TemperatureMonitor | None = None
 
     # Callbacks (optional)
@@ -94,7 +92,7 @@ class Coordinator:
         archive_manager: ArchiveManager,
         space_manager: SpaceManager,
         backend: ArchiveBackend,
-        config: CoordinatorConfig | None = None,
+        config: CoordinatorConfig,
     ):
         """Initialize the Coordinator.
 
@@ -104,14 +102,14 @@ class Coordinator:
             archive_manager: ArchiveManager instance
             space_manager: SpaceManager instance
             backend: Archive backend (for reachability checks)
-            config: Optional configuration
+            config: Coordinator configuration
         """
         self.fs = fs
         self.snapshot_manager = snapshot_manager
         self.archive_manager = archive_manager
         self.space_manager = space_manager
         self.backend = backend
-        self.config = config or CoordinatorConfig()
+        self.config = config
 
         self._state = CoordinatorState.STOPPED
         self._stop_event = Event()
@@ -197,8 +195,8 @@ class Coordinator:
         """
         self._set_state(CoordinatorState.ARCHIVING)
 
-        # Wait for car to stop writing (if enabled)
-        if self.config.wait_for_idle and self.config.idle_detector:
+        # Wait for car to stop writing (if idle detector configured)
+        if self.config.idle_detector:
             logger.info("Waiting for car to become idle...")
             if not self.config.idle_detector.wait_for_idle(self.config.idle_timeout):
                 logger.warning("Timeout waiting for idle, proceeding anyway")
@@ -365,68 +363,3 @@ class Coordinator:
             status["led_pattern"] = self.config.led_controller.get_pattern().value
 
         return status
-
-
-def create_coordinator(
-    backingfiles_path: Path = Path("/backingfiles"),
-    cam_disk_path: Path = Path("/backingfiles/cam_disk.bin"),
-    snapshots_path: Path = Path("/backingfiles/snapshots"),
-    cam_size: int = 40 * 1024 * 1024 * 1024,  # 40GB default
-    backend: ArchiveBackend | None = None,
-    config: CoordinatorConfig | None = None,
-) -> Coordinator:
-    """Factory function to create a fully configured Coordinator.
-
-    Args:
-        backingfiles_path: Path to backingfiles directory
-        cam_disk_path: Path to cam_disk.bin
-        snapshots_path: Path to snapshots directory
-        cam_size: Size of cam disk in bytes
-        backend: Archive backend (required for production)
-        config: Optional coordinator configuration
-
-    Returns:
-        Configured Coordinator instance
-    """
-    from .filesystem import RealFilesystem
-    from .archive import MockArchiveBackend
-
-    fs = RealFilesystem()
-
-    snapshot_manager = SnapshotManager(
-        fs=fs,
-        cam_disk_path=cam_disk_path,
-        snapshots_path=snapshots_path,
-    )
-
-    space_manager = SpaceManager(
-        fs=fs,
-        snapshot_manager=snapshot_manager,
-        backingfiles_path=backingfiles_path,
-        cam_size=cam_size,
-    )
-
-    if backend is None:
-        logger.warning("No backend provided, using mock backend")
-        backend = MockArchiveBackend()
-
-    archive_manager = ArchiveManager(
-        fs=fs,
-        snapshot_manager=snapshot_manager,
-        backend=backend,
-    )
-
-    # Default to real mount function for production
-    if config is None:
-        config = CoordinatorConfig(mount_fn=mount_image)
-    elif config.mount_fn is None:
-        config.mount_fn = mount_image
-
-    return Coordinator(
-        fs=fs,
-        snapshot_manager=snapshot_manager,
-        archive_manager=archive_manager,
-        space_manager=space_manager,
-        backend=backend,
-        config=config,
-    )

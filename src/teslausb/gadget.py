@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -35,34 +34,6 @@ class LunConfig:
     removable: bool = True
     readonly: bool = False
     cdrom: bool = False
-
-
-class Gadget(Protocol):
-    """Protocol for USB gadget operations."""
-
-    def initialize(self, luns: dict[int, LunConfig]) -> None:
-        """Create and configure the gadget."""
-        ...
-
-    def remove(self) -> None:
-        """Remove the gadget configuration."""
-        ...
-
-    def enable(self) -> None:
-        """Bind gadget to UDC - host sees the drives."""
-        ...
-
-    def disable(self) -> None:
-        """Unbind gadget from UDC - drives disappear."""
-        ...
-
-    def is_enabled(self) -> bool:
-        """Check if gadget is currently bound to UDC."""
-        ...
-
-    def is_initialized(self) -> bool:
-        """Check if gadget structure exists."""
-        ...
 
 
 class UsbGadget:

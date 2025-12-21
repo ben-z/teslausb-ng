@@ -6,7 +6,7 @@ import pytest
 
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
-from teslausb.space import SpaceManager, SpaceInfo, GB, MB
+from teslausb.space import SpaceManager, SpaceInfo, GB
 
 
 class TestSpaceInfo:

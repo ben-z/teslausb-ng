@@ -24,8 +24,9 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
 from .config import Config, ConfigError, load_from_env, load_from_file
-from .coordinator import Coordinator
+from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
+from .mount import mount_image
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .snapshot import SnapshotManager
 from .space import SpaceManager, GB
@@ -353,6 +354,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
+        config=CoordinatorConfig(mount_fn=mount_image),
     )
 
     logger.info("Starting TeslaUSB coordinator")
@@ -371,6 +373,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
+        config=CoordinatorConfig(mount_fn=mount_image),
     )
 
     success = coordinator.run_once()
@@ -622,13 +625,13 @@ def main() -> int:
     )
 
     # mount command
-    mount_parser = subparsers.add_parser("mount", help="Mount the backingfiles image")
+    subparsers.add_parser("mount", help="Mount the backingfiles image")
 
     # run command
-    run_parser = subparsers.add_parser("run", help="Run the main coordinator loop")
+    subparsers.add_parser("run", help="Run the main coordinator loop")
 
     # archive command
-    archive_parser = subparsers.add_parser("archive", help="Run a single archive cycle")
+    subparsers.add_parser("archive", help="Run a single archive cycle")
 
     # status command
     status_parser = subparsers.add_parser("status", help="Show current status")
@@ -645,7 +648,7 @@ def main() -> int:
     )
 
     # validate command
-    validate_parser = subparsers.add_parser("validate", help="Validate configuration")
+    subparsers.add_parser("validate", help="Validate configuration")
 
     # gadget command with subcommands
     gadget_parser = subparsers.add_parser("gadget", help="Manage USB gadget")
