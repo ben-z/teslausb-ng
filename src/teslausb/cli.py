@@ -446,7 +446,7 @@ def cmd_gadget(args: argparse.Namespace) -> int:
             print(f"Gadget setup complete with {len(luns)} LUN(s)")
             return 0
         except GadgetError as e:
-            print(f"Failed to setup gadget: {e}")
+            print(f"Failed to set up gadget: {e}")
             return 1
 
     elif args.gadget_command == "enable":
@@ -551,7 +551,7 @@ def main() -> int:
     gadget_parser = subparsers.add_parser("gadget", help="Manage USB gadget")
     gadget_subparsers = gadget_parser.add_subparsers(dest="gadget_command", help="Gadget command")
 
-    gadget_setup = gadget_subparsers.add_parser("setup", help="Setup USB gadget")
+    gadget_setup = gadget_subparsers.add_parser("setup", help="Set up USB gadget")
     gadget_setup.add_argument("--enable", action="store_true", help="Enable after setup")
 
     gadget_subparsers.add_parser("enable", help="Enable USB gadget")

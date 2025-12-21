@@ -62,7 +62,7 @@ teslausb setup
 
 This creates a sparse disk image at `/backingfiles/cam_disk.bin` with a FAT32 filesystem and TeslaCam directory.
 
-### Setup USB Gadget
+### USB Gadget
 
 Set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
 

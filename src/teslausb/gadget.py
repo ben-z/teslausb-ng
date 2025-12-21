@@ -140,7 +140,7 @@ class UsbGadget:
             GadgetError: If setup fails
         """
         if self.is_setup():
-            logger.info(f"Gadget {self.name} already setup")
+            logger.info(f"Gadget {self.name} already set up")
             return
 
         if not luns:
@@ -210,10 +210,10 @@ class UsbGadget:
             logger.info(f"Gadget {self.name} setup complete")
 
         except OSError as e:
-            logger.error(f"Failed to setup gadget: {e}")
+            logger.error(f"Failed to set up gadget: {e}")
             # Try to clean up partial setup
             self._cleanup_partial()
-            raise GadgetError(f"Failed to setup gadget: {e}") from e
+            raise GadgetError(f"Failed to set up gadget: {e}") from e
 
     def _setup_lun(self, func_path: Path, lun_id: int, config: LunConfig) -> None:
         """Configure a single LUN.
@@ -304,7 +304,7 @@ class UsbGadget:
             GadgetError: If gadget is not setup or binding fails
         """
         if not self.is_setup():
-            raise GadgetError("Gadget not setup")
+            raise GadgetError("Gadget not set up")
 
         if self.is_enabled():
             logger.debug("Gadget already enabled")
@@ -432,7 +432,7 @@ class MockGadget:
         return self._enabled
 
     def is_setup(self) -> bool:
-        """Check if mock gadget is setup."""
+        """Check if mock gadget is set up."""
         return self._setup
 
     def get_status(self) -> dict:

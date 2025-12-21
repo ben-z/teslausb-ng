@@ -64,7 +64,7 @@ class TestMockGadget:
         assert gadget.luns[0].disk_path == Path("/cam.bin")
 
     def test_setup_empty_luns_raises(self):
-        """Test that setup with no LUNs raises error."""
+        """Test that setting up with no LUNs raises error."""
         gadget = MockGadget()
 
         with pytest.raises(GadgetError):
@@ -81,7 +81,7 @@ class TestMockGadget:
         assert gadget.enable_count == 1
 
     def test_enable_without_setup_raises(self):
-        """Test that enabling without setup raises error."""
+        """Test that enabling without being set up raises error."""
         gadget = MockGadget()
 
         with pytest.raises(GadgetError):
@@ -167,7 +167,7 @@ class TestUsbGadget:
         assert gadget.is_setup()
 
     def test_is_enabled_false_when_not_setup(self, tmp_path):
-        """Test is_enabled returns False when not setup."""
+        """Test is_enabled returns False when not set up."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         assert not gadget.is_enabled()
@@ -187,14 +187,14 @@ class TestUsbGadget:
         assert gadget.is_enabled()
 
     def test_enable_without_setup_raises(self, tmp_path):
-        """Test enable raises when gadget not setup."""
+        """Test enable raises when gadget not set up."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
-        with pytest.raises(GadgetError, match="not setup"):
+        with pytest.raises(GadgetError, match="not set up"):
             gadget.enable()
 
     def test_get_status_not_setup(self, tmp_path):
-        """Test get_status when gadget not setup."""
+        """Test get_status when gadget not set up."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         status = gadget.get_status()
@@ -205,7 +205,7 @@ class TestUsbGadget:
         assert status["luns"] == {}
 
     def test_setup_empty_luns_raises(self, tmp_path):
-        """Test setup with empty LUNs raises error."""
+        """Test that setting up with empty LUNs raises error."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         with pytest.raises(GadgetError, match="At least one LUN"):
