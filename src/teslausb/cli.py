@@ -426,6 +426,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_gadget(args: argparse.Namespace) -> int:
     """Manage USB gadget."""
+    if args.gadget_command is None:
+        args.gadget_parser.print_help()
+        return 1
+
     gadget = UsbGadget()
 
     if args.gadget_command == "init":
@@ -543,6 +547,7 @@ def main() -> int:
 
     # gadget command with subcommands
     gadget_parser = subparsers.add_parser("gadget", help="Manage USB gadget")
+    gadget_parser.set_defaults(gadget_parser=gadget_parser)
     gadget_subparsers = gadget_parser.add_subparsers(dest="gadget_command", help="Gadget command")
 
     gadget_init = gadget_subparsers.add_parser("init", help="Initialize USB gadget")
