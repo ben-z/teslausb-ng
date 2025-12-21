@@ -41,7 +41,6 @@ class CoordinatorState(Enum):
     STARTING = "starting"
     WAITING_FOR_ARCHIVE = "waiting_for_archive"
     ARCHIVING = "archiving"
-    WAITING_FOR_DISCONNECT = "waiting_for_disconnect"
     CLEANING = "cleaning"
     STOPPED = "stopped"
     ERROR = "error"
@@ -53,7 +52,6 @@ class CoordinatorConfig:
 
     # Timing
     poll_interval: float = 5.0  # Seconds between archive reachability checks
-    disconnect_poll_interval: float = 30.0  # Seconds between disconnect checks
     idle_timeout: float = 90.0  # Seconds to wait for idle before snapshot
 
     # Archive settings
@@ -78,11 +76,9 @@ class Coordinator:
     The main loop:
     1. Wait for archive to become reachable (WiFi connected, server up)
     2. Wait for car to stop writing (idle detection)
-    3. Take snapshot
-    4. Archive snapshot
-    5. Clean up old snapshots if needed
-    6. Wait for archive to become unreachable (car driving away)
-    7. Repeat
+    3. Take snapshot and archive
+    4. Clean up old snapshots if needed
+    5. Repeat
 
     This design ensures:
     - Snapshots are only taken when we're about to archive
@@ -157,8 +153,6 @@ class Coordinator:
             led.set_pattern(LedPattern.SLOW_BLINK)
         elif state == CoordinatorState.ARCHIVING:
             led.set_pattern(LedPattern.FAST_BLINK)
-        elif state == CoordinatorState.WAITING_FOR_DISCONNECT:
-            led.set_pattern(LedPattern.HEARTBEAT)
         elif state == CoordinatorState.STOPPED:
             led.set_pattern(LedPattern.OFF)
 
@@ -185,27 +179,6 @@ class Coordinator:
 
             logger.debug("Archive not reachable, waiting...")
             if not self._wait_interruptible(self.config.poll_interval):
-                return False
-
-        return False
-
-    def _wait_for_archive_unreachable(self) -> bool:
-        """Wait for archive destination to become unreachable.
-
-        This typically happens when the car drives away from WiFi.
-
-        Returns:
-            True if unreachable, False if stopped
-        """
-        self._set_state(CoordinatorState.WAITING_FOR_DISCONNECT)
-
-        while not self._stop_event.is_set():
-            if not self.backend.is_reachable():
-                logger.info("Archive is no longer reachable")
-                return True
-
-            logger.debug("Archive still reachable, waiting for disconnect...")
-            if not self._wait_interruptible(self.config.disconnect_poll_interval):
                 return False
 
         return False
@@ -323,15 +296,15 @@ class Coordinator:
                 if not self._wait_for_archive_reachable():
                     break
 
-                # Do archive cycle
+                # Do archive cycle (waits for idle, then archives)
                 if not self._do_archive_cycle():
-                    # On error, wait a bit before retrying
+                    # On error, wait before retrying
                     if not self._wait_interruptible(30):
                         break
                     continue
 
-                # Wait for archive to become unreachable
-                if not self._wait_for_archive_unreachable():
+                # Brief pause before next cycle
+                if not self._wait_interruptible(self.config.poll_interval):
                     break
 
         finally:

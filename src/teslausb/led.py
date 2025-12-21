@@ -6,7 +6,7 @@ the current state of the archiving process.
 LED patterns:
 - slow_blink: Waiting for archive (900ms off, 100ms on)
 - fast_blink: Archiving in progress (150ms off, 50ms on)
-- heartbeat: Archive complete, waiting for disconnect
+- heartbeat: Rhythmic pulse pattern
 - off: LED disabled
 """
 

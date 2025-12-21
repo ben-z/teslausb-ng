@@ -81,10 +81,9 @@ while running:
         archive_manager.archive_snapshot(handle, mount_path)
 
     space_manager.cleanup_if_needed()
-    wait_for_archive_unreachable()
 ```
 
-Key: **no timer-based snapshots** - only when WiFi available.
+Archives continuously while WiFi is available. Idle detection gates each cycle.
 
 ## Storage Architecture
 
