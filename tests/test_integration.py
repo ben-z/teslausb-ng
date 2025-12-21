@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from teslausb.archive import ArchiveManager, MockArchiveBackend
 from teslausb.coordinator import Coordinator, CoordinatorConfig
@@ -10,9 +11,9 @@ from teslausb.filesystem import RealFilesystem
 from teslausb.snapshot import SnapshotManager
 from teslausb.space import SpaceManager
 
-CAM_DISK_SIZE = 2_000_000
-SAVED_CLIP_SIZE = 150_000
-SENTRY_CLIP_SIZE = 200_000
+CAM_DISK_SIZE_BYTES = 2_000_000
+SAVED_CLIP_SIZE_BYTES = 150_000
+SENTRY_CLIP_SIZE_BYTES = 200_000
 RESERVE_BYTES = 10 * 1024 * 1024
 SAVED_EVENT_ID = "2024-01-01_12-00-00"
 SENTRY_EVENT_ID = "2024-01-01_13-00-00"
@@ -26,17 +27,17 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
     cam_disk_path = backingfiles_path / "cam_disk.bin"
 
     backingfiles_path.mkdir(parents=True)
-    cam_disk_path.write_bytes(b"x" * CAM_DISK_SIZE)
+    cam_disk_path.write_bytes(b"x" * CAM_DISK_SIZE_BYTES)
 
     mount_source = tmp_path / "cam-mount-source"
     saved_event = mount_source / "TeslaCam" / "SavedClips" / SAVED_EVENT_ID
     saved_event.mkdir(parents=True)
-    (saved_event / "front.mp4").write_bytes(b"f" * SAVED_CLIP_SIZE)
-    (saved_event / "back.mp4").write_bytes(b"b" * SAVED_CLIP_SIZE)
+    (saved_event / "front.mp4").write_bytes(b"f" * SAVED_CLIP_SIZE_BYTES)
+    (saved_event / "back.mp4").write_bytes(b"b" * SAVED_CLIP_SIZE_BYTES)
 
     sentry_event = mount_source / "TeslaCam" / "SentryClips" / SENTRY_EVENT_ID
     sentry_event.mkdir(parents=True)
-    (sentry_event / "sentry.mp4").write_bytes(b"s" * SENTRY_CLIP_SIZE)
+    (sentry_event / "sentry.mp4").write_bytes(b"s" * SENTRY_CLIP_SIZE_BYTES)
 
     snapshot_manager = SnapshotManager(
         fs=fs,
@@ -48,7 +49,7 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
         fs=fs,
         snapshot_manager=snapshot_manager,
         backingfiles_path=backingfiles_path,
-        cam_size=CAM_DISK_SIZE,
+        cam_size=CAM_DISK_SIZE_BYTES,
         reserve=RESERVE_BYTES,
     )
 
@@ -62,7 +63,7 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
     )
 
     @contextmanager
-    def fake_mount(image_path: Path):
+    def fake_mount(image_path: Path) -> Iterator[Path]:
         mount_path = image_path.parent / "mnt"
         if mount_path.exists():
             shutil.rmtree(mount_path)
@@ -90,11 +91,11 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
 
     assert coordinator.run_once()
 
-    archived_paths = {str(path) for path in backend.archived_files}
+    archived_paths = set(backend.archived_files)
     assert archived_paths == {
-        f"SavedClips/{SAVED_EVENT_ID}/back.mp4",
-        f"SavedClips/{SAVED_EVENT_ID}/front.mp4",
-        f"SentryClips/{SENTRY_EVENT_ID}/sentry.mp4",
+        Path(f"SavedClips/{SAVED_EVENT_ID}/back.mp4"),
+        Path(f"SavedClips/{SAVED_EVENT_ID}/front.mp4"),
+        Path(f"SentryClips/{SENTRY_EVENT_ID}/sentry.mp4"),
     }
 
     snapshots = snapshot_manager.get_snapshots()
