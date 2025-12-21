@@ -89,7 +89,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/local/bin/teslausb gadget setup --enable
 ExecStart=/usr/local/bin/teslausb run
+ExecStopPost=/usr/local/bin/teslausb gadget teardown
 EnvironmentFile=/etc/teslausb.conf
 Restart=always
 RestartSec=10
