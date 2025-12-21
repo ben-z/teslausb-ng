@@ -9,6 +9,27 @@ teslausb-ng is a Python rewrite of [TeslaUSB](https://github.com/marcone/teslaus
 - Each module has one clear purpose
 - Tests use `MockFilesystem`, not real filesystem
 
+## Grammar
+
+In prose (comments, docstrings, error messages, documentation), use the verb form (two words). In identifiers (function names, command names, variables), the noun form (one word) is fine.
+
+| Noun (one word) | Verb (two words) |
+|-----------------|------------------|
+| setup | set up |
+| teardown | tear down |
+| cleanup | clean up |
+| startup | start up |
+| shutdown | shut down |
+| backup | back up |
+| login | log in |
+| logout | log out |
+
+Examples:
+- `gadget.setup()` - method name (noun form OK)
+- `"Failed to set up gadget"` - error message (use verb form)
+- `teslausb cleanup` - command name (noun form OK)
+- `"Clean up old snapshots"` - help text (use verb form)
+
 ## Modules
 
 | Module | Purpose |
