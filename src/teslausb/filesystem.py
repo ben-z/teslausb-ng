@@ -7,13 +7,17 @@ This module provides a protocol for filesystem operations and two implementation
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -226,9 +230,13 @@ class RealFilesystem(Filesystem):
             # Try cp --reflink=always first (works on XFS, btrfs)
             result = subprocess.run(
                 ["cp", "--reflink=always", str(src), str(dst)],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 check=False,
             )
+            if result.stderr:
+                for line in result.stderr.decode().splitlines():
+                    logger.debug(f"cp: {line}")
             if result.returncode == 0:
                 return
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -200,17 +201,36 @@ class RcloneBackend(ArchiveBackend):
             return f"{self.remote}:"
 
     def is_reachable(self) -> bool:
-        """Check if rclone remote is reachable."""
+        """Check if rclone remote is reachable.
+
+        Uses polling with short intervals so signals can be handled promptly.
+        """
+        proc = None
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ["rclone", "lsf", f"{self.remote}:", "--max-depth", "1"],
-                capture_output=True,
-                timeout=30,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            # Poll with short intervals to allow signal handling
+            for _ in range(300):  # 30 seconds total (300 * 0.1s)
+                returncode = proc.poll()
+                if returncode is not None:
+                    # Log any output for debugging
+                    stdout, stderr = proc.communicate()
+                    if stderr:
+                        for line in stderr.decode().splitlines():
+                            logger.debug(f"rclone: {line}")
+                    return returncode == 0
+                time.sleep(0.1)
+            # Timeout
             return False
+        except (OSError, FileNotFoundError):
+            return False
+        finally:
+            if proc is not None:
+                proc.kill()  # No-op if already exited
+                proc.wait()  # Reap zombie, returns immediately if already done
 
     def connect(self) -> None:
         """Verify rclone remote is accessible."""
@@ -229,14 +249,17 @@ class RcloneBackend(ArchiveBackend):
         try:
             result = subprocess.run(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=self.timeout,
                 check=False,
             )
+            if result.stderr:
+                for line in result.stderr.decode().splitlines():
+                    logger.debug(f"rclone: {line}")
             if result.returncode != 0:
-                logger.warning(f"rclone copyto failed: {result.stderr.decode()}")
-                return False
-            return True
+                logger.warning(f"rclone copyto failed for {src}")
+            return result.returncode == 0
         except subprocess.TimeoutExpired:
             logger.error(f"rclone timeout archiving {src}")
             return False
@@ -250,10 +273,14 @@ class RcloneBackend(ArchiveBackend):
         try:
             result = subprocess.run(
                 ["rclone", "lsf", dest],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=30,
                 check=False,
             )
+            if result.stderr:
+                for line in result.stderr.decode().splitlines():
+                    logger.debug(f"rclone: {line}")
             # lsf returns empty output if file doesn't exist
             return result.returncode == 0 and bool(result.stdout.strip())
         except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
@@ -265,10 +292,14 @@ class RcloneBackend(ArchiveBackend):
         try:
             result = subprocess.run(
                 ["rclone", "size", dest, "--json"],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=30,
                 check=False,
             )
+            if result.stderr:
+                for line in result.stderr.decode().splitlines():
+                    logger.debug(f"rclone: {line}")
             if result.returncode == 0:
                 import json
                 data = json.loads(result.stdout)

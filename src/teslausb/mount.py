@@ -21,9 +21,16 @@ class MountError(Exception):
 
 
 def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run command and return result."""
+    """Run command and return result.
+
+    Captures output and logs stderr for visibility.
+    """
     logger.debug(f"Running: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    if result.stderr:
+        for line in result.stderr.decode().splitlines():
+            logger.debug(f"{cmd[0]}: {line}")
+    return result
 
 
 @contextmanager
@@ -54,7 +61,7 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         # Create loop device with partition scanning
         result = _run(["losetup", "-Pf", "--show", str(image_path)])
         if result.returncode != 0:
-            raise MountError(f"losetup failed: {result.stderr.decode()}")
+            raise MountError("losetup failed")
 
         loop_dev = result.stdout.decode().strip()
         partition = f"{loop_dev}p1"
@@ -73,7 +80,7 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         # Mount the partition
         result = _run(["mount", "-o", "ro", partition, str(mount_point)])
         if result.returncode != 0:
-            raise MountError(f"mount failed: {result.stderr.decode()}")
+            raise MountError("mount failed")
 
         logger.info(f"Mounted {image_path} at {mount_point}")
         yield mount_point
@@ -83,7 +90,7 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         if mount_point and mount_point.exists():
             result = _run(["umount", str(mount_point)])
             if result.returncode != 0:
-                logger.warning(f"umount failed: {result.stderr.decode()}")
+                logger.warning("umount failed")
             try:
                 mount_point.rmdir()
             except OSError:
@@ -92,6 +99,6 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         if loop_dev:
             result = _run(["losetup", "-d", loop_dev])
             if result.returncode != 0:
-                logger.warning(f"losetup -d failed: {result.stderr.decode()}")
+                logger.warning("losetup -d failed")
 
         logger.debug(f"Cleaned up mount for {image_path}")

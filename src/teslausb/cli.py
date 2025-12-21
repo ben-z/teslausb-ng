@@ -30,6 +30,32 @@ from .space import SpaceManager, GB
 
 logger = logging.getLogger(__name__)
 
+# ANSI escape codes for dim text
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+
+def _run_cmd(cmd: list[str], capture_stdout: bool = False) -> subprocess.CompletedProcess:
+    """Run a command with stderr output shown in dim text.
+
+    Args:
+        cmd: Command and arguments to run
+        capture_stdout: If True, capture stdout for parsing; otherwise pass through
+
+    Returns:
+        CompletedProcess result
+    """
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE if capture_stdout else None,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.stderr:
+        for line in result.stderr.decode().splitlines():
+            print(f"{DIM}    {cmd[0]}: {line}{RESET}", file=sys.stderr)
+    return result
+
 
 def _get_version() -> str:
     """Get package version, with fallback for development."""
@@ -132,46 +158,23 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # Create sparse disk image
     print(f"  Creating {config.cam_size / GB:.1f} GB disk image (sparse)...")
-    try:
-        subprocess.run(
-            ["fallocate", "-l", str(config.cam_size), str(config.cam_disk_path)],
-            check=True,
-            capture_output=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    result = _run_cmd(["fallocate", "-l", str(config.cam_size), str(config.cam_disk_path)])
+    if result.returncode != 0:
         # fallocate may not be available or supported, fall back to truncate
-        try:
-            subprocess.run(
-                ["truncate", "-s", str(config.cam_size), str(config.cam_disk_path)],
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"  Failed to create disk image: {e.stderr.decode()}")
-            return 1
-        except FileNotFoundError:
-            print(f"  Neither 'fallocate' nor 'truncate' found")
+        result = _run_cmd(["truncate", "-s", str(config.cam_size), str(config.cam_disk_path)])
+        if result.returncode != 0:
+            print(f"  Failed to create disk image")
             return 1
 
     # Create partition table and filesystem
     print(f"  Creating partition table...")
-    try:
-        # Create MBR partition table with single FAT32 partition
-        subprocess.run(
-            ["parted", "-s", str(config.cam_disk_path), "mklabel", "msdos"],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["parted", "-s", str(config.cam_disk_path), "mkpart", "primary", "fat32", "0%", "100%"],
-            check=True,
-            capture_output=True,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"  Failed to create partition table: {e.stderr.decode()}")
+    result = _run_cmd(["parted", "-s", str(config.cam_disk_path), "mklabel", "msdos"])
+    if result.returncode != 0:
+        print(f"  Failed to create partition table")
         return 1
-    except FileNotFoundError:
-        print(f"  'parted' not found. Install it with: apt install parted")
+    result = _run_cmd(["parted", "-s", str(config.cam_disk_path), "mkpart", "primary", "fat32", "0%", "100%"])
+    if result.returncode != 0:
+        print(f"  Failed to create partition")
         return 1
 
     # Set up loop device and format
@@ -179,11 +182,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     loop_dev = None
     try:
         # Create loop device with partition scanning
-        result = subprocess.run(
-            ["losetup", "-Pf", "--show", str(config.cam_disk_path)],
-            check=True,
-            capture_output=True,
-        )
+        result = _run_cmd(["losetup", "-Pf", "--show", str(config.cam_disk_path)], capture_stdout=True)
+        if result.returncode != 0:
+            print(f"  Failed to create loop device")
+            return 1
         loop_dev = result.stdout.decode().strip()
         partition = f"{loop_dev}p1"
 
@@ -197,42 +199,34 @@ def cmd_init(args: argparse.Namespace) -> int:
             return 1
 
         # Format as FAT32
-        subprocess.run(
-            ["mkfs.vfat", "-F", "32", "-n", "TESLAUSB", partition],
-            check=True,
-            capture_output=True,
-        )
+        result = _run_cmd(["mkfs.vfat", "-F", "32", "-n", "TESLAUSB", partition])
+        if result.returncode != 0:
+            print(f"  Failed to format partition")
+            return 1
 
         # Create TeslaCam directory structure
         mount_point = Path("/tmp/teslausb-setup-mount")
         mount_point.mkdir(exist_ok=True)
 
-        subprocess.run(
-            ["mount", partition, str(mount_point)],
-            check=True,
-            capture_output=True,
-        )
+        result = _run_cmd(["mount", partition, str(mount_point)])
+        if result.returncode != 0:
+            print(f"  Failed to mount partition")
+            return 1
 
         try:
             (mount_point / "TeslaCam").mkdir()
             print(f"  Created TeslaCam directory")
         finally:
-            subprocess.run(["umount", str(mount_point)], capture_output=True)
+            _run_cmd(["umount", str(mount_point)])
             try:
                 mount_point.rmdir()
             except OSError:
                 pass
 
-    except subprocess.CalledProcessError as e:
-        print(f"  Failed to format disk: {e.stderr.decode() if e.stderr else e}")
-        return 1
-    except FileNotFoundError as e:
-        print(f"  Required tool not found: {e}")
-        return 1
     finally:
         # Always clean up loop device
         if loop_dev:
-            subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
+            _run_cmd(["losetup", "-d", loop_dev])
 
     print(f"\nInitialization complete!")
     print(f"  Disk image: {config.cam_disk_path}")
