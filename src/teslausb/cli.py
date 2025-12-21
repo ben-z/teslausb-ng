@@ -133,59 +133,81 @@ def create_components(config: Config) -> tuple[
     return fs, snapshot_manager, space_manager, archive_manager, backend
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    """Initialize TeslaUSB disk images and directory structure."""
-    config = load_config(args)
+def _is_mounted(path: Path) -> bool:
+    """Check if a path is a mount point."""
+    result = _run_cmd(["mountpoint", "-q", str(path)])
+    return result.returncode == 0
 
-    print(f"Initializing TeslaUSB...")
-    print(f"  Backingfiles path: {config.backingfiles_path}")
-    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
 
-    # Create directories
-    config.backingfiles_path.mkdir(parents=True, exist_ok=True)
-    config.snapshots_path.mkdir(parents=True, exist_ok=True)
-    print(f"  Created directories")
+def _get_fstype(path: Path) -> str | None:
+    """Get filesystem type of a mounted path."""
+    result = _run_cmd(["stat", "-f", "-c", "%T", str(path)], capture_stdout=True)
+    if result.returncode == 0:
+        return result.stdout.decode().strip()
+    return None
 
-    # Check if cam_disk already exists
-    if config.cam_disk_path.exists():
-        if not args.force:
-            print(f"  Cam disk already exists: {config.cam_disk_path}")
-            print(f"  Use --force to recreate")
-            return 0
-        else:
-            print(f"  Removing existing cam disk...")
-            config.cam_disk_path.unlink()
 
-    # Create sparse disk image
-    print(f"  Creating {config.cam_size / GB:.1f} GiB disk image (sparse)...")
-    result = _run_cmd(["fallocate", "-l", str(config.cam_size), str(config.cam_disk_path)])
+def _create_backingfiles_image(image_path: Path, size: int) -> bool:
+    """Create and format an XFS disk image for backingfiles."""
+    print(f"  Creating {size / GB:.1f} GiB XFS image at {image_path}...")
+
+    result = _run_cmd(["truncate", "-s", str(size), str(image_path)])
     if result.returncode != 0:
-        # fallocate may not be available or supported, fall back to truncate
-        result = _run_cmd(["truncate", "-s", str(config.cam_size), str(config.cam_disk_path)])
-        if result.returncode != 0:
-            print(f"  Failed to create disk image")
-            return 1
+        print(f"  Failed to create image file")
+        return False
 
-    # Create partition table and filesystem
+    result = _run_cmd(["mkfs.xfs", "-f", str(image_path)])
+    if result.returncode != 0:
+        print(f"  Failed to format as XFS (is xfsprogs installed?)")
+        return False
+
+    return True
+
+
+def _mount_backingfiles(image_path: Path, mount_path: Path) -> bool:
+    """Mount the backingfiles image."""
+    mount_path.mkdir(parents=True, exist_ok=True)
+
+    if _is_mounted(mount_path):
+        print(f"  {mount_path} is already mounted")
+        return True
+
+    print(f"  Mounting {image_path} at {mount_path}...")
+    result = _run_cmd(["mount", "-o", "loop", str(image_path), str(mount_path)])
+    if result.returncode != 0:
+        print(f"  Failed to mount image")
+        return False
+
+    return True
+
+
+def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
+    """Create the FAT32 cam disk image."""
+    print(f"  Creating {cam_size / GB:.1f} GiB cam disk (sparse)...")
+
+    result = _run_cmd(["truncate", "-s", str(cam_size), str(cam_disk_path)])
+    if result.returncode != 0:
+        print(f"  Failed to create disk image")
+        return False
+
     print(f"  Creating partition table...")
-    result = _run_cmd(["parted", "-s", str(config.cam_disk_path), "mklabel", "msdos"])
+    result = _run_cmd(["parted", "-s", str(cam_disk_path), "mklabel", "msdos"])
     if result.returncode != 0:
         print(f"  Failed to create partition table")
-        return 1
-    result = _run_cmd(["parted", "-s", str(config.cam_disk_path), "mkpart", "primary", "fat32", "0%", "100%"])
+        return False
+
+    result = _run_cmd(["parted", "-s", str(cam_disk_path), "mkpart", "primary", "fat32", "0%", "100%"])
     if result.returncode != 0:
         print(f"  Failed to create partition")
-        return 1
+        return False
 
-    # Set up loop device and format
-    print(f"  Formatting as FAT32...")
+    print(f"  Formatting cam disk as FAT32...")
     loop_dev = None
     try:
-        # Create loop device with partition scanning
-        result = _run_cmd(["losetup", "-Pf", "--show", str(config.cam_disk_path)], capture_stdout=True)
+        result = _run_cmd(["losetup", "-Pf", "--show", str(cam_disk_path)], capture_stdout=True)
         if result.returncode != 0:
             print(f"  Failed to create loop device")
-            return 1
+            return False
         loop_dev = result.stdout.decode().strip()
         partition = f"{loop_dev}p1"
 
@@ -196,13 +218,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             time.sleep(0.1)
         else:
             print(f"  Partition device {partition} not found")
-            return 1
+            return False
 
-        # Format as FAT32
         result = _run_cmd(["mkfs.vfat", "-F", "32", "-n", "TESLAUSB", partition])
         if result.returncode != 0:
             print(f"  Failed to format partition")
-            return 1
+            return False
 
         # Create TeslaCam directory structure
         mount_point = Path("/tmp/teslausb-setup-mount")
@@ -211,7 +232,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         result = _run_cmd(["mount", partition, str(mount_point)])
         if result.returncode != 0:
             print(f"  Failed to mount partition")
-            return 1
+            return False
 
         try:
             (mount_point / "TeslaCam").mkdir()
@@ -223,15 +244,66 @@ def cmd_init(args: argparse.Namespace) -> int:
             except OSError:
                 pass
 
+        return True
+
     finally:
-        # Always clean up loop device
         if loop_dev:
             _run_cmd(["losetup", "-d", loop_dev])
 
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize TeslaUSB disk images and directory structure."""
+    config = load_config(args)
+    backingfiles_img = config.mutable_path / "backingfiles.img"
+
+    print(f"Initializing TeslaUSB...")
+    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
+
+    # Step 1: Create XFS backingfiles image if needed
+    if not backingfiles_img.exists():
+        # Size: cam_disk + one full snapshot + reserve
+        backingfiles_size = config.cam_size * 2 + config.reserve
+        config.mutable_path.mkdir(parents=True, exist_ok=True)
+
+        if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
+            return 1
+    else:
+        print(f"  Backingfiles image exists: {backingfiles_img}")
+
+    # Step 2: Mount backingfiles
+    if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
+        return 1
+
+    # Verify it's XFS (required for reflinks)
+    fstype = _get_fstype(config.backingfiles_path)
+    if fstype != "xfs":
+        print(f"  Error: {config.backingfiles_path} is {fstype}, not xfs")
+        print(f"  Reflinks require XFS. Delete {backingfiles_img} and re-run init.")
+        return 1
+
+    # Step 3: Check if cam disk already exists (after mount!)
+    if config.cam_disk_path.exists():
+        if not args.force:
+            print(f"  Cam disk already exists: {config.cam_disk_path}")
+            print(f"  Use --force to recreate")
+            return 0
+        else:
+            print(f"  Removing existing cam disk...")
+            config.cam_disk_path.unlink()
+
+    # Step 4: Create snapshots directory and cam disk
+    config.snapshots_path.mkdir(parents=True, exist_ok=True)
+
+    if not _create_cam_disk(config.cam_disk_path, config.cam_size):
+        return 1
+
     print(f"\nInitialization complete!")
-    print(f"  Disk image: {config.cam_disk_path}")
+    print(f"  Backingfiles image: {backingfiles_img}")
+    print(f"  Cam disk: {config.cam_disk_path}")
+    print(f"\nTo make the mount persistent, add to /etc/fstab:")
+    print(f"  {backingfiles_img} {config.backingfiles_path} xfs loop 0 0")
     print(f"\nNext steps:")
-    print(f"  1. Configure archiving in /etc/teslausb.conf (optional)")
+    print(f"  1. Configure archiving in /etc/teslausb.conf")
     print(f"  2. Run: teslausb gadget init --enable")
     print(f"  3. Run: teslausb run")
 
