@@ -223,7 +223,7 @@ class TestArchiveManager:
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        # Setup snapshot
+        # Set up snapshot
         mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
         mock_fs_with_teslacam.write_text(
             Path("/backingfiles/snapshots/snap-000000/snap.bin"),
@@ -275,7 +275,7 @@ class TestArchiveManager:
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        # Setup snapshot
+        # Set up snapshot
         mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
         mock_fs_with_teslacam.write_text(
             Path("/backingfiles/snapshots/snap-000000/snap.bin"),

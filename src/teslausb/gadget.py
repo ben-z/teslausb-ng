@@ -40,11 +40,11 @@ class LunConfig:
 class Gadget(Protocol):
     """Protocol for USB gadget operations."""
 
-    def setup(self, luns: dict[int, LunConfig]) -> None:
+    def initialize(self, luns: dict[int, LunConfig]) -> None:
         """Create and configure the gadget."""
         ...
 
-    def teardown(self) -> None:
+    def remove(self) -> None:
         """Remove the gadget configuration."""
         ...
 
@@ -60,7 +60,7 @@ class Gadget(Protocol):
         """Check if gadget is currently bound to UDC."""
         ...
 
-    def is_setup(self) -> bool:
+    def is_initialized(self) -> bool:
         """Check if gadget structure exists."""
         ...
 
@@ -76,7 +76,7 @@ class UsbGadget:
 
     Example:
         gadget = UsbGadget()
-        gadget.setup({
+        gadget.initialize({
             0: LunConfig(disk_path=Path("/backingfiles/cam_disk.bin")),
         })
         gadget.enable()
@@ -129,7 +129,7 @@ class UsbGadget:
 
         return udcs[0].name
 
-    def setup(self, luns: dict[int, LunConfig]) -> None:
+    def initialize(self, luns: dict[int, LunConfig]) -> None:
         """Create gadget structure in configfs.
 
         Args:
@@ -137,10 +137,10 @@ class UsbGadget:
                   LUN 0 is typically the camera disk, LUN 1 is music, etc.
 
         Raises:
-            GadgetError: If setup fails
+            GadgetError: If initialization fails
         """
-        if self.is_setup():
-            logger.info(f"Gadget {self.name} already set up")
+        if self.is_initialized():
+            logger.info(f"Gadget {self.name} already initialized")
             return
 
         if not luns:
@@ -165,7 +165,7 @@ class UsbGadget:
             if not config.disk_path.exists():
                 raise GadgetError(f"Disk image not found: {config.disk_path}")
 
-        logger.info(f"Setting up gadget {self.name} with {len(luns)} LUN(s)")
+        logger.info(f"Initializing gadget {self.name} with {len(luns)} LUN(s)")
 
         try:
             # Create gadget directory
@@ -190,7 +190,7 @@ class UsbGadget:
 
             # Configure each LUN
             for lun_id, config in sorted(luns.items()):
-                self._setup_lun(func, lun_id, config)
+                self._configure_lun(func, lun_id, config)
 
             # Create configuration
             cfg = self.path / "configs" / "c.1"
@@ -207,15 +207,15 @@ class UsbGadget:
             if not link.exists():
                 link.symlink_to(func)
 
-            logger.info(f"Gadget {self.name} setup complete")
+            logger.info(f"Gadget {self.name} initialized")
 
         except OSError as e:
-            logger.error(f"Failed to set up gadget: {e}")
-            # Try to clean up partial setup
+            logger.error(f"Failed to initialize gadget: {e}")
+            # Try to clean up partial initialization
             self._cleanup_partial()
-            raise GadgetError(f"Failed to set up gadget: {e}") from e
+            raise GadgetError(f"Failed to initialize gadget: {e}") from e
 
-    def _setup_lun(self, func_path: Path, lun_id: int, config: LunConfig) -> None:
+    def _configure_lun(self, func_path: Path, lun_id: int, config: LunConfig) -> None:
         """Configure a single LUN.
 
         Args:
@@ -246,15 +246,15 @@ class UsbGadget:
         except OSError:
             pass
 
-    def teardown(self) -> None:
+    def remove(self) -> None:
         """Remove gadget from configfs.
 
         This will disable the gadget first if it's enabled.
         """
-        if not self.is_setup():
+        if not self.is_initialized():
             return
 
-        logger.info(f"Tearing down gadget {self.name}")
+        logger.info(f"Removing gadget {self.name}")
 
         # Must disable first
         self.disable()
@@ -294,17 +294,17 @@ class UsbGadget:
             logger.info(f"Gadget {self.name} removed")
 
         except OSError as e:
-            logger.error(f"Failed to tear down gadget: {e}")
-            raise GadgetError(f"Failed to tear down gadget: {e}") from e
+            logger.error(f"Failed to remove gadget: {e}")
+            raise GadgetError(f"Failed to remove gadget: {e}") from e
 
     def enable(self) -> None:
         """Bind gadget to UDC - Tesla sees the drives.
 
         Raises:
-            GadgetError: If gadget is not setup or binding fails
+            GadgetError: If gadget is not initialized or binding fails
         """
-        if not self.is_setup():
-            raise GadgetError("Gadget not set up")
+        if not self.is_initialized():
+            raise GadgetError("Gadget not initialized")
 
         if self.is_enabled():
             logger.debug("Gadget already enabled")
@@ -341,7 +341,7 @@ class UsbGadget:
             return False
         return bool(self._read(udc_file))
 
-    def is_setup(self) -> bool:
+    def is_initialized(self) -> bool:
         """Check if gadget structure exists in configfs.
 
         Returns:
@@ -357,13 +357,13 @@ class UsbGadget:
         """
         status = {
             "name": self.name,
-            "setup": self.is_setup(),
+            "initialized": self.is_initialized(),
             "enabled": False,
             "udc": None,
             "luns": {},
         }
 
-        if not self.is_setup():
+        if not self.is_initialized():
             return status
 
         # Get UDC
@@ -395,34 +395,34 @@ class MockGadget:
     """
 
     def __init__(self):
-        self._setup = False
+        self._initialized = False
         self._enabled = False
         self.luns: dict[int, LunConfig] = {}
         self.enable_count = 0
         self.disable_count = 0
 
-    def setup(self, luns: dict[int, LunConfig]) -> None:
-        """Record gadget setup."""
+    def initialize(self, luns: dict[int, LunConfig]) -> None:
+        """Initialize mock gadget."""
         if not luns:
             raise GadgetError("At least one LUN must be configured")
         self.luns = {k: v for k, v in luns.items()}
-        self._setup = True
+        self._initialized = True
 
-    def teardown(self) -> None:
-        """Record gadget teardown."""
+    def remove(self) -> None:
+        """Remove mock gadget."""
         self._enabled = False
-        self._setup = False
+        self._initialized = False
         self.luns.clear()
 
     def enable(self) -> None:
-        """Record gadget enable."""
-        if not self._setup:
-            raise GadgetError("Gadget not setup")
+        """Enable mock gadget."""
+        if not self._initialized:
+            raise GadgetError("Gadget not initialized")
         self._enabled = True
         self.enable_count += 1
 
     def disable(self) -> None:
-        """Record gadget disable."""
+        """Disable mock gadget."""
         if self._enabled:
             self._enabled = False
             self.disable_count += 1
@@ -431,15 +431,15 @@ class MockGadget:
         """Check if mock gadget is enabled."""
         return self._enabled
 
-    def is_setup(self) -> bool:
-        """Check if mock gadget is set up."""
-        return self._setup
+    def is_initialized(self) -> bool:
+        """Check if mock gadget is initialized."""
+        return self._initialized
 
     def get_status(self) -> dict:
         """Get mock gadget status."""
         return {
             "name": "mock",
-            "setup": self._setup,
+            "initialized": self._initialized,
             "enabled": self._enabled,
             "udc": "mock-udc" if self._enabled else None,
             "luns": {

@@ -6,9 +6,9 @@ Simple, focused module for mounting disk images via loop devices.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -63,7 +63,6 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         for _ in range(10):
             if Path(partition).exists():
                 break
-            import time
             time.sleep(0.1)
         else:
             raise MountError(f"Partition device {partition} not found")

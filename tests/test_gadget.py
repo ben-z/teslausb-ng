@@ -45,43 +45,43 @@ class TestMockGadget:
         """Test mock gadget starts in correct state."""
         gadget = MockGadget()
 
-        assert not gadget.is_setup()
+        assert not gadget.is_initialized()
         assert not gadget.is_enabled()
         assert gadget.luns == {}
 
-    def test_setup(self):
-        """Test setting up mock gadget."""
+    def test_initialize(self):
+        """Test initializing mock gadget."""
         gadget = MockGadget()
         luns = {
             0: LunConfig(disk_path=Path("/cam.bin")),
             1: LunConfig(disk_path=Path("/music.bin")),
         }
 
-        gadget.setup(luns)
+        gadget.initialize(luns)
 
-        assert gadget.is_setup()
+        assert gadget.is_initialized()
         assert len(gadget.luns) == 2
         assert gadget.luns[0].disk_path == Path("/cam.bin")
 
-    def test_setup_empty_luns_raises(self):
-        """Test that setting up with no LUNs raises error."""
+    def test_initialize_empty_luns_raises(self):
+        """Test that initializing with no LUNs raises error."""
         gadget = MockGadget()
 
         with pytest.raises(GadgetError):
-            gadget.setup({})
+            gadget.initialize({})
 
     def test_enable(self):
         """Test enabling mock gadget."""
         gadget = MockGadget()
-        gadget.setup({0: LunConfig(disk_path=Path("/disk.bin"))})
+        gadget.initialize({0: LunConfig(disk_path=Path("/disk.bin"))})
 
         gadget.enable()
 
         assert gadget.is_enabled()
         assert gadget.enable_count == 1
 
-    def test_enable_without_setup_raises(self):
-        """Test that enabling without being set up raises error."""
+    def test_enable_without_init_raises(self):
+        """Test that enabling without being initialized raises error."""
         gadget = MockGadget()
 
         with pytest.raises(GadgetError):
@@ -90,7 +90,7 @@ class TestMockGadget:
     def test_disable(self):
         """Test disabling mock gadget."""
         gadget = MockGadget()
-        gadget.setup({0: LunConfig(disk_path=Path("/disk.bin"))})
+        gadget.initialize({0: LunConfig(disk_path=Path("/disk.bin"))})
         gadget.enable()
 
         gadget.disable()
@@ -101,28 +101,28 @@ class TestMockGadget:
     def test_disable_when_not_enabled(self):
         """Test disabling when not enabled is safe."""
         gadget = MockGadget()
-        gadget.setup({0: LunConfig(disk_path=Path("/disk.bin"))})
+        gadget.initialize({0: LunConfig(disk_path=Path("/disk.bin"))})
 
         gadget.disable()  # Should not raise
 
         assert gadget.disable_count == 0  # Wasn't actually enabled
 
-    def test_teardown(self):
-        """Test tearing down mock gadget."""
+    def test_remove(self):
+        """Test removing mock gadget."""
         gadget = MockGadget()
-        gadget.setup({0: LunConfig(disk_path=Path("/disk.bin"))})
+        gadget.initialize({0: LunConfig(disk_path=Path("/disk.bin"))})
         gadget.enable()
 
-        gadget.teardown()
+        gadget.remove()
 
-        assert not gadget.is_setup()
+        assert not gadget.is_initialized()
         assert not gadget.is_enabled()
         assert gadget.luns == {}
 
     def test_get_status(self):
         """Test getting mock gadget status."""
         gadget = MockGadget()
-        gadget.setup({
+        gadget.initialize({
             0: LunConfig(disk_path=Path("/cam.bin")),
             1: LunConfig(disk_path=Path("/music.bin"), readonly=True),
         })
@@ -130,7 +130,7 @@ class TestMockGadget:
 
         status = gadget.get_status()
 
-        assert status["setup"] is True
+        assert status["initialized"] is True
         assert status["enabled"] is True
         assert status["udc"] == "mock-udc"
         assert len(status["luns"]) == 2
@@ -153,21 +153,21 @@ class TestUsbGadget:
         assert gadget.name == "test"
         assert gadget.path == Path("/tmp/fake/test")
 
-    def test_is_setup_false_when_not_exists(self, tmp_path):
-        """Test is_setup returns False when gadget doesn't exist."""
+    def test_is_initialized_false_when_not_exists(self, tmp_path):
+        """Test is_initialized returns False when gadget doesn't exist."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
-        assert not gadget.is_setup()
+        assert not gadget.is_initialized()
 
-    def test_is_setup_true_when_exists(self, tmp_path):
-        """Test is_setup returns True when gadget directory exists."""
+    def test_is_initialized_true_when_exists(self, tmp_path):
+        """Test is_initialized returns True when gadget directory exists."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
         (tmp_path / "test").mkdir()
 
-        assert gadget.is_setup()
+        assert gadget.is_initialized()
 
-    def test_is_enabled_false_when_not_setup(self, tmp_path):
-        """Test is_enabled returns False when not set up."""
+    def test_is_enabled_false_when_not_initialized(self, tmp_path):
+        """Test is_enabled returns False when not initialized."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         assert not gadget.is_enabled()
@@ -186,27 +186,27 @@ class TestUsbGadget:
         (gadget_path / "UDC").write_text("fe980000.usb\n")
         assert gadget.is_enabled()
 
-    def test_enable_without_setup_raises(self, tmp_path):
-        """Test enable raises when gadget not set up."""
+    def test_enable_without_init_raises(self, tmp_path):
+        """Test enable raises when gadget not initialized."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
-        with pytest.raises(GadgetError, match="not set up"):
+        with pytest.raises(GadgetError, match="not initialized"):
             gadget.enable()
 
-    def test_get_status_not_setup(self, tmp_path):
-        """Test get_status when gadget not set up."""
+    def test_get_status_not_initialized(self, tmp_path):
+        """Test get_status when gadget not initialized."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         status = gadget.get_status()
 
         assert status["name"] == "test"
-        assert status["setup"] is False
+        assert status["initialized"] is False
         assert status["enabled"] is False
         assert status["luns"] == {}
 
-    def test_setup_empty_luns_raises(self, tmp_path):
-        """Test that setting up with empty LUNs raises error."""
+    def test_initialize_empty_luns_raises(self, tmp_path):
+        """Test that initializing with empty LUNs raises error."""
         gadget = UsbGadget(name="test", configfs=tmp_path)
 
         with pytest.raises(GadgetError, match="At least one LUN"):
-            gadget.setup({})
+            gadget.initialize({})

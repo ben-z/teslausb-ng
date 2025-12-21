@@ -25,7 +25,7 @@ In prose (comments, docstrings, error messages, documentation), use the verb for
 | logout | log out |
 
 Examples:
-- `gadget.setup()` - method name (noun form OK)
+- `backup_path` - variable name (noun form OK)
 - `"Failed to set up gadget"` - error message (use verb form)
 - `teslausb clean` - command uses verb form
 - `"Clean up old snapshots"` - help text (use verb form)

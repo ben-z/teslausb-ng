@@ -39,7 +39,7 @@ def _get_version() -> str:
         return "dev"
 
 
-def setup_logging(verbose: bool = False, debug: bool = False) -> None:
+def configure_logging(verbose: bool = False, debug: bool = False) -> None:
     """Configure logging."""
     if debug:
         level = logging.DEBUG
@@ -111,7 +111,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     """Initialize TeslaUSB disk images and directory structure."""
     config = load_config(args)
 
-    print(f"Setting up TeslaUSB...")
+    print(f"Initializing TeslaUSB...")
     print(f"  Backingfiles path: {config.backingfiles_path}")
     print(f"  Cam disk size: {config.cam_size / GB:.1f} GB")
 
@@ -234,7 +234,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         if loop_dev:
             subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
 
-    print(f"\nSetup complete!")
+    print(f"\nInitialization complete!")
     print(f"  Disk image: {config.cam_disk_path}")
     print(f"\nNext steps:")
     print(f"  1. Configure archiving in /etc/teslausb.conf (optional)")
@@ -440,13 +440,13 @@ def cmd_gadget(args: argparse.Namespace) -> int:
         luns = {0: LunConfig(disk_path=config.cam_disk_path)}
 
         try:
-            gadget.setup(luns)
+            gadget.initialize(luns)
             if args.enable:
                 gadget.enable()
-            print(f"Gadget setup complete with {len(luns)} LUN(s)")
+            print(f"Gadget initialized with {len(luns)} LUN(s)")
             return 0
         except GadgetError as e:
-            print(f"Failed to set up gadget: {e}")
+            print(f"Failed to initialize gadget: {e}")
             return 1
 
     elif args.gadget_command == "enable":
@@ -469,7 +469,7 @@ def cmd_gadget(args: argparse.Namespace) -> int:
 
     elif args.gadget_command == "remove":
         try:
-            gadget.teardown()
+            gadget.remove()
             print("Gadget removed")
             return 0
         except GadgetError as e:
@@ -483,7 +483,7 @@ def cmd_gadget(args: argparse.Namespace) -> int:
             print(json.dumps(status, indent=2))
         else:
             print(f"Gadget: {status['name']}")
-            print(f"  Setup: {'Yes' if status['setup'] else 'No'}")
+            print(f"  Initialized: {'Yes' if status['initialized'] else 'No'}")
             print(f"  Enabled: {'Yes' if status['enabled'] else 'No'}")
             if status['udc']:
                 print(f"  UDC: {status['udc']}")
@@ -563,7 +563,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    setup_logging(verbose=args.verbose, debug=args.debug)
+    configure_logging(verbose=args.verbose, debug=args.debug)
 
     if args.command is None:
         parser.print_help()
