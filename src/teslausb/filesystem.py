@@ -64,6 +64,10 @@ class PermissionError_(FilesystemError):
     """Permission denied."""
 
 
+class ReflinkNotSupportedError(FilesystemError):
+    """Filesystem does not support reflinks (COW copies)."""
+
+
 class Filesystem(ABC):
     """Abstract base class for filesystem operations."""
 
@@ -225,27 +229,27 @@ class RealFilesystem(Filesystem):
             raise PermissionError_(str(src)) from e
 
     def copy_reflink(self, src: Path, dst: Path) -> None:
-        """Copy using reflink (COW). Falls back to regular copy if not supported."""
-        try:
-            # Try cp --reflink=always first (works on XFS, btrfs)
-            result = subprocess.run(
-                ["cp", "--reflink=always", str(src), str(dst)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if result.stderr:
-                for line in result.stderr.decode().splitlines():
-                    logger.debug(f"cp: {line}")
-            if result.returncode == 0:
-                return
+        """Copy using reflink (COW). Raises error if not supported.
 
-            # Fallback to regular copy
-            self.copy(src, dst)
-        except FileNotFoundError as e:
-            raise FileNotFoundError_(str(src)) from e
-        except PermissionError as e:
-            raise PermissionError_(str(src)) from e
+        Reflinks are required for efficient snapshots - without them,
+        each snapshot would copy the entire disk image.
+
+        Raises:
+            ReflinkNotSupportedError: If reflink copy fails for any reason
+        """
+        result = subprocess.run(
+            ["cp", "--reflink=always", str(src), str(dst)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+
+        stderr = result.stderr.decode().strip() if result.stderr else "unknown error"
+        raise ReflinkNotSupportedError(
+            f"Reflink copy failed. TeslaUSB requires XFS or btrfs. Error: {stderr}"
+        )
 
     def read_text(self, path: Path) -> str:
         try:
