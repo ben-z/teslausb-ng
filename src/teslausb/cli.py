@@ -473,7 +473,7 @@ def cmd_gadget(args: argparse.Namespace) -> int:
             print("Gadget removed")
             return 0
         except GadgetError as e:
-            print(f"Failed to teardown gadget: {e}")
+            print(f"Failed to tear down gadget: {e}")
             return 1
 
     elif args.gadget_command == "status":

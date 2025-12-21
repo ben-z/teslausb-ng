@@ -294,8 +294,8 @@ class UsbGadget:
             logger.info(f"Gadget {self.name} removed")
 
         except OSError as e:
-            logger.error(f"Failed to teardown gadget: {e}")
-            raise GadgetError(f"Failed to teardown gadget: {e}") from e
+            logger.error(f"Failed to tear down gadget: {e}")
+            raise GadgetError(f"Failed to tear down gadget: {e}") from e
 
     def enable(self) -> None:
         """Bind gadget to UDC - Tesla sees the drives.
