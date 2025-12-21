@@ -27,8 +27,10 @@ In prose (comments, docstrings, error messages, documentation), use the verb for
 Examples:
 - `gadget.setup()` - method name (noun form OK)
 - `"Failed to set up gadget"` - error message (use verb form)
-- `teslausb cleanup` - command name (noun form OK)
+- `teslausb clean` - command uses verb form
 - `"Clean up old snapshots"` - help text (use verb form)
+
+CLI commands use verb forms: `init`, `run`, `clean`, `validate`, `enable`, `disable`, `remove`.
 
 ## Modules
 

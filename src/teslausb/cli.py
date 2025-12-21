@@ -1,12 +1,12 @@
 """Command-line interface for TeslaUSB.
 
 Usage:
-    teslausb setup         # Create disk images and directory structure
+    teslausb init          # Create disk images and directory structure
     teslausb run           # Run the main coordinator loop
     teslausb archive       # Run a single archive cycle
     teslausb status        # Show current status
     teslausb snapshots     # List snapshots
-    teslausb cleanup       # Clean up old snapshots
+    teslausb clean         # Clean up old snapshots
     teslausb validate      # Validate configuration
 """
 
@@ -107,8 +107,8 @@ def create_components(config: Config) -> tuple[
     return fs, snapshot_manager, space_manager, archive_manager, backend
 
 
-def cmd_setup(args: argparse.Namespace) -> int:
-    """Set up TeslaUSB disk images and directory structure."""
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize TeslaUSB disk images and directory structure."""
     config = load_config(args)
 
     print(f"Setting up TeslaUSB...")
@@ -238,7 +238,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print(f"  Disk image: {config.cam_disk_path}")
     print(f"\nNext steps:")
     print(f"  1. Configure archiving in /etc/teslausb.conf (optional)")
-    print(f"  2. Run: teslausb gadget setup --enable")
+    print(f"  2. Run: teslausb gadget init --enable")
     print(f"  3. Run: teslausb run")
 
     return 0
@@ -367,7 +367,7 @@ def cmd_snapshots(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_cleanup(args: argparse.Namespace) -> int:
+def cmd_clean(args: argparse.Namespace) -> int:
     """Clean up old snapshots."""
     config = load_config(args)
     fs, snapshot_manager, space_manager, _, _ = create_components(config)
@@ -434,7 +434,7 @@ def cmd_gadget(args: argparse.Namespace) -> int:
     """Manage USB gadget."""
     gadget = UsbGadget()
 
-    if args.gadget_command == "setup":
+    if args.gadget_command == "init":
         config = load_config(args)
 
         luns = {0: LunConfig(disk_path=config.cam_disk_path)}
@@ -467,13 +467,13 @@ def cmd_gadget(args: argparse.Namespace) -> int:
             print(f"Failed to disable gadget: {e}")
             return 1
 
-    elif args.gadget_command == "teardown":
+    elif args.gadget_command == "remove":
         try:
             gadget.teardown()
             print("Gadget removed")
             return 0
         except GadgetError as e:
-            print(f"Failed to tear down gadget: {e}")
+            print(f"Failed to remove gadget: {e}")
             return 1
 
     elif args.gadget_command == "status":
@@ -518,9 +518,9 @@ def main() -> int:
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # setup command
-    setup_parser = subparsers.add_parser("setup", help="Create disk images and directory structure")
-    setup_parser.add_argument(
+    # init command
+    init_parser = subparsers.add_parser("init", help="Initialize disk images and directory structure")
+    init_parser.add_argument(
         "--force", action="store_true", help="Recreate disk image if it exists"
     )
 
@@ -538,9 +538,9 @@ def main() -> int:
     snap_parser = subparsers.add_parser("snapshots", help="List snapshots")
     snap_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
-    # cleanup command
-    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up old snapshots")
-    cleanup_parser.add_argument(
+    # clean command
+    clean_parser = subparsers.add_parser("clean", help="Clean up old snapshots")
+    clean_parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be deleted"
     )
 
@@ -551,12 +551,12 @@ def main() -> int:
     gadget_parser = subparsers.add_parser("gadget", help="Manage USB gadget")
     gadget_subparsers = gadget_parser.add_subparsers(dest="gadget_command", help="Gadget command")
 
-    gadget_setup = gadget_subparsers.add_parser("setup", help="Set up USB gadget")
-    gadget_setup.add_argument("--enable", action="store_true", help="Enable after setup")
+    gadget_init = gadget_subparsers.add_parser("init", help="Initialize USB gadget")
+    gadget_init.add_argument("--enable", action="store_true", help="Enable after init")
 
     gadget_subparsers.add_parser("enable", help="Enable USB gadget")
     gadget_subparsers.add_parser("disable", help="Disable USB gadget")
-    gadget_subparsers.add_parser("teardown", help="Remove USB gadget")
+    gadget_subparsers.add_parser("remove", help="Remove USB gadget")
 
     gadget_status = gadget_subparsers.add_parser("status", help="Show gadget status")
     gadget_status.add_argument("--json", action="store_true", help="Output as JSON")
@@ -570,12 +570,12 @@ def main() -> int:
         return 1
 
     commands = {
-        "setup": cmd_setup,
+        "init": cmd_init,
         "run": cmd_run,
         "archive": cmd_archive,
         "status": cmd_status,
         "snapshots": cmd_snapshots,
-        "cleanup": cmd_cleanup,
+        "clean": cmd_clean,
         "validate": cmd_validate,
         "gadget": cmd_gadget,
     }

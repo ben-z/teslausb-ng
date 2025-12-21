@@ -52,12 +52,12 @@ Or export environment variables directly.
 
 ## Running
 
-### Initial Setup
+### Initialize
 
 First, create the disk image and directory structure:
 
 ```bash
-teslausb setup
+teslausb init
 ```
 
 This creates a sparse disk image at `/backingfiles/cam_disk.bin` with a FAT32 filesystem and TeslaCam directory.
@@ -67,7 +67,7 @@ This creates a sparse disk image at `/backingfiles/cam_disk.bin` with a FAT32 fi
 Set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
 
 ```bash
-teslausb gadget setup --enable
+teslausb gadget init --enable
 ```
 
 This binds the disk image to the USB controller.
@@ -89,9 +89,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/local/bin/teslausb gadget setup --enable
+ExecStartPre=/usr/local/bin/teslausb gadget init --enable
 ExecStart=/usr/local/bin/teslausb run
-ExecStopPost=/usr/local/bin/teslausb gadget teardown
+ExecStopPost=/usr/local/bin/teslausb gadget remove
 EnvironmentFile=/etc/teslausb.conf
 Restart=always
 RestartSec=10
@@ -108,12 +108,12 @@ sudo systemctl start teslausb
 
 | Command | Description |
 |---------|-------------|
-| `teslausb setup` | Create disk image and directories |
+| `teslausb init` | Initialize disk image and directories |
 | `teslausb run` | Main loop: wait for WiFi, snapshot, archive, repeat |
 | `teslausb archive` | Single archive cycle |
 | `teslausb status` | Show space and snapshot info |
 | `teslausb snapshots` | List snapshots |
-| `teslausb cleanup` | Delete old snapshots |
+| `teslausb clean` | Delete old snapshots |
 | `teslausb validate` | Check configuration |
 | `teslausb gadget` | Manage USB mass storage |
 
