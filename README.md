@@ -48,6 +48,10 @@ Or export environment variables directly.
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
 | `RCLONE_PATH` | Path within remote | |
+| `ARCHIVE_SAVEDCLIPS` | Archive SavedClips | `true` |
+| `ARCHIVE_SENTRYCLIPS` | Archive SentryClips | `true` |
+| `ARCHIVE_RECENTCLIPS` | Archive RecentClips (rolling buffer) | `false` |
+| `ARCHIVE_TRACKMODECLIPS` | Archive TrackMode clips | `true` |
 
 ## Running
 
