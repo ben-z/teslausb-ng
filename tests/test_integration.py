@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from typing import Iterator
 
@@ -17,6 +18,19 @@ SENTRY_CLIP_SIZE_BYTES = 200_000
 RESERVE_BYTES = 10 * 1024 * 1024
 SAVED_EVENT_ID = "2024-01-01_12-00-00"
 SENTRY_EVENT_ID = "2024-01-01_13-00-00"
+
+
+@contextmanager
+def mount_from_source(image_path: Path, mount_source: Path) -> Iterator[Path]:
+    mount_path = image_path.parent / "mnt"
+    if mount_path.exists():
+        shutil.rmtree(mount_path)
+    shutil.copytree(mount_source, mount_path)
+    try:
+        yield mount_path
+    finally:
+        if mount_path.exists():
+            shutil.rmtree(mount_path)
 
 
 def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
@@ -64,17 +78,7 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
         archive_track=False,
     )
 
-    @contextmanager
-    def fake_mount(image_path: Path) -> Iterator[Path]:
-        mount_path = image_path.parent / "mnt"
-        if mount_path.exists():
-            shutil.rmtree(mount_path)
-        shutil.copytree(mount_source, mount_path)
-        try:
-            yield mount_path
-        finally:
-            if mount_path.exists():
-                shutil.rmtree(mount_path)
+    mount_fn = partial(mount_from_source, mount_source=mount_source)
 
     coordinator = Coordinator(
         fs=fs,
@@ -83,7 +87,7 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
         space_manager=space_manager,
         backend=backend,
         config=CoordinatorConfig(
-            mount_fn=fake_mount,
+            mount_fn=mount_fn,
             fsck_on_snapshot=False,
             wait_for_idle=False,
             poll_interval=0.01,
@@ -93,7 +97,7 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
 
     assert coordinator.run_once()
 
-    archived_paths = set(backend.archived_files)
+    archived_paths = set(backend.archived_files.keys())
     assert archived_paths == {
         Path(f"SavedClips/{SAVED_EVENT_ID}/back.mp4"),
         Path(f"SavedClips/{SAVED_EVENT_ID}/front.mp4"),
