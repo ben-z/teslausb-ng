@@ -58,6 +58,8 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
         fs=fs,
         snapshot_manager=snapshot_manager,
         backend=backend,
+        archive_saved=True,
+        archive_sentry=True,
         archive_recent=False,
         archive_track=False,
     )
