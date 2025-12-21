@@ -148,10 +148,17 @@ class UsbGadget:
 
         # Check prerequisites
         if not self.configfs.exists():
-            raise GadgetError(
-                f"configfs not mounted at {self.configfs}. "
-                "Run: sudo modprobe libcomposite && sudo mount -t configfs none /sys/kernel/config"
-            )
+            configfs_base = Path("/sys/kernel/config")
+            if not configfs_base.exists():
+                raise GadgetError(
+                    f"configfs not mounted. "
+                    "Run: sudo mount -t configfs none /sys/kernel/config"
+                )
+            else:
+                raise GadgetError(
+                    f"USB gadget configfs not available at {self.configfs}. "
+                    "Run: sudo modprobe libcomposite"
+                )
 
         # Check that cam_disk exists
         for lun_id, config in luns.items():

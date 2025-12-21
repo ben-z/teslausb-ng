@@ -17,11 +17,12 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
 from .config import Config, ConfigError, load_from_env, load_from_file
-from .coordinator import Coordinator, CoordinatorConfig, create_coordinator
+from .coordinator import Coordinator
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .snapshot import SnapshotManager
@@ -137,16 +138,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
             check=True,
             capture_output=True,
         )
-    except subprocess.CalledProcessError as e:
-        # fallocate may not be available, fall back to truncate
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # fallocate may not be available or supported, fall back to truncate
         try:
             subprocess.run(
                 ["truncate", "-s", str(config.cam_size), str(config.cam_disk_path)],
                 check=True,
                 capture_output=True,
             )
-        except subprocess.CalledProcessError as e2:
-            print(f"  Failed to create disk image: {e2.stderr.decode()}")
+        except subprocess.CalledProcessError as e:
+            print(f"  Failed to create disk image: {e.stderr.decode()}")
+            return 1
+        except FileNotFoundError:
+            print(f"  Neither 'fallocate' nor 'truncate' found")
             return 1
 
     # Create partition table and filesystem
@@ -172,6 +176,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # Set up loop device and format
     print(f"  Formatting as FAT32...")
+    loop_dev = None
     try:
         # Create loop device with partition scanning
         result = subprocess.run(
@@ -183,14 +188,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         partition = f"{loop_dev}p1"
 
         # Wait for partition device to appear
-        import time
         for _ in range(20):
             if Path(partition).exists():
                 break
             time.sleep(0.1)
         else:
             print(f"  Partition device {partition} not found")
-            subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
             return 1
 
         # Format as FAT32
@@ -215,10 +218,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  Created TeslaCam directory")
         finally:
             subprocess.run(["umount", str(mount_point)], capture_output=True)
-            mount_point.rmdir()
-
-        # Detach loop device
-        subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
+            try:
+                mount_point.rmdir()
+            except OSError:
+                pass
 
     except subprocess.CalledProcessError as e:
         print(f"  Failed to format disk: {e.stderr.decode() if e.stderr else e}")
@@ -226,6 +229,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     except FileNotFoundError as e:
         print(f"  Required tool not found: {e}")
         return 1
+    finally:
+        # Always clean up loop device
+        if loop_dev:
+            subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
 
     print(f"\nSetup complete!")
     print(f"  Disk image: {config.cam_disk_path}")
