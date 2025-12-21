@@ -1,6 +1,7 @@
 """Command-line interface for TeslaUSB.
 
 Usage:
+    teslausb setup         # Create disk images and directory structure
     teslausb run           # Run the main coordinator loop
     teslausb archive       # Run a single archive cycle
     teslausb status        # Show current status
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -102,6 +104,137 @@ def create_components(config: Config) -> tuple[
     )
 
     return fs, snapshot_manager, space_manager, archive_manager, backend
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Set up TeslaUSB disk images and directory structure."""
+    config = load_config(args)
+
+    print(f"Setting up TeslaUSB...")
+    print(f"  Backingfiles path: {config.backingfiles_path}")
+    print(f"  Cam disk size: {config.cam_size / GB:.1f} GB")
+
+    # Create directories
+    config.backingfiles_path.mkdir(parents=True, exist_ok=True)
+    config.snapshots_path.mkdir(parents=True, exist_ok=True)
+    print(f"  Created directories")
+
+    # Check if cam_disk already exists
+    if config.cam_disk_path.exists():
+        if not args.force:
+            print(f"  Cam disk already exists: {config.cam_disk_path}")
+            print(f"  Use --force to recreate")
+            return 0
+        else:
+            print(f"  Removing existing cam disk...")
+            config.cam_disk_path.unlink()
+
+    # Create sparse disk image
+    print(f"  Creating {config.cam_size / GB:.1f} GB disk image (sparse)...")
+    try:
+        subprocess.run(
+            ["fallocate", "-l", str(config.cam_size), str(config.cam_disk_path)],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        # fallocate may not be available, fall back to truncate
+        try:
+            subprocess.run(
+                ["truncate", "-s", str(config.cam_size), str(config.cam_disk_path)],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e2:
+            print(f"  Failed to create disk image: {e2.stderr.decode()}")
+            return 1
+
+    # Create partition table and filesystem
+    print(f"  Creating partition table...")
+    try:
+        # Create MBR partition table with single FAT32 partition
+        subprocess.run(
+            ["parted", "-s", str(config.cam_disk_path), "mklabel", "msdos"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["parted", "-s", str(config.cam_disk_path), "mkpart", "primary", "fat32", "0%", "100%"],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"  Failed to create partition table: {e.stderr.decode()}")
+        return 1
+    except FileNotFoundError:
+        print(f"  'parted' not found. Install it with: apt install parted")
+        return 1
+
+    # Set up loop device and format
+    print(f"  Formatting as FAT32...")
+    try:
+        # Create loop device with partition scanning
+        result = subprocess.run(
+            ["losetup", "-Pf", "--show", str(config.cam_disk_path)],
+            check=True,
+            capture_output=True,
+        )
+        loop_dev = result.stdout.decode().strip()
+        partition = f"{loop_dev}p1"
+
+        # Wait for partition device to appear
+        import time
+        for _ in range(20):
+            if Path(partition).exists():
+                break
+            time.sleep(0.1)
+        else:
+            print(f"  Partition device {partition} not found")
+            subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
+            return 1
+
+        # Format as FAT32
+        subprocess.run(
+            ["mkfs.vfat", "-F", "32", "-n", "TESLAUSB", partition],
+            check=True,
+            capture_output=True,
+        )
+
+        # Create TeslaCam directory structure
+        mount_point = Path("/tmp/teslausb-setup-mount")
+        mount_point.mkdir(exist_ok=True)
+
+        subprocess.run(
+            ["mount", partition, str(mount_point)],
+            check=True,
+            capture_output=True,
+        )
+
+        try:
+            (mount_point / "TeslaCam").mkdir()
+            print(f"  Created TeslaCam directory")
+        finally:
+            subprocess.run(["umount", str(mount_point)], capture_output=True)
+            mount_point.rmdir()
+
+        # Detach loop device
+        subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"  Failed to format disk: {e.stderr.decode() if e.stderr else e}")
+        return 1
+    except FileNotFoundError as e:
+        print(f"  Required tool not found: {e}")
+        return 1
+
+    print(f"\nSetup complete!")
+    print(f"  Disk image: {config.cam_disk_path}")
+    print(f"\nNext steps:")
+    print(f"  1. Configure archiving in /etc/teslausb.conf (optional)")
+    print(f"  2. Run: teslausb gadget setup --enable")
+    print(f"  3. Run: teslausb run")
+
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -378,6 +511,12 @@ def main() -> int:
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
+    # setup command
+    setup_parser = subparsers.add_parser("setup", help="Create disk images and directory structure")
+    setup_parser.add_argument(
+        "--force", action="store_true", help="Recreate disk image if it exists"
+    )
+
     # run command
     run_parser = subparsers.add_parser("run", help="Run the main coordinator loop")
 
@@ -424,6 +563,7 @@ def main() -> int:
         return 1
 
     commands = {
+        "setup": cmd_setup,
         "run": cmd_run,
         "archive": cmd_archive,
         "status": cmd_status,
