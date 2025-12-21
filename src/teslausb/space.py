@@ -66,8 +66,8 @@ class SpaceInfo:
 
     def __str__(self) -> str:
         return (
-            f"Space: {self.free_gb:.1f}GB free / {self.total_gb:.1f}GB total "
-            f"(reserve: {self.reserve_gb:.1f}GB, budget: {self.snapshot_budget_gb:.1f}GB)"
+            f"Space: {self.free_gb:.1f} GiB free / {self.total_gb:.1f} GiB total "
+            f"(reserve: {self.reserve_gb:.1f} GiB, budget: {self.snapshot_budget_gb:.1f} GiB)"
         )
 
 
@@ -76,7 +76,7 @@ class SpaceManager:
 
     The space model:
     - Total backingfiles space contains: cam_disk, snapshots, free space
-    - Reserve = 10GB (for filesystem overhead and safety margin)
+    - Reserve = 10 GiB (for filesystem overhead and safety margin)
     - Snapshot budget = free_space - reserve
 
     For reliable operation:
@@ -210,8 +210,8 @@ class SpaceManager:
         # Log warning if budget is less than cam_size
         if info.snapshot_budget_bytes < self.cam_size:
             logger.warning(
-                f"Snapshot budget ({info.snapshot_budget_gb:.1f}GB) is less than cam_size "
-                f"({self.cam_size / GB:.1f}GB). Snapshot may fail if cam disk fills up."
+                f"Snapshot budget ({info.snapshot_budget_gb:.1f} GiB) is less than cam_size "
+                f"({self.cam_size / GB:.1f} GiB). Snapshot may fail if cam disk fills up."
             )
 
         return True
@@ -247,8 +247,8 @@ class SpaceManager:
 
         if self.cam_size > recommended:
             warnings.append(
-                f"CAM_SIZE ({self.cam_size / GB:.1f}GB) exceeds recommended maximum "
-                f"({recommended / GB:.1f}GB) for {total_space / GB:.1f}GB total space. "
+                f"CAM_SIZE ({self.cam_size / GB:.1f} GiB) exceeds recommended maximum "
+                f"({recommended / GB:.1f} GiB) for {total_space / GB:.1f} GiB total space. "
                 f"You may experience space exhaustion errors."
             )
 
@@ -256,8 +256,8 @@ class SpaceManager:
         min_required = self.cam_size + self.reserve_bytes
         if total_space < min_required:
             warnings.append(
-                f"Total space ({total_space / GB:.1f}GB) is less than minimum required "
-                f"({min_required / GB:.1f}GB). System will not function correctly."
+                f"Total space ({total_space / GB:.1f} GiB) is less than minimum required "
+                f"({min_required / GB:.1f} GiB). System will not function correctly."
             )
 
         return warnings

@@ -22,6 +22,10 @@ class ConfigError(Exception):
     """Configuration error."""
 
 
+# Minimum 1 GiB - smaller sizes are not useful for TeslaCam footage
+MIN_CAM_SIZE = 1 * GB
+
+
 def parse_size(size_str: str) -> int:
     """Parse a size string like '40G' or '500M' to bytes.
 
@@ -154,6 +158,12 @@ def load_from_env() -> Config:
             config.cam_size = parse_size(size)
         except ConfigError as e:
             raise ConfigError(f"Invalid CAM_SIZE: {e}") from e
+
+        if config.cam_size < MIN_CAM_SIZE:
+            raise ConfigError(
+                f"CAM_SIZE={size} is too small ({config.cam_size} bytes). "
+                f"Minimum is {MIN_CAM_SIZE // GB} GiB. Did you mean '{size}G' for gibibytes?"
+            )
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()

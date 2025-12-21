@@ -203,6 +203,25 @@ class TestLoadFromEnv:
             else:
                 os.environ.pop("CAM_SIZE", None)
 
+    def test_load_too_small_size_raises(self):
+        """Test that too-small size raises ConfigError with helpful message."""
+        old_value = os.environ.get("CAM_SIZE")
+
+        try:
+            os.environ["CAM_SIZE"] = "40"  # 40 bytes, user probably meant 40G
+
+            with pytest.raises(ConfigError) as exc_info:
+                load_from_env()
+
+            # Check error message suggests using 'G' suffix
+            assert "too small" in str(exc_info.value)
+            assert "40G" in str(exc_info.value)
+        finally:
+            if old_value is not None:
+                os.environ["CAM_SIZE"] = old_value
+            else:
+                os.environ.pop("CAM_SIZE", None)
+
 
 class TestLoadFromFile:
     """Tests for load_from_file function."""

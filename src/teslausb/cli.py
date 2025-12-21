@@ -139,7 +139,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     print(f"Initializing TeslaUSB...")
     print(f"  Backingfiles path: {config.backingfiles_path}")
-    print(f"  Cam disk size: {config.cam_size / GB:.1f} GB")
+    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
 
     # Create directories
     config.backingfiles_path.mkdir(parents=True, exist_ok=True)
@@ -157,7 +157,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             config.cam_disk_path.unlink()
 
     # Create sparse disk image
-    print(f"  Creating {config.cam_size / GB:.1f} GB disk image (sparse)...")
+    print(f"  Creating {config.cam_size / GB:.1f} GiB disk image (sparse)...")
     result = _run_cmd(["fallocate", "-l", str(config.cam_size), str(config.cam_disk_path)])
     if result.returncode != 0:
         # fallocate may not be available or supported, fall back to truncate
@@ -307,7 +307,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "reachable": backend.is_reachable(),
         },
         "config": {
-            "cam_size_gb": round(config.cam_size / GB, 2),
+            "cam_size_gib": round(config.cam_size / GB, 2),
         },
     }
 
@@ -315,10 +315,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(status, indent=2))
     else:
         print(f"Space:")
-        print(f"  Total: {status['space']['total_gb']} GB")
-        print(f"  Free: {status['space']['free_gb']} GB")
-        print(f"  Reserve: {status['space']['reserve_gb']} GB")
-        print(f"  Snapshot budget: {status['space']['snapshot_budget_gb']} GB")
+        print(f"  Total: {status['space']['total_gb']} GiB")
+        print(f"  Free: {status['space']['free_gb']} GiB")
+        print(f"  Reserve: {status['space']['reserve_gb']} GiB")
+        print(f"  Snapshot budget: {status['space']['snapshot_budget_gb']} GiB")
         print(f"  Low space: {'YES' if status['space']['is_low'] else 'No'}")
         print()
         print(f"Snapshots:")
