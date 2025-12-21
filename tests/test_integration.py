@@ -10,6 +10,13 @@ from teslausb.filesystem import RealFilesystem
 from teslausb.snapshot import SnapshotManager
 from teslausb.space import SpaceManager
 
+CAM_DISK_SIZE = 2_000_000
+SAVED_CLIP_SIZE = 150_000
+SENTRY_CLIP_SIZE = 200_000
+RESERVE_BYTES = 10 * 1024 * 1024
+SAVED_EVENT_ID = "2024-01-01_12-00-00"
+SENTRY_EVENT_ID = "2024-01-01_13-00-00"
+
 
 def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
     fs = RealFilesystem()
@@ -19,17 +26,17 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
     cam_disk_path = backingfiles_path / "cam_disk.bin"
 
     backingfiles_path.mkdir(parents=True)
-    cam_disk_path.write_bytes(b"x" * 2_000_000)
+    cam_disk_path.write_bytes(b"x" * CAM_DISK_SIZE)
 
     mount_source = tmp_path / "cam-mount-source"
-    saved_event = mount_source / "TeslaCam" / "SavedClips" / "2024-01-01_12-00-00"
+    saved_event = mount_source / "TeslaCam" / "SavedClips" / SAVED_EVENT_ID
     saved_event.mkdir(parents=True)
-    (saved_event / "front.mp4").write_bytes(b"f" * 150_000)
-    (saved_event / "back.mp4").write_bytes(b"b" * 150_000)
+    (saved_event / "front.mp4").write_bytes(b"f" * SAVED_CLIP_SIZE)
+    (saved_event / "back.mp4").write_bytes(b"b" * SAVED_CLIP_SIZE)
 
-    sentry_event = mount_source / "TeslaCam" / "SentryClips" / "2024-01-01_13-00-00"
+    sentry_event = mount_source / "TeslaCam" / "SentryClips" / SENTRY_EVENT_ID
     sentry_event.mkdir(parents=True)
-    (sentry_event / "sentry.mp4").write_bytes(b"s" * 200_000)
+    (sentry_event / "sentry.mp4").write_bytes(b"s" * SENTRY_CLIP_SIZE)
 
     snapshot_manager = SnapshotManager(
         fs=fs,
@@ -41,8 +48,8 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
         fs=fs,
         snapshot_manager=snapshot_manager,
         backingfiles_path=backingfiles_path,
-        cam_size=2_000_000,
-        reserve=10 * 1024 * 1024,
+        cam_size=CAM_DISK_SIZE,
+        reserve=RESERVE_BYTES,
     )
 
     backend = MockArchiveBackend(reachable=True)
@@ -85,9 +92,9 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
 
     archived_paths = {str(path) for path in backend.archived_files}
     assert archived_paths == {
-        "SavedClips/2024-01-01_12-00-00/back.mp4",
-        "SavedClips/2024-01-01_12-00-00/front.mp4",
-        "SentryClips/2024-01-01_13-00-00/sentry.mp4",
+        f"SavedClips/{SAVED_EVENT_ID}/back.mp4",
+        f"SavedClips/{SAVED_EVENT_ID}/front.mp4",
+        f"SentryClips/{SENTRY_EVENT_ID}/sentry.mp4",
     }
 
     snapshots = snapshot_manager.get_snapshots()
