@@ -86,13 +86,28 @@ while running:
 
 Key: **no timer-based snapshots** - only when WiFi available.
 
+## Storage Architecture
+
+```
+/mutable/backingfiles.img (XFS, sparse)
+    └── mounted at /backingfiles
+        ├── cam_disk.bin (FAT32, sparse, CAM_SIZE)
+        │   └── TeslaCam/
+        └── snapshots/
+            └── <id>/
+                ├── image.bin (reflink copy of cam_disk.bin)
+                └── .toc
+```
+
+**Why XFS?** Reflinks (copy-on-write) enable instant, space-efficient snapshots. A 40 GiB cam disk can be "copied" in milliseconds, using no extra space until Tesla writes new data.
+
+**Why a disk image?** The backingfiles.img allows teslausb to work on any root filesystem (ext4, etc.) while still getting XFS benefits for the snapshot directory.
+
 ## Space Management
 
 ```
-Total Space
-├── cam_disk.bin (CAM_SIZE)
-├── snapshots/
-└── free space (>= 10GB reserve)
-
-Recommended: total >= 2 * CAM_SIZE + 10GB
+backingfiles.img size = CAM_SIZE * 2 + reserve
+    ├── cam_disk.bin (CAM_SIZE)
+    ├── snapshots/ (up to CAM_SIZE worth)
+    └── reserve (10 GiB default)
 ```

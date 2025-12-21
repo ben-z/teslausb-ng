@@ -2,12 +2,14 @@
 
 Usage:
     teslausb init          # Create disk images and directory structure
+    teslausb mount         # Mount the backingfiles image
     teslausb run           # Run the main coordinator loop
     teslausb archive       # Run a single archive cycle
     teslausb status        # Show current status
     teslausb snapshots     # List snapshots
     teslausb clean         # Clean up old snapshots
     teslausb validate      # Validate configuration
+    teslausb gadget        # Manage USB mass storage gadget
 """
 
 from __future__ import annotations
@@ -251,6 +253,32 @@ def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
             _run_cmd(["losetup", "-d", loop_dev])
 
 
+def cmd_mount(args: argparse.Namespace) -> int:
+    """Mount the backingfiles image."""
+    config = load_config(args)
+    backingfiles_img = config.mutable_path / "backingfiles.img"
+
+    if not backingfiles_img.exists():
+        print(f"Error: {backingfiles_img} does not exist")
+        print(f"Run 'teslausb init' first to create the backingfiles image")
+        return 1
+
+    already_mounted = _is_mounted(config.backingfiles_path)
+
+    if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
+        return 1
+
+    # Verify it's XFS
+    fstype = _get_fstype(config.backingfiles_path)
+    if fstype != "xfs":
+        print(f"Error: {config.backingfiles_path} is {fstype}, not xfs")
+        return 1
+
+    if not already_mounted:
+        print(f"Mounted {backingfiles_img} at {config.backingfiles_path}")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Initialize TeslaUSB disk images and directory structure."""
     config = load_config(args)
@@ -300,12 +328,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"\nInitialization complete!")
     print(f"  Backingfiles image: {backingfiles_img}")
     print(f"  Cam disk: {config.cam_disk_path}")
-    print(f"\nTo make the mount persistent, add to /etc/fstab:")
-    print(f"  {backingfiles_img} {config.backingfiles_path} xfs loop 0 0")
     print(f"\nNext steps:")
-    print(f"  1. Configure archiving in /etc/teslausb.conf")
-    print(f"  2. Run: teslausb gadget init --enable")
-    print(f"  3. Run: teslausb run")
+    print(f"  1. Configure archiving: edit /etc/teslausb.conf")
+    print(f"  2. Set up USB gadget: teslausb gadget init --enable")
+    print(f"  3. Start archiving: teslausb run")
+    print(f"\nFor automatic startup, set up a systemd service (see README).")
 
     return 0
 
@@ -594,6 +621,9 @@ def main() -> int:
         "--force", action="store_true", help="Recreate disk image if it exists"
     )
 
+    # mount command
+    mount_parser = subparsers.add_parser("mount", help="Mount the backingfiles image")
+
     # run command
     run_parser = subparsers.add_parser("run", help="Run the main coordinator loop")
 
@@ -642,6 +672,7 @@ def main() -> int:
 
     commands = {
         "init": cmd_init,
+        "mount": cmd_mount,
         "run": cmd_run,
         "archive": cmd_archive,
         "status": cmd_status,

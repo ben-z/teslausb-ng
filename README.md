@@ -13,7 +13,6 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 - Raspberry Pi (Zero 2 W, 3, 4, or 5) with USB OTG support
 - Raspberry Pi OS Lite (64-bit recommended)
-- XFS-formatted storage partition
 - rclone configured with your cloud provider
 
 ## Installation
@@ -21,7 +20,7 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install -y python3-pip rclone xfsprogs
+sudo apt install -y python3-pip rclone xfsprogs parted dosfstools
 
 # Configure rclone (follow prompts)
 rclone config
@@ -54,13 +53,15 @@ Or export environment variables directly.
 
 ### Initialize
 
-First, create the disk image and directory structure:
+First, create the disk images and directory structure:
 
 ```bash
-teslausb init
+sudo teslausb init
 ```
 
-This creates a sparse disk image at `/backingfiles/cam_disk.bin` with a FAT32 filesystem and TeslaCam directory.
+This creates:
+- `/mutable/backingfiles.img` - XFS disk image (for reflink snapshots)
+- `/backingfiles/cam_disk.bin` - FAT32 disk image (presented to Tesla via USB)
 
 ### USB Gadget
 
@@ -89,6 +90,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/local/bin/teslausb mount
 ExecStartPre=/usr/local/bin/teslausb gadget init --enable
 ExecStart=/usr/local/bin/teslausb run
 ExecStopPost=/usr/local/bin/teslausb gadget remove
@@ -108,12 +110,13 @@ sudo systemctl start teslausb
 
 | Command | Description |
 |---------|-------------|
-| `teslausb init` | Initialize disk image and directories |
+| `teslausb init` | Initialize disk images and directories |
+| `teslausb mount` | Mount the backingfiles image |
 | `teslausb run` | Main loop: wait for WiFi, snapshot, archive, repeat |
 | `teslausb archive` | Single archive cycle |
 | `teslausb status` | Show space and snapshot info |
 | `teslausb snapshots` | List snapshots |
-| `teslausb clean` | Delete old snapshots |
+| `teslausb clean` | Clean up old snapshots |
 | `teslausb validate` | Check configuration |
 | `teslausb gadget` | Manage USB mass storage |
 
