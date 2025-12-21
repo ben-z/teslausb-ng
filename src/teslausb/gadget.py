@@ -146,6 +146,18 @@ class UsbGadget:
         if not luns:
             raise GadgetError("At least one LUN must be configured")
 
+        # Check prerequisites
+        if not self.configfs.exists():
+            raise GadgetError(
+                f"configfs not mounted at {self.configfs}. "
+                "Run: sudo modprobe libcomposite && sudo mount -t configfs none /sys/kernel/config"
+            )
+
+        # Check that cam_disk exists
+        for lun_id, config in luns.items():
+            if not config.disk_path.exists():
+                raise GadgetError(f"Disk image not found: {config.disk_path}")
+
         logger.info(f"Setting up gadget {self.name} with {len(luns)} LUN(s)")
 
         try:
