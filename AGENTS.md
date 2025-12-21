@@ -4,7 +4,7 @@ teslausb-ng is a Python rewrite of [TeslaUSB](https://github.com/marcone/teslaus
 
 ## Code Style
 
-- Python 3.11+, type hints everywhere
+- Python 3.9+, type hints everywhere
 - Dataclasses for data, protocols for abstractions
 - Each module has one clear purpose
 - Tests use `MockFilesystem`, not real filesystem
@@ -47,4 +47,4 @@ pytest tests/ -v
 **Changing space management:**
 1. Logic in `space.py`
 2. Reserve is fixed at 10GB
-3. Formula: `recommended_cam_size = (total - other_drives - 10GB) / 2`
+3. Formula: `recommended_cam_size = (total - 10GB) / 2`

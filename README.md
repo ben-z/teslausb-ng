@@ -52,15 +52,25 @@ Or export environment variables directly.
 
 ## Running
 
+### Initial Setup
+
+First, create the disk image and directory structure:
+
+```bash
+teslausb setup
+```
+
+This creates a sparse disk image at `/backingfiles/cam_disk.bin` with a FAT32 filesystem and TeslaCam directory.
+
 ### Setup USB Gadget
 
-Before running, set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
+Set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
 
 ```bash
 teslausb gadget setup --enable
 ```
 
-This creates the virtual USB drive from your `cam_disk.bin` and binds it to the USB controller.
+This binds the disk image to the USB controller.
 
 ### Manual
 
@@ -96,6 +106,7 @@ sudo systemctl start teslausb
 
 | Command | Description |
 |---------|-------------|
+| `teslausb setup` | Create disk image and directories |
 | `teslausb run` | Main loop: wait for WiFi, snapshot, archive, repeat |
 | `teslausb archive` | Single archive cycle |
 | `teslausb status` | Show space and snapshot info |

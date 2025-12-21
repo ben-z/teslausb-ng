@@ -91,9 +91,8 @@ Key: **no timer-based snapshots** - only when WiFi available.
 ```
 Total Space
 ├── cam_disk.bin (CAM_SIZE)
-├── music_disk.bin (optional)
 ├── snapshots/
 └── free space (>= 10GB reserve)
 
-Recommended: total >= 2 * CAM_SIZE + other_drives + 10GB
+Recommended: total >= 2 * CAM_SIZE + 10GB
 ```
