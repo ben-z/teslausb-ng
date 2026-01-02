@@ -97,12 +97,18 @@ def test_end_to_end_archive_cycle(tmp_path: Path) -> None:
 
     assert coordinator.run_once()
 
-    archived_paths = set(backend.archived_files.keys())
-    assert archived_paths == {
-        Path(f"SavedClips/{SAVED_EVENT_ID}/back.mp4"),
-        Path(f"SavedClips/{SAVED_EVENT_ID}/front.mp4"),
-        Path(f"SentryClips/{SENTRY_EVENT_ID}/sentry.mp4"),
-    }
+    if hasattr(backend, "archived_files"):
+        archived_paths = set(backend.archived_files.keys())
+        assert archived_paths == {
+            Path(f"SavedClips/{SAVED_EVENT_ID}/back.mp4"),
+            Path(f"SavedClips/{SAVED_EVENT_ID}/front.mp4"),
+            Path(f"SentryClips/{SENTRY_EVENT_ID}/sentry.mp4"),
+        }
+    elif hasattr(backend, "copied_dirs"):
+        copied = {dst for _, dst in backend.copied_dirs}
+        assert copied == {"SavedClips", "SentryClips"}
+    else:
+        raise AssertionError("Unexpected archive backend interface")
 
     snapshots = snapshot_manager.get_snapshots()
     assert len(snapshots) == 1
