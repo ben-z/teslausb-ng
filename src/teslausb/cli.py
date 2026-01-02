@@ -772,7 +772,8 @@ def cmd_service(args: argparse.Namespace) -> int:
             print("Run 'teslausb service install' to install")
             return 1
 
-        return _run_cmd(["systemctl", "status", "teslausb.service"])
+        result = _run_cmd(["systemctl", "status", "teslausb.service"])
+        return result.returncode
 
     return 1
 
