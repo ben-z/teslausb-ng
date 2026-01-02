@@ -661,7 +661,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=/usr/local/bin/teslausb gadget on
-ExecStart=/usr/local/bin/teslausb run
+ExecStart=/usr/local/bin/teslausb --log-level debug run
 ExecStop=/usr/local/bin/teslausb gadget off
 EnvironmentFile=-/etc/teslausb.conf
 TimeoutStartSec=60
