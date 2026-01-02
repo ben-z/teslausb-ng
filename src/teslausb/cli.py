@@ -239,7 +239,7 @@ def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
         loop_dev = result.stdout.decode().strip()
         partition = f"{loop_dev}p1"
 
-        # Try blockdev to force partition scanning
+        # Use blockdev to force partition scanning (primary method, replacing losetup -P)
         _run_cmd(["blockdev", "--rereadpt", loop_dev])
 
         # Wait for partition device to appear
