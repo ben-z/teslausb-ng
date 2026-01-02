@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 # ANSI escape codes for dim text
 DIM = "\033[2m"
 RESET = "\033[0m"
+
+# Valid log levels
+LOG_LEVELS = ("debug", "info", "warning", "error")
 
 
 def _run_cmd(cmd: list[str], capture_stdout: bool = False) -> subprocess.CompletedProcess:
@@ -71,15 +75,9 @@ def _get_version() -> str:
         return "dev"
 
 
-def configure_logging(verbose: bool = False, debug: bool = False) -> None:
-    """Configure logging."""
-    if debug:
-        level = logging.DEBUG
-    elif verbose:
-        level = logging.INFO
-    else:
-        level = logging.WARNING
-
+def configure_logging(log_level: str) -> None:
+    """Configure logging based on level name."""
+    level = getattr(logging, log_level.upper(), logging.WARNING)
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -803,11 +801,12 @@ def main() -> int:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {_get_version()}"
     )
+    env_log_level = os.environ.get("LOG_LEVEL", "").lower()
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose output"
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug output"
+        "-l", "--log-level",
+        choices=LOG_LEVELS,
+        default=env_log_level if env_log_level in LOG_LEVELS else "warning",
+        help="Set log level (default: warning, or LOG_LEVEL env var)",
     )
     parser.add_argument(
         "-c", "--config", type=str, help="Path to config file"
@@ -871,8 +870,7 @@ def main() -> int:
     service_subparsers.add_parser("status", help="Show service status")
 
     args = parser.parse_args()
-
-    configure_logging(verbose=args.verbose, debug=args.debug)
+    configure_logging(args.log_level)
 
     if args.command is None:
         parser.print_help()
