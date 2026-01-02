@@ -25,7 +25,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
-from .config import Config, ConfigError, load_from_env, load_from_file
+from .config import Config, ConfigError, GB, MIN_CAM_SIZE, load_from_env, load_from_file
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
@@ -232,20 +232,39 @@ def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
 
     print(f"  Formatting cam disk as FAT32...")
     loop_dev = None
+    kpartx_used = False
     try:
-        result = _run_cmd(["losetup", "-Pf", "--show", str(cam_disk_path)], capture_stdout=True)
+        result = _run_cmd(["losetup", "-f", "--show", str(cam_disk_path)], capture_stdout=True)
         if result.returncode != 0:
             print(f"  Failed to create loop device")
             return False
         loop_dev = result.stdout.decode().strip()
         partition = f"{loop_dev}p1"
 
+        # Use blockdev to force partition scanning (primary method, replacing losetup -P)
+        _run_cmd(["blockdev", "--rereadpt", loop_dev])
+
         # Wait for partition device to appear
-        for _ in range(20):
+        for _ in range(20):  # 2 seconds
             if Path(partition).exists():
                 break
             time.sleep(0.1)
-        else:
+
+        # If partition not found, try kpartx (works better in some environments like Docker)
+        if not Path(partition).exists():
+            result = _run_cmd(["kpartx", "-av", loop_dev])
+            if result.returncode == 0:
+                kpartx_used = True
+                # kpartx creates /dev/mapper/loopXp1 instead of /dev/loopXp1
+                loop_name = Path(loop_dev).name  # e.g., "loop0"
+                partition = f"/dev/mapper/{loop_name}p1"
+                # Wait for kpartx partition
+                for _ in range(20):
+                    if Path(partition).exists():
+                        break
+                    time.sleep(0.1)
+
+        if not Path(partition).exists():
             print(f"  Partition device {partition} not found")
             return False
 
@@ -277,6 +296,8 @@ def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
 
     finally:
         if loop_dev:
+            if kpartx_used:
+                _run_cmd(["kpartx", "-d", loop_dev])
             _run_cmd(["losetup", "-d", loop_dev])
 
 
@@ -288,6 +309,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     if backingfiles_img.exists():
         print(f"Error: {backingfiles_img} already exists")
         print(f"Run 'teslausb deinit' to remove it first")
+        return 1
+
+    if config.cam_size < MIN_CAM_SIZE:
+        print(f"Error: CAM_SIZE is too small ({config.cam_size} bytes)")
+        print(f"Minimum is {MIN_CAM_SIZE // GB} GiB")
         return 1
 
     print(f"Initializing TeslaUSB...")

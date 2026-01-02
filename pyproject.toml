@@ -21,6 +21,9 @@ dev = [
     "mypy>=1.0",
     "ruff>=0.1",
 ]
+test = [
+    "pytest>=7.0",
+]
 
 [project.scripts]
 teslausb = "teslausb.cli:main"
@@ -31,6 +34,9 @@ packages = ["src/teslausb"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests as integration tests (require root, XFS, Docker)",
+]
 
 [tool.mypy]
 python_version = "3.9"

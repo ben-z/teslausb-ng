@@ -1,0 +1,25 @@
+services:
+  integration-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    privileged: true  # Required for loop devices and mount operations
+    environment:
+      CAM_SIZE: "1G"
+      ARCHIVE_SYSTEM: "rclone"
+      RCLONE_DRIVE: ":memory:"
+      RCLONE_PATH: "/test"
+    volumes:
+      # Mount source for faster iteration during development
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+
+  # Run only unit tests (no privileges needed)
+  unit-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["pytest", "tests/", "--ignore=tests/integration", "-v"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro

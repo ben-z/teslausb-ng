@@ -27,5 +27,5 @@ jobs:
           pip install pytest
           pip install -e .
 
-      - name: Run tests
-        run: pytest tests/ -v
+      - name: Run unit tests
+        run: pytest tests/ --ignore=tests/integration -v
