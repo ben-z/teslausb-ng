@@ -582,3 +582,75 @@ class TestDeleteArchivedFiles:
         assert skipped == 0
         assert not fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"))
         assert not fs.exists(Path("/cam_mount/TeslaCam/SentryClips/event2/front.mp4"))
+
+    def test_delete_handles_trackmode(self):
+        """Test deletion from TeslaTrackMode directory."""
+        fs = MockFilesystem()
+
+        # Set up TrackMode structure (different path than TeslaCam)
+        fs.mkdir(Path("/cam_mount/TeslaTrackMode/event1"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaTrackMode/event1/front.mp4"), "x" * 1000)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "TrackMode": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                ],
+            },
+        )
+
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 1
+        assert skipped == 0
+        assert not fs.exists(Path("/cam_mount/TeslaTrackMode/event1/front.mp4"))
+
+    def test_delete_ignores_unknown_directory(self):
+        """Test that unknown directory names are logged and skipped."""
+        fs = MockFilesystem()
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "UnknownDir": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                ],
+            },
+        )
+
+        # Should not raise, just skip the unknown directory
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 0
+        assert skipped == 0  # Unknown dirs don't count as skipped files

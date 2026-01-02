@@ -19,7 +19,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable, Iterator
 
-from .filesystem import Filesystem
+from .filesystem import Filesystem, FilesystemError, RealFilesystem
 from .snapshot import SnapshotHandle, SnapshotManager
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,7 @@ class RcloneBackend(ArchiveBackend):
         self.flags = flags or []
         self.timeout = timeout
         self.stop_event = stop_event
-        self.fs = fs or Filesystem()
+        self.fs = fs or RealFilesystem()
 
     def _dest(self, subpath: str = "") -> str:
         """Build rclone destination path."""
@@ -209,9 +209,9 @@ class RcloneBackend(ArchiveBackend):
                         size = self.fs.stat(full_path).size
                         rel_path = str(full_path.relative_to(src))
                         files.append(ArchivedFile(relative_path=rel_path, size=size))
-                    except OSError as e:
+                    except (OSError, FilesystemError) as e:
                         logger.warning(f"Could not stat {full_path}: {e}")
-        except OSError as e:
+        except (OSError, FilesystemError) as e:
             logger.warning(f"Could not scan directory {src}: {e}")
         return files
 
@@ -487,7 +487,7 @@ class ArchiveManager:
                         )
                         skipped += 1
                         continue
-                except OSError as e:
+                except (OSError, FilesystemError) as e:
                     logger.warning(f"Could not stat {file_path}: {e}")
                     skipped += 1
                     continue
@@ -497,7 +497,7 @@ class ArchiveManager:
                     self.fs.remove(file_path)
                     deleted += 1
                     logger.debug(f"Deleted: {file_path}")
-                except OSError as e:
+                except (OSError, FilesystemError) as e:
                     logger.warning(f"Could not delete {file_path}: {e}")
                     skipped += 1
 
@@ -521,7 +521,7 @@ class ArchiveManager:
             for dirpath, dirnames, filenames in self.fs.walk(base_path):
                 for dirname in dirnames:
                     dirs_to_check.append(Path(dirpath) / dirname)
-        except OSError:
+        except (OSError, FilesystemError):
             return
 
         # Sort by path length descending (deepest first)
@@ -533,7 +533,7 @@ class ArchiveManager:
                 if self.fs.exists(dir_path) and not any(self.fs.listdir(dir_path)):
                     self.fs.rmdir(dir_path)
                     logger.debug(f"Removed empty directory: {dir_path}")
-            except OSError:
+            except (OSError, FilesystemError):
                 pass  # Directory not empty or other error, skip
 
     def archive_new_snapshot(
@@ -551,7 +551,7 @@ class ArchiveManager:
         Returns:
             ArchiveResult with details of the operation
         """
-        from .mount import mount_image  # Import here to avoid circular import
+        from .mount import mount_image
 
         snapshot = self.snapshot_manager.create_snapshot()
         handle = self.snapshot_manager.acquire(snapshot.id)
