@@ -9,10 +9,38 @@ The gadget is configured via configfs at /sys/kernel/config/usb_gadget/.
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _run_modprobe(module: str) -> bool:
+    """Load a kernel module using modprobe.
+
+    Args:
+        module: Name of the kernel module to load
+
+    Returns:
+        True if module was loaded successfully
+    """
+    try:
+        result = subprocess.run(
+            ["modprobe", module],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info(f"Loaded kernel module: {module}")
+            return True
+        else:
+            stderr = result.stderr.decode().strip()
+            logger.warning(f"Failed to load {module}: {stderr}")
+            return False
+    except FileNotFoundError:
+        logger.warning("modprobe not found")
+        return False
 
 
 class GadgetError(Exception):
@@ -117,18 +145,25 @@ class UsbGadget:
         if not luns:
             raise GadgetError("At least one LUN must be configured")
 
-        # Check prerequisites
+        # Check prerequisites and auto-load modules if needed
         if not self.configfs.exists():
             configfs_base = Path("/sys/kernel/config")
             if not configfs_base.exists():
                 raise GadgetError(
-                    f"configfs not mounted. "
+                    "configfs not mounted. "
                     "Run: sudo mount -t configfs none /sys/kernel/config"
                 )
-            else:
+            # Try to load libcomposite module
+            logger.info("USB gadget configfs not available, loading libcomposite...")
+            if not _run_modprobe("libcomposite"):
                 raise GadgetError(
                     f"USB gadget configfs not available at {self.configfs}. "
                     "Run: sudo modprobe libcomposite"
+                )
+            # Check again after loading module
+            if not self.configfs.exists():
+                raise GadgetError(
+                    f"USB gadget configfs still not available after loading libcomposite"
                 )
 
         # Check that cam_disk exists
