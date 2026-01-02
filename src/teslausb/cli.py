@@ -285,21 +285,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     config = load_config(args)
     backingfiles_img = config.mutable_path / "backingfiles.img"
 
+    if backingfiles_img.exists():
+        print(f"Error: {backingfiles_img=} already exists")
+        print(f"Run 'teslausb mount' to mount the existing image, or 'teslausb deinit' to remove it")
+        return 1
+
     print(f"Initializing TeslaUSB...")
     print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
 
-    # Step 1: Create XFS backingfiles image if needed
-    if not backingfiles_img.exists():
-        # Size: cam_disk + one full snapshot + reserve
-        backingfiles_size = config.cam_size * 2 + config.reserve
-        config.mutable_path.mkdir(parents=True, exist_ok=True)
+    # Create XFS backingfiles image if needed
+    # size: cam_disk + one full snapshot + reserve
+    backingfiles_size = config.cam_size * 2 + config.reserve
+    config.mutable_path.mkdir(parents=True, exist_ok=True)
+    if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
+        return 1
 
-        if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
-            return 1
-    else:
-        print(f"  Backingfiles image exists: {backingfiles_img}")
-
-    # Step 2: Mount backingfiles
+    # Mount backingfiles
     if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
         return 1
 
@@ -310,17 +311,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"  Reflinks require XFS. Delete {backingfiles_img} and re-run init.")
         return 1
 
-    # Step 3: Check if cam disk already exists (after mount!)
-    if config.cam_disk_path.exists():
-        if not args.force:
-            print(f"  Cam disk already exists: {config.cam_disk_path}")
-            print(f"  Use --force to recreate")
-            return 0
-        else:
-            print(f"  Removing existing cam disk...")
-            config.cam_disk_path.unlink()
-
-    # Step 4: Create snapshots directory and cam disk
+    # Create snapshots directory and cam disk
     config.snapshots_path.mkdir(parents=True, exist_ok=True)
 
     if not _create_cam_disk(config.cam_disk_path, config.cam_size):
@@ -619,10 +610,7 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # init command
-    init_parser = subparsers.add_parser("init", help="Initialize disk images and directory structure")
-    init_parser.add_argument(
-        "--force", action="store_true", help="Recreate disk image if it exists"
-    )
+    subparsers.add_parser("init", help="Initialize disk images and directory structure")
 
     # mount command
     subparsers.add_parser("mount", help="Mount the backingfiles image")
