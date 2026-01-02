@@ -144,6 +144,7 @@ def load_from_env() -> Config:
 
     Reads environment variables:
     - CAM_SIZE
+    - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
 
@@ -153,17 +154,17 @@ def load_from_env() -> Config:
     config = Config()
     archive = ArchiveConfig()
 
+    # Optional path overrides
+    if path := os.environ.get("MUTABLE_PATH"):
+        config.mutable_path = Path(path)
+    if path := os.environ.get("BACKINGFILES_PATH"):
+        config.backingfiles_path = Path(path)
+
     if size := os.environ.get("CAM_SIZE"):
         try:
             config.cam_size = parse_size(size)
         except ConfigError as e:
             raise ConfigError(f"Invalid CAM_SIZE: {e}") from e
-
-        if config.cam_size < MIN_CAM_SIZE:
-            raise ConfigError(
-                f"CAM_SIZE={size} is too small ({config.cam_size} bytes). "
-                f"Minimum is {MIN_CAM_SIZE // GB} GiB. Did you mean '{size}G' for gibibytes?"
-            )
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()

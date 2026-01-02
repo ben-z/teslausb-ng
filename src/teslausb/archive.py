@@ -155,20 +155,27 @@ class RcloneBackend(ArchiveBackend):
         self.stop_event = stop_event
         self.fs = fs or RealFilesystem()
 
+    def _remote_with_colon(self) -> str:
+        """Get remote name with exactly one trailing colon."""
+        if self.remote.endswith(":"):
+            return self.remote
+        return f"{self.remote}:"
+
     def _dest(self, subpath: str = "") -> str:
         """Build rclone destination path."""
         parts = [p for p in [self.path, subpath] if p]
         path_str = "/".join(parts)
+        remote = self._remote_with_colon()
         if path_str:
-            return f"{self.remote}:{path_str}"
-        return f"{self.remote}:"
+            return f"{remote}{path_str}"
+        return remote
 
     def is_reachable(self) -> bool:
         """Check if rclone remote is reachable."""
         proc = None
         try:
             proc = subprocess.Popen(
-                ["rclone", "lsf", f"{self.remote}:", "--max-depth", "1"],
+                ["rclone", "lsf", self._remote_with_colon(), "--max-depth", "1"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
