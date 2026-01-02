@@ -126,6 +126,7 @@ def create_components(config: Config) -> tuple[
         fs=fs,
         snapshot_manager=snapshot_manager,
         backend=backend,
+        cam_disk_path=config.cam_disk_path,
         archive_recent=config.archive.archive_recent,
         archive_saved=config.archive.archive_saved,
         archive_sentry=config.archive.archive_sentry,

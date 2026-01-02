@@ -112,6 +112,10 @@ class Filesystem(ABC):
         """Remove directory tree."""
 
     @abstractmethod
+    def rmdir(self, path: Path) -> None:
+        """Remove empty directory."""
+
+    @abstractmethod
     def copy(self, src: Path, dst: Path) -> None:
         """Copy file (regular copy)."""
 
@@ -219,6 +223,17 @@ class RealFilesystem(Filesystem):
             raise FileNotFoundError_(str(path)) from e
         except PermissionError as e:
             raise PermissionError_(str(path)) from e
+
+    def rmdir(self, path: Path) -> None:
+        try:
+            path.rmdir()
+        except FileNotFoundError as e:
+            raise FileNotFoundError_(str(path)) from e
+        except PermissionError as e:
+            raise PermissionError_(str(path)) from e
+        except OSError as e:
+            # Directory not empty
+            raise FilesystemError(str(e)) from e
 
     def copy(self, src: Path, dst: Path) -> None:
         try:
@@ -497,6 +512,22 @@ class MockFilesystem(Filesystem):
             del self._symlinks[p]
         for p in sorted(to_remove_dirs, reverse=True):  # Remove deepest first
             del self._dirs[p]
+
+    def rmdir(self, path: Path) -> None:
+        path = self._normalize(path)
+
+        if path not in self._dirs:
+            raise FileNotFoundError_(str(path))
+
+        # Check if directory is empty
+        has_children = any(
+            str(p).startswith(str(path) + "/")
+            for p in list(self._files.keys()) + list(self._dirs.keys()) + list(self._symlinks.keys())
+        )
+        if has_children:
+            raise FilesystemError(f"Directory not empty: {path}")
+
+        del self._dirs[path]
 
     def copy(self, src: Path, dst: Path) -> None:
         src = self._normalize(src)
