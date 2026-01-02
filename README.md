@@ -124,7 +124,6 @@ This creates:
 
 ```bash
 sudo teslausb service install
-sudo teslausb init
 sudo systemctl start teslausb
 ```
 
@@ -137,6 +136,8 @@ The service will:
 ### Manual Running
 
 ```bash
+# Mount /backingfiles
+sudo teslausb mount
 # Enable USB gadget
 sudo teslausb gadget on
 
