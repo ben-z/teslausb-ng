@@ -39,7 +39,7 @@ class IntegrationTestEnv:
         return self.backingfiles_path / "snapshots"
 
 
-def _cleanup_loop_devices(path_pattern: str = None) -> None:
+def _cleanup_loop_devices(path_pattern: str | None = None) -> None:
     """Clean up loop devices, optionally filtering by path pattern."""
     # First, remove any kpartx mappings
     result = subprocess.run(["losetup", "-a"], capture_output=True, text=True)
@@ -56,7 +56,7 @@ def _cleanup_loop_devices(path_pattern: str = None) -> None:
     dm_path = Path("/dev/mapper")
     if dm_path.exists():
         for entry in dm_path.iterdir():
-            if entry.name.startswith("loop") and entry.name != "control":
+            if entry.name.startswith("loop"):
                 subprocess.run(["dmsetup", "remove", str(entry)], capture_output=True)
 
 
@@ -87,7 +87,7 @@ def _cleanup_mounts_and_devices(env: IntegrationTestEnv) -> None:
     time.sleep(0.2)
 
 
-def mount_cam_disk(disk_path: Path, mount_point: Path) -> Tuple[str, str, bool]:
+def mount_cam_disk(disk_path: Path, mount_point: Path) -> tuple[str, str, bool]:
     """Mount a cam disk image, handling Docker kpartx fallback.
 
     Args:
@@ -112,6 +112,9 @@ def mount_cam_disk(disk_path: Path, mount_point: Path) -> Tuple[str, str, bool]:
         text=True,
     )
     loop_dev = result.stdout.strip()
+    if result.returncode != 0 or not loop_dev:
+        error_msg = result.stderr.strip() if result.stderr else "losetup failed with no error message"
+        raise RuntimeError(f"Failed to set up loop device for {disk_path}: {error_msg}")
     partition = f"{loop_dev}p1"
     kpartx_used = False
 

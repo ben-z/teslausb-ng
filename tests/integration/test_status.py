@@ -20,7 +20,8 @@ class TestStatusCommand:
 
         # Should succeed but show warnings
         assert result.returncode == 0
-        assert "not mounted" in result.stdout.lower() or "warning" in result.stdout.lower()
+        assert "warning" in result.stdout.lower()
+        assert "not mounted" in result.stdout.lower()
 
     def test_status_after_init(self, initialized_env: IntegrationTestEnv, cli_runner):
         """Status should show space and snapshot info after init."""
