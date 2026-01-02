@@ -72,7 +72,7 @@ This creates:
 Set up the USB mass storage gadget so the Tesla sees the Pi as a USB drive:
 
 ```bash
-teslausb gadget init --enable
+sudo teslausb gadget on
 ```
 
 This binds the disk image to the USB controller.
@@ -80,7 +80,7 @@ This binds the disk image to the USB controller.
 ### Manual
 
 ```bash
-teslausb run
+sudo teslausb run
 ```
 
 ### As a systemd service
@@ -94,10 +94,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/usr/local/bin/teslausb mount
-ExecStartPre=/usr/local/bin/teslausb gadget init --enable
+ExecStartPre=/usr/local/bin/teslausb gadget on
 ExecStart=/usr/local/bin/teslausb run
-ExecStopPost=/usr/local/bin/teslausb gadget remove
+ExecStopPost=/usr/local/bin/teslausb gadget off
 EnvironmentFile=/etc/teslausb.conf
 Restart=always
 RestartSec=10
@@ -115,14 +114,15 @@ sudo systemctl start teslausb
 | Command | Description |
 |---------|-------------|
 | `teslausb init` | Initialize disk images and directories |
-| `teslausb mount` | Mount the backingfiles image |
+| `teslausb deinit` | Remove disk images and clean up |
 | `teslausb run` | Main loop: wait for WiFi, snapshot, archive, repeat |
 | `teslausb archive` | Single archive cycle |
-| `teslausb status` | Show space and snapshot info |
+| `teslausb status` | Show status (space, snapshots, config warnings) |
 | `teslausb snapshots` | List snapshots |
 | `teslausb clean` | Clean up old snapshots |
-| `teslausb validate` | Check configuration |
-| `teslausb gadget` | Manage USB mass storage |
+| `teslausb gadget on` | Initialize and enable USB gadget |
+| `teslausb gadget off` | Disable and remove USB gadget |
+| `teslausb gadget status` | Show USB gadget status |
 
 ## Documentation
 

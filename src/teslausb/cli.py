@@ -3,13 +3,11 @@
 Usage:
     teslausb init          # Create disk images and directory structure
     teslausb deinit        # Remove disk images and clean up
-    teslausb mount         # Mount the backingfiles image
     teslausb run           # Run the main coordinator loop
     teslausb archive       # Run a single archive cycle
-    teslausb status        # Show current status
+    teslausb status        # Show status (space, snapshots, config)
     teslausb snapshots     # List snapshots
     teslausb clean         # Clean up old snapshots
-    teslausb validate      # Validate configuration
     teslausb gadget        # Manage USB mass storage gadget
 """
 
@@ -173,13 +171,37 @@ def _mount_backingfiles(image_path: Path, mount_path: Path) -> bool:
     mount_path.mkdir(parents=True, exist_ok=True)
 
     if _is_mounted(mount_path):
-        print(f"  {mount_path} is already mounted")
         return True
 
     print(f"  Mounting {image_path} at {mount_path}...")
     result = _run_cmd(["mount", "-o", "loop", str(image_path), str(mount_path)])
     if result.returncode != 0:
         print(f"  Failed to mount image")
+        return False
+
+    return True
+
+
+def _ensure_mounted(config: Config) -> bool:
+    """Ensure backingfiles image is mounted.
+
+    Returns:
+        True if mounted successfully, False on error.
+    """
+    backingfiles_img = config.mutable_path / "backingfiles.img"
+
+    if not backingfiles_img.exists():
+        print(f"Error: {backingfiles_img} does not exist")
+        print(f"Run 'teslausb init' first to create the backingfiles image")
+        return False
+
+    if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
+        return False
+
+    # Verify it's XFS (required for reflinks)
+    fstype = _get_fstype(config.backingfiles_path)
+    if fstype != "xfs":
+        print(f"Error: {config.backingfiles_path} is {fstype}, not xfs")
         return False
 
     return True
@@ -255,29 +277,51 @@ def _create_cam_disk(cam_disk_path: Path, cam_size: int) -> bool:
             _run_cmd(["losetup", "-d", loop_dev])
 
 
-def cmd_mount(args: argparse.Namespace) -> int:
-    """Mount the backingfiles image."""
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize TeslaUSB disk images and directory structure."""
     config = load_config(args)
     backingfiles_img = config.mutable_path / "backingfiles.img"
 
-    if not backingfiles_img.exists():
-        print(f"Error: {backingfiles_img} does not exist")
-        print(f"Run 'teslausb init' first to create the backingfiles image")
+    if backingfiles_img.exists():
+        print(f"Error: {backingfiles_img} already exists")
+        print(f"Run 'teslausb deinit' to remove it first")
         return 1
 
-    already_mounted = _is_mounted(config.backingfiles_path)
+    print(f"Initializing TeslaUSB...")
+    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
 
+    # Create XFS backingfiles image
+    # size: cam_disk + one full snapshot + reserve
+    backingfiles_size = config.cam_size * 2 + config.reserve
+    config.mutable_path.mkdir(parents=True, exist_ok=True)
+    if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
+        return 1
+
+    # Mount backingfiles
     if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
         return 1
 
-    # Verify it's XFS
+    # Verify it's XFS (required for reflinks)
     fstype = _get_fstype(config.backingfiles_path)
     if fstype != "xfs":
-        print(f"Error: {config.backingfiles_path} is {fstype}, not xfs")
+        print(f"  Error: {config.backingfiles_path} is {fstype}, not xfs")
+        print(f"  Reflinks require XFS. Delete {backingfiles_img} and re-run init.")
         return 1
 
-    if not already_mounted:
-        print(f"Mounted {backingfiles_img} at {config.backingfiles_path}")
+    # Create snapshots directory and cam disk
+    config.snapshots_path.mkdir(parents=True, exist_ok=True)
+
+    if not _create_cam_disk(config.cam_disk_path, config.cam_size):
+        return 1
+
+    print(f"\nInitialization complete!")
+    print(f"  Backingfiles image: {backingfiles_img}")
+    print(f"  Cam disk: {config.cam_disk_path}")
+    print(f"\nNext steps:")
+    print(f"  1. Configure archiving in /etc/teslausb.conf")
+    print(f"  2. Enable USB gadget: teslausb gadget on")
+    print(f"  3. Start archiving: teslausb run")
+
     return 0
 
 
@@ -329,58 +373,13 @@ def cmd_deinit(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    """Initialize TeslaUSB disk images and directory structure."""
-    config = load_config(args)
-    backingfiles_img = config.mutable_path / "backingfiles.img"
-
-    if backingfiles_img.exists():
-        print(f"Error: {backingfiles_img=} already exists")
-        print(f"Run 'teslausb mount' to mount the existing image, or 'teslausb deinit' to remove it")
-        return 1
-
-    print(f"Initializing TeslaUSB...")
-    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
-
-    # Create XFS backingfiles image if needed
-    # size: cam_disk + one full snapshot + reserve
-    backingfiles_size = config.cam_size * 2 + config.reserve
-    config.mutable_path.mkdir(parents=True, exist_ok=True)
-    if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
-        return 1
-
-    # Mount backingfiles
-    if not _mount_backingfiles(backingfiles_img, config.backingfiles_path):
-        return 1
-
-    # Verify it's XFS (required for reflinks)
-    fstype = _get_fstype(config.backingfiles_path)
-    if fstype != "xfs":
-        print(f"  Error: {config.backingfiles_path} is {fstype}, not xfs")
-        print(f"  Reflinks require XFS. Delete {backingfiles_img} and re-run init.")
-        return 1
-
-    # Create snapshots directory and cam disk
-    config.snapshots_path.mkdir(parents=True, exist_ok=True)
-
-    if not _create_cam_disk(config.cam_disk_path, config.cam_size):
-        return 1
-
-    print(f"\nInitialization complete!")
-    print(f"  Backingfiles image: {backingfiles_img}")
-    print(f"  Cam disk: {config.cam_disk_path}")
-    print(f"\nNext steps:")
-    print(f"  1. Configure archiving: edit /etc/teslausb.conf")
-    print(f"  2. Set up USB gadget: teslausb gadget init --enable")
-    print(f"  3. Start archiving: teslausb run")
-    print(f"\nFor automatic startup, set up a systemd service (see README).")
-
-    return 0
-
-
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the main coordinator loop."""
     config = load_config(args)
+
+    # Auto-mount backingfiles
+    if not _ensure_mounted(config):
+        return 1
 
     warnings = config.validate()
     for warning in warnings:
@@ -405,6 +404,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_archive(args: argparse.Namespace) -> int:
     """Run a single archive cycle."""
     config = load_config(args)
+
+    # Auto-mount backingfiles
+    if not _ensure_mounted(config):
+        return 1
+
     fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
 
     coordinator = Coordinator(
@@ -421,53 +425,122 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show current status."""
+    """Show current status including config validation."""
     config = load_config(args)
-    fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
 
-    # Get space info
-    space_info = space_manager.get_space_info()
+    # Collect validation warnings
+    warnings = config.validate()
 
-    # Get snapshots
-    snapshots = snapshot_manager.get_snapshots()
+    fs = RealFilesystem()
+    snapshot_manager = SnapshotManager(
+        fs=fs,
+        cam_disk_path=config.cam_disk_path,
+        snapshots_path=config.snapshots_path,
+    )
 
+    # Check if backingfiles is mounted
+    backingfiles_mounted = _is_mounted(config.backingfiles_path)
+
+    # Get space info if mounted
+    space_data = None
+    if backingfiles_mounted:
+        try:
+            space_manager = SpaceManager(
+                fs=fs,
+                snapshot_manager=snapshot_manager,
+                backingfiles_path=config.backingfiles_path,
+                cam_size=config.cam_size,
+                reserve=config.reserve,
+            )
+            space_info = space_manager.get_space_info()
+            space_data = {
+                "total_gb": round(space_info.total_gb, 2),
+                "free_gb": round(space_info.free_gb, 2),
+                "used_gb": round(space_info.used_gb, 2),
+                "reserve_gb": round(space_info.reserve_gb, 2),
+                "snapshot_budget_gb": round(space_info.snapshot_budget_gb, 2),
+                "is_low": space_info.is_low,
+            }
+
+            # Add space validation warnings
+            space_warnings = space_manager.validate_configuration(
+                total_space=int(space_info.total_gb * GB),
+            )
+            warnings.extend(space_warnings)
+        except Exception as e:
+            warnings.append(f"Could not get space info: {e}")
+    else:
+        warnings.append("Backingfiles not mounted (run 'teslausb run' to auto-mount)")
+
+    # Get snapshots if mounted
+    snapshots = []
+    deletable_count = 0
+    if backingfiles_mounted:
+        try:
+            snapshots = snapshot_manager.get_snapshots()
+            deletable_count = len(snapshot_manager.get_deletable_snapshots())
+        except Exception:
+            pass
+
+    # Get archive backend status
+    if config.archive.system == "rclone":
+        backend = RcloneBackend(
+            remote=config.archive.rclone_drive,
+            path=config.archive.rclone_path,
+            flags=config.archive.rclone_flags,
+        )
+    else:
+        backend = MockArchiveBackend(reachable=True)
+
+    archive_reachable = backend.is_reachable()
+
+    # Build status dict
     status = {
-        "space": {
-            "total_gb": round(space_info.total_gb, 2),
-            "free_gb": round(space_info.free_gb, 2),
-            "used_gb": round(space_info.used_gb, 2),
-            "reserve_gb": round(space_info.reserve_gb, 2),
-            "snapshot_budget_gb": round(space_info.snapshot_budget_gb, 2),
-            "is_low": space_info.is_low,
-        },
+        "warnings": warnings,
+        "space": space_data,
         "snapshots": {
             "count": len(snapshots),
-            "deletable": len(snapshot_manager.get_deletable_snapshots()),
+            "deletable": deletable_count,
         },
         "archive": {
             "system": config.archive.system,
-            "reachable": backend.is_reachable(),
+            "reachable": archive_reachable,
         },
         "config": {
-            "cam_size_gib": round(config.cam_size / GB, 2),
+            "cam_size_gb": round(config.cam_size / GB, 2),
         },
     }
 
     if args.json:
         print(json.dumps(status, indent=2))
     else:
-        print(f"Space:")
-        print(f"  Total: {status['space']['total_gb']} GiB")
-        print(f"  Free: {status['space']['free_gb']} GiB")
-        print(f"  Reserve: {status['space']['reserve_gb']} GiB")
-        print(f"  Snapshot budget: {status['space']['snapshot_budget_gb']} GiB")
-        print(f"  Low space: {'YES' if status['space']['is_low'] else 'No'}")
+        # Show warnings first
+        if warnings:
+            print("Warnings:")
+            for w in warnings:
+                print(f"  - {w}")
+            print()
+
+        # Space
+        print("Space:")
+        if space_data:
+            print(f"  Total: {space_data['total_gb']} GiB")
+            print(f"  Free: {space_data['free_gb']} GiB")
+            print(f"  Reserve: {space_data['reserve_gb']} GiB")
+            print(f"  Snapshot budget: {space_data['snapshot_budget_gb']} GiB")
+            print(f"  Low space: {'YES' if space_data['is_low'] else 'No'}")
+        else:
+            print("  (not available)")
         print()
-        print(f"Snapshots:")
+
+        # Snapshots
+        print("Snapshots:")
         print(f"  Count: {status['snapshots']['count']}")
         print(f"  Deletable: {status['snapshots']['deletable']}")
         print()
-        print(f"Archive:")
+
+        # Archive
+        print("Archive:")
         print(f"  System: {status['archive']['system']}")
         print(f"  Reachable: {'Yes' if status['archive']['reachable'] else 'No'}")
 
@@ -477,8 +550,12 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_snapshots(args: argparse.Namespace) -> int:
     """List snapshots."""
     config = load_config(args)
-    fs = RealFilesystem()
 
+    # Auto-mount backingfiles
+    if not _ensure_mounted(config):
+        return 1
+
+    fs = RealFilesystem()
     snapshot_manager = SnapshotManager(
         fs=fs,
         cam_disk_path=config.cam_disk_path,
@@ -506,6 +583,11 @@ def cmd_snapshots(args: argparse.Namespace) -> int:
 def cmd_clean(args: argparse.Namespace) -> int:
     """Clean up old snapshots."""
     config = load_config(args)
+
+    # Auto-mount backingfiles
+    if not _ensure_mounted(config):
+        return 1
+
     fs, snapshot_manager, space_manager, _, _ = create_components(config)
 
     if args.dry_run:
@@ -525,47 +607,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_validate(args: argparse.Namespace) -> int:
-    """Validate configuration."""
-    try:
-        config = load_config(args)
-    except ConfigError as e:
-        print(f"Configuration error: {e}")
-        return 1
-
-    warnings = config.validate()
-
-    # Also check space requirements if possible
-    fs = RealFilesystem()
-    if fs.exists(config.backingfiles_path):
-        try:
-            statvfs = fs.statvfs(config.backingfiles_path)
-            total_space = statvfs.total_bytes
-
-            space_manager = SpaceManager(
-                fs=fs,
-                snapshot_manager=None,  # type: ignore
-                backingfiles_path=config.backingfiles_path,
-                cam_size=config.cam_size,
-            )
-
-            space_warnings = space_manager.validate_configuration(
-                total_space=total_space,
-            )
-            warnings.extend(space_warnings)
-        except Exception as e:
-            warnings.append(f"Could not validate space: {e}")
-
-    if warnings:
-        print("Configuration warnings:")
-        for warning in warnings:
-            print(f"  - {warning}")
-        return 1
-    else:
-        print("Configuration is valid")
-        return 0
-
-
 def cmd_gadget(args: argparse.Namespace) -> int:
     """Manage USB gadget."""
     if args.gadget_command is None:
@@ -574,23 +615,12 @@ def cmd_gadget(args: argparse.Namespace) -> int:
 
     gadget = UsbGadget()
 
-    if args.gadget_command == "init":
+    if args.gadget_command == "on":
         config = load_config(args)
-
         luns = {0: LunConfig(disk_path=config.cam_disk_path)}
 
         try:
             gadget.initialize(luns)
-            if args.enable:
-                gadget.enable()
-            print(f"Gadget initialized with {len(luns)} LUN(s)")
-            return 0
-        except GadgetError as e:
-            print(f"Failed to initialize gadget: {e}")
-            return 1
-
-    elif args.gadget_command == "enable":
-        try:
             gadget.enable()
             print("Gadget enabled")
             return 0
@@ -598,22 +628,13 @@ def cmd_gadget(args: argparse.Namespace) -> int:
             print(f"Failed to enable gadget: {e}")
             return 1
 
-    elif args.gadget_command == "disable":
+    elif args.gadget_command == "off":
         try:
-            gadget.disable()
+            gadget.remove()
             print("Gadget disabled")
             return 0
         except GadgetError as e:
             print(f"Failed to disable gadget: {e}")
-            return 1
-
-    elif args.gadget_command == "remove":
-        try:
-            gadget.remove()
-            print("Gadget removed")
-            return 0
-        except GadgetError as e:
-            print(f"Failed to remove gadget: {e}")
             return 1
 
     elif args.gadget_command == "status":
@@ -667,9 +688,6 @@ def main() -> int:
         "-y", "--yes", action="store_true", help="Skip confirmation prompt"
     )
 
-    # mount command
-    subparsers.add_parser("mount", help="Mount the backingfiles image")
-
     # run command
     subparsers.add_parser("run", help="Run the main coordinator loop")
 
@@ -677,7 +695,7 @@ def main() -> int:
     subparsers.add_parser("archive", help="Run a single archive cycle")
 
     # status command
-    status_parser = subparsers.add_parser("status", help="Show current status")
+    status_parser = subparsers.add_parser("status", help="Show status (space, snapshots, config)")
     status_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     # snapshots command
@@ -690,21 +708,13 @@ def main() -> int:
         "--dry-run", action="store_true", help="Show what would be deleted"
     )
 
-    # validate command
-    subparsers.add_parser("validate", help="Validate configuration")
-
     # gadget command with subcommands
     gadget_parser = subparsers.add_parser("gadget", help="Manage USB gadget")
     gadget_parser.set_defaults(gadget_parser=gadget_parser)
     gadget_subparsers = gadget_parser.add_subparsers(dest="gadget_command", help="Gadget command")
 
-    gadget_init = gadget_subparsers.add_parser("init", help="Initialize USB gadget")
-    gadget_init.add_argument("--enable", action="store_true", help="Enable after init")
-
-    gadget_subparsers.add_parser("enable", help="Enable USB gadget")
-    gadget_subparsers.add_parser("disable", help="Disable USB gadget")
-    gadget_subparsers.add_parser("remove", help="Remove USB gadget")
-
+    gadget_subparsers.add_parser("on", help="Initialize and enable USB gadget")
+    gadget_subparsers.add_parser("off", help="Disable and remove USB gadget")
     gadget_status = gadget_subparsers.add_parser("status", help="Show gadget status")
     gadget_status.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -719,13 +729,11 @@ def main() -> int:
     commands = {
         "init": cmd_init,
         "deinit": cmd_deinit,
-        "mount": cmd_mount,
         "run": cmd_run,
         "archive": cmd_archive,
         "status": cmd_status,
         "snapshots": cmd_snapshots,
         "clean": cmd_clean,
-        "validate": cmd_validate,
         "gadget": cmd_gadget,
     }
 
