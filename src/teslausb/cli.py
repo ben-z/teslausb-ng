@@ -640,6 +640,7 @@ ExecStartPre=/usr/local/bin/teslausb gadget on
 ExecStart=/usr/local/bin/teslausb run
 ExecStopPost=/usr/local/bin/teslausb gadget off
 EnvironmentFile=-/etc/teslausb.conf
+TimeoutStartSec=60
 Restart=always
 RestartSec=10
 
