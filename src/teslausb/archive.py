@@ -12,7 +12,7 @@ import logging
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -36,6 +36,14 @@ class ArchiveState(Enum):
 
 
 @dataclass
+class ArchivedFile:
+    """Information about an archived file for later deletion."""
+
+    relative_path: str  # Path relative to clip directory (e.g., "2024-01-01_12-00-00/front.mp4")
+    size: int  # File size in bytes at time of archive
+
+
+@dataclass
 class ArchiveResult:
     """Result of an archive operation."""
 
@@ -46,6 +54,8 @@ class ArchiveResult:
     started_at: datetime | None = None
     completed_at: datetime | None = None
     error: str | None = None
+    # Archived files by directory name (e.g., "SavedClips" -> [ArchivedFile, ...])
+    archived_files: dict[str, list[ArchivedFile]] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -66,6 +76,8 @@ class CopyResult:
     files_transferred: int = 0
     bytes_transferred: int = 0
     error: str | None = None
+    # Files that were archived (with sizes for verification before deletion)
+    archived_files: list[ArchivedFile] = field(default_factory=list)
 
 
 class ArchiveBackend(ABC):
@@ -124,6 +136,7 @@ class RcloneBackend(ArchiveBackend):
         flags: list[str] | None = None,
         timeout: int = 3600,
         stop_event: Event | None = None,
+        fs: Filesystem | None = None,
     ):
         """Initialize rclone backend.
 
@@ -133,12 +146,14 @@ class RcloneBackend(ArchiveBackend):
             flags: Additional rclone flags (e.g., ["--fast-list"])
             timeout: Timeout for copy operations in seconds
             stop_event: Optional event to signal shutdown
+            fs: Filesystem abstraction (for scanning source directories)
         """
         self.remote = remote
         self.path = path.strip("/")
         self.flags = flags or []
         self.timeout = timeout
         self.stop_event = stop_event
+        self.fs = fs or Filesystem()
 
     def _dest(self, subpath: str = "") -> str:
         """Build rclone destination path."""
@@ -176,8 +191,40 @@ class RcloneBackend(ArchiveBackend):
                 proc.kill()
                 proc.wait()
 
+    def _scan_directory(self, src: Path) -> list[ArchivedFile]:
+        """Scan a directory and collect file info for later deletion verification.
+
+        Args:
+            src: Source directory to scan
+
+        Returns:
+            List of ArchivedFile with relative paths and sizes
+        """
+        files: list[ArchivedFile] = []
+        try:
+            for dirpath, _, filenames in self.fs.walk(src):
+                for filename in filenames:
+                    full_path = Path(dirpath) / filename
+                    try:
+                        size = self.fs.stat(full_path).size
+                        rel_path = str(full_path.relative_to(src))
+                        files.append(ArchivedFile(relative_path=rel_path, size=size))
+                    except OSError as e:
+                        logger.warning(f"Could not stat {full_path}: {e}")
+        except OSError as e:
+            logger.warning(f"Could not scan directory {src}: {e}")
+        return files
+
     def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
-        """Copy a directory using rclone copy."""
+        """Copy a directory using rclone copy.
+
+        Scans the source directory first to collect file info for later
+        deletion verification.
+        """
+        # Scan files before copying (for deletion verification later)
+        archived_files = self._scan_directory(src)
+        logger.debug(f"Scanned {len(archived_files)} files in {src}")
+
         dest = self._dest(dst_name)
         cmd = [
             "rclone", "copy",
@@ -224,6 +271,7 @@ class RcloneBackend(ArchiveBackend):
                 success=True,
                 files_transferred=files_transferred,
                 bytes_transferred=bytes_transferred,
+                archived_files=archived_files,
             )
 
         except subprocess.TimeoutExpired:
@@ -240,14 +288,24 @@ class ArchiveManager:
     Coordinates with SnapshotManager to:
     1. Acquire snapshot (locks it from deletion)
     2. Archive clip directories
-    3. Release snapshot
+    3. Delete archived files from live cam_disk
+    4. Release snapshot
     """
+
+    # Directory name to TeslaCam path mapping
+    DIR_TO_PATH: dict[str, str] = {
+        "SavedClips": "TeslaCam/SavedClips",
+        "SentryClips": "TeslaCam/SentryClips",
+        "RecentClips": "TeslaCam/RecentClips",
+        "TrackMode": "TeslaTrackMode",
+    }
 
     def __init__(
         self,
         fs: Filesystem,
         snapshot_manager: SnapshotManager,
         backend: ArchiveBackend,
+        cam_disk_path: Path | None = None,
         archive_recent: bool = False,
         archive_saved: bool = True,
         archive_sentry: bool = True,
@@ -259,6 +317,7 @@ class ArchiveManager:
             fs: Filesystem abstraction
             snapshot_manager: SnapshotManager instance
             backend: Archive backend to use
+            cam_disk_path: Path to cam_disk.bin (for deleting archived files)
             archive_recent: Whether to archive RecentClips
             archive_saved: Whether to archive SavedClips
             archive_sentry: Whether to archive SentryClips
@@ -267,6 +326,7 @@ class ArchiveManager:
         self.fs = fs
         self.snapshot_manager = snapshot_manager
         self.backend = backend
+        self.cam_disk_path = cam_disk_path
         self.archive_recent = archive_recent
         self.archive_saved = archive_saved
         self.archive_sentry = archive_sentry
@@ -355,6 +415,9 @@ class ArchiveManager:
             if copy_result.success:
                 total_files += copy_result.files_transferred
                 total_bytes += copy_result.bytes_transferred
+                # Track archived files for deletion (only for successful directories)
+                if copy_result.archived_files:
+                    result.archived_files[dst_name] = copy_result.archived_files
                 logger.info(f"  {dst_name}: {copy_result.files_transferred} files")
             else:
                 errors.append(f"{dst_name}: {copy_result.error}")
@@ -374,23 +437,145 @@ class ArchiveManager:
 
         return result
 
+    def delete_archived_files(
+        self,
+        result: ArchiveResult,
+        cam_disk_mount: Path,
+    ) -> tuple[int, int]:
+        """Delete archived files from the live cam_disk.
+
+        Before deleting each file, verifies that the file size matches what was
+        archived. This catches edge cases where files might have been modified
+        (e.g., if Tesla's behavior changes).
+
+        Args:
+            result: ArchiveResult containing the list of archived files
+            cam_disk_mount: Path where cam_disk is mounted (read-write)
+
+        Returns:
+            Tuple of (files_deleted, files_skipped)
+        """
+        deleted = 0
+        skipped = 0
+
+        for dir_name, files in result.archived_files.items():
+            # Map directory name to path on disk
+            dir_path = self.DIR_TO_PATH.get(dir_name)
+            if not dir_path:
+                logger.warning(f"Unknown directory name: {dir_name}")
+                continue
+
+            base_path = cam_disk_mount / dir_path
+
+            for archived_file in files:
+                file_path = base_path / archived_file.relative_path
+
+                # Check if file exists
+                if not self.fs.exists(file_path):
+                    logger.debug(f"File already deleted: {file_path}")
+                    skipped += 1
+                    continue
+
+                # Verify file size matches (safety check)
+                try:
+                    current_size = self.fs.stat(file_path).size
+                    if current_size != archived_file.size:
+                        logger.warning(
+                            f"File size mismatch for {file_path}: "
+                            f"archived={archived_file.size}, current={current_size}. "
+                            f"Skipping deletion."
+                        )
+                        skipped += 1
+                        continue
+                except OSError as e:
+                    logger.warning(f"Could not stat {file_path}: {e}")
+                    skipped += 1
+                    continue
+
+                # Delete the file
+                try:
+                    self.fs.remove(file_path)
+                    deleted += 1
+                    logger.debug(f"Deleted: {file_path}")
+                except OSError as e:
+                    logger.warning(f"Could not delete {file_path}: {e}")
+                    skipped += 1
+
+            # Clean up empty directories
+            self._cleanup_empty_dirs(base_path)
+
+        logger.info(f"Deleted {deleted} files, skipped {skipped}")
+        return deleted, skipped
+
+    def _cleanup_empty_dirs(self, base_path: Path) -> None:
+        """Remove empty directories under base_path.
+
+        Walks the directory tree bottom-up and removes empty directories.
+        """
+        if not self.fs.exists(base_path):
+            return
+
+        # Collect all directories, then sort by depth (deepest first)
+        dirs_to_check: list[Path] = []
+        try:
+            for dirpath, dirnames, filenames in self.fs.walk(base_path):
+                for dirname in dirnames:
+                    dirs_to_check.append(Path(dirpath) / dirname)
+        except OSError:
+            return
+
+        # Sort by path length descending (deepest first)
+        dirs_to_check.sort(key=lambda p: len(p.parts), reverse=True)
+
+        for dir_path in dirs_to_check:
+            try:
+                # Check if directory is empty
+                if self.fs.exists(dir_path) and not any(self.fs.listdir(dir_path)):
+                    self.fs.rmdir(dir_path)
+                    logger.debug(f"Removed empty directory: {dir_path}")
+            except OSError:
+                pass  # Directory not empty or other error, skip
+
     def archive_new_snapshot(
         self,
         mount_fn: Callable[[Path], Iterator[Path]],
+        delete_after_archive: bool = True,
     ) -> ArchiveResult:
-        """Create a new snapshot, mount it, and archive.
+        """Create a new snapshot, mount it, archive, and optionally delete archived files.
 
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
+            delete_after_archive: If True and cam_disk_path is set, delete archived
+                files from cam_disk after successful archive.
 
         Returns:
             ArchiveResult with details of the operation
         """
+        from .mount import mount_image  # Import here to avoid circular import
+
         snapshot = self.snapshot_manager.create_snapshot()
         handle = self.snapshot_manager.acquire(snapshot.id)
 
         try:
             with mount_fn(snapshot.image_path) as mount_path:
-                return self.archive_snapshot(handle, mount_path)
+                result = self.archive_snapshot(handle, mount_path)
+
+            # Delete archived files from cam_disk if configured and archive succeeded
+            if (
+                delete_after_archive
+                and self.cam_disk_path
+                and result.success
+                and result.archived_files
+            ):
+                logger.info("Deleting archived files from cam_disk...")
+                try:
+                    with mount_image(self.cam_disk_path, readonly=False) as cam_mount:
+                        deleted, skipped = self.delete_archived_files(result, cam_mount)
+                        logger.info(f"Cleanup complete: {deleted} deleted, {skipped} skipped")
+                except Exception as e:
+                    # Don't fail the archive if cleanup fails - files will be re-archived next time
+                    logger.error(f"Failed to delete archived files: {e}")
+
+            return result
         finally:
             handle.release()

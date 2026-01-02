@@ -34,14 +34,15 @@ def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
 
 
 @contextmanager
-def mount_image(image_path: Path) -> Iterator[Path]:
+def mount_image(image_path: Path, readonly: bool = True) -> Iterator[Path]:
     """Mount a disk image and yield the mount path.
 
     Creates a loop device with partition scanning, mounts the first partition,
     and cleans up on exit.
 
     Args:
-        image_path: Path to disk image file (e.g., snap.bin)
+        image_path: Path to disk image file (e.g., snap.bin or cam_disk.bin)
+        readonly: If True, mount read-only (default). If False, mount read-write.
 
     Yields:
         Path to mounted filesystem
@@ -53,6 +54,10 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         with mount_image(Path("/backingfiles/snapshots/snap-000000/snap.bin")) as mnt:
             for f in (mnt / "TeslaCam" / "SavedClips").iterdir():
                 print(f)
+
+        # Mount read-write for deletion:
+        with mount_image(Path("/backingfiles/cam_disk.bin"), readonly=False) as mnt:
+            (mnt / "TeslaCam" / "SavedClips" / "old_event").unlink()
     """
     loop_dev: str | None = None
     mount_point: Path | None = None
@@ -77,17 +82,22 @@ def mount_image(image_path: Path) -> Iterator[Path]:
         # Create mount point
         mount_point = Path(tempfile.mkdtemp(prefix="teslausb-mount-"))
 
-        # Mount the partition
-        result = _run(["mount", "-o", "ro", partition, str(mount_point)])
+        # Mount the partition (read-only or read-write)
+        mount_opts = "ro" if readonly else "rw"
+        result = _run(["mount", "-o", mount_opts, partition, str(mount_point)])
         if result.returncode != 0:
             raise MountError("mount failed")
 
-        logger.info(f"Mounted {image_path} at {mount_point}")
+        mode = "read-only" if readonly else "read-write"
+        logger.info(f"Mounted {image_path} at {mount_point} ({mode})")
         yield mount_point
 
     finally:
         # Cleanup: unmount and detach
         if mount_point and mount_point.exists():
+            # Sync before unmount if read-write
+            if not readonly:
+                _run(["sync"])
             result = _run(["umount", str(mount_point)])
             if result.returncode != 0:
                 logger.warning("umount failed")

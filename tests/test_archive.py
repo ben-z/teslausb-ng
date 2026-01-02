@@ -6,6 +6,7 @@ import pytest
 
 from teslausb.archive import (
     ArchiveManager,
+    ArchivedFile,
     ArchiveResult,
     ArchiveState,
     CopyResult,
@@ -324,27 +325,260 @@ class TestRcloneBackend:
 
     def test_dest_remote_only(self):
         """Test destination with remote name only."""
-        backend = RcloneBackend(remote="gdrive")
+        fs = MockFilesystem()
+        backend = RcloneBackend(remote="gdrive", fs=fs)
         assert backend._dest() == "gdrive:"
         assert backend._dest("") == "gdrive:"
 
     def test_dest_with_path(self):
         """Test destination with remote and path."""
-        backend = RcloneBackend(remote="gdrive", path="TeslaCam/archive")
+        fs = MockFilesystem()
+        backend = RcloneBackend(remote="gdrive", path="TeslaCam/archive", fs=fs)
         assert backend._dest() == "gdrive:TeslaCam/archive"
         assert backend._dest("") == "gdrive:TeslaCam/archive"
 
     def test_dest_with_subpath(self):
         """Test destination with subpath."""
-        backend = RcloneBackend(remote="gdrive", path="TeslaCam")
+        fs = MockFilesystem()
+        backend = RcloneBackend(remote="gdrive", path="TeslaCam", fs=fs)
         assert backend._dest("SavedClips") == "gdrive:TeslaCam/SavedClips"
 
     def test_dest_no_base_path(self):
         """Test destination without base path."""
-        backend = RcloneBackend(remote="s3")
+        fs = MockFilesystem()
+        backend = RcloneBackend(remote="s3", fs=fs)
         assert backend._dest("SavedClips") == "s3:SavedClips"
 
     def test_dest_strips_slashes_from_path(self):
         """Test that leading/trailing slashes are stripped from path."""
-        backend = RcloneBackend(remote="gdrive", path="/TeslaCam/archive/")
+        fs = MockFilesystem()
+        backend = RcloneBackend(remote="gdrive", path="/TeslaCam/archive/", fs=fs)
         assert backend._dest() == "gdrive:TeslaCam/archive"
+
+    def test_scan_directory(self):
+        """Test scanning a directory for files."""
+        fs = MockFilesystem()
+        fs.mkdir(Path("/test/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/test/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/SavedClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/SavedClips/event1/event.json"), "{}")
+
+        backend = RcloneBackend(remote="gdrive", fs=fs)
+        files = backend._scan_directory(Path("/test/SavedClips"))
+
+        assert len(files) == 3
+        # Check that we got the right relative paths
+        rel_paths = {f.relative_path for f in files}
+        assert "event1/front.mp4" in rel_paths
+        assert "event1/back.mp4" in rel_paths
+        assert "event1/event.json" in rel_paths
+
+        # Check sizes
+        by_path = {f.relative_path: f for f in files}
+        assert by_path["event1/front.mp4"].size == 1000
+        assert by_path["event1/back.mp4"].size == 2000
+
+
+class TestDeleteArchivedFiles:
+    """Tests for deleting archived files from cam_disk."""
+
+    def test_delete_archived_files_success(self):
+        """Test successful deletion of archived files."""
+        fs = MockFilesystem()
+
+        # Set up cam_disk structure
+        fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/back.mp4"), "x" * 2000)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        # Create archive result with archived files
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "SavedClips": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/back.mp4", size=2000),
+                ],
+            },
+        )
+
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 2
+        assert skipped == 0
+        assert not fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"))
+        assert not fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1/back.mp4"))
+
+    def test_delete_skips_size_mismatch(self):
+        """Test that files with different sizes are not deleted."""
+        fs = MockFilesystem()
+
+        # Set up cam_disk structure - file has different size than archived
+        fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"), "x" * 1500)  # Different!
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "SavedClips": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),  # Archived size was 1000
+                ],
+            },
+        )
+
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 0
+        assert skipped == 1
+        # File should still exist
+        assert fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"))
+
+    def test_delete_handles_missing_files(self):
+        """Test that missing files are handled gracefully."""
+        fs = MockFilesystem()
+
+        # Create structure but don't create the file
+        fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips"), parents=True)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "SavedClips": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                ],
+            },
+        )
+
+        # Should not raise - missing files are skipped
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 0
+        assert skipped == 1
+
+    def test_delete_cleans_empty_directories(self):
+        """Test that empty directories are cleaned up after deletion."""
+        fs = MockFilesystem()
+
+        # Set up structure with nested directories
+        fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"), "x" * 1000)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "SavedClips": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                ],
+            },
+        )
+
+        manager.delete_archived_files(result, Path("/cam_mount"))
+
+        # The event1 directory should be removed since it's empty
+        assert not fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1"))
+        # But SavedClips should still exist
+        assert fs.exists(Path("/cam_mount/TeslaCam/SavedClips"))
+
+    def test_delete_handles_multiple_directories(self):
+        """Test deletion from multiple directories."""
+        fs = MockFilesystem()
+
+        # Set up both SavedClips and SentryClips
+        fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips/event1"), parents=True)
+        fs.mkdir(Path("/cam_mount/TeslaCam/SentryClips/event2"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/cam_mount/TeslaCam/SentryClips/event2/front.mp4"), "x" * 2000)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "SavedClips": [
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                ],
+                "SentryClips": [
+                    ArchivedFile(relative_path="event2/front.mp4", size=2000),
+                ],
+            },
+        )
+
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 2
+        assert skipped == 0
+        assert not fs.exists(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"))
+        assert not fs.exists(Path("/cam_mount/TeslaCam/SentryClips/event2/front.mp4"))
