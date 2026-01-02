@@ -9,6 +9,7 @@ Usage:
     teslausb snapshots     # List snapshots
     teslausb clean         # Clean up old snapshots
     teslausb gadget        # Manage USB mass storage gadget
+    teslausb service       # Manage systemd service
 """
 
 from __future__ import annotations
@@ -21,14 +22,17 @@ import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
 from .config import Config, ConfigError, load_from_env, load_from_file
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
-from .mount import mount_image
 from .gadget import GadgetError, LunConfig, UsbGadget
+from .led import SysfsLedController
+from .mount import mount_image
 from .snapshot import SnapshotManager
-from .space import SpaceManager, GB
+from .space import GB, SpaceManager
+from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
 logger = logging.getLogger(__name__)
 
@@ -388,13 +392,29 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
 
+    # Set up LED controller (auto-detects available LED)
+    led_controller = SysfsLedController()
+
+    # Set up temperature monitoring with sensible defaults for a car environment
+    temp_monitor = SysfsTemperatureMonitor(
+        config=TemperatureConfig(
+            warning_threshold=80000,  # 80°C - high warning
+            caution_threshold=70000,  # 70°C - caution
+            poll_interval=60.0,
+        )
+    )
+
     coordinator = Coordinator(
         fs=fs,
         snapshot_manager=snapshot_manager,
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
-        config=CoordinatorConfig(mount_fn=mount_image),
+        config=CoordinatorConfig(
+            mount_fn=mount_image,
+            led_controller=led_controller,
+            temperature_monitor=temp_monitor,
+        ),
     )
 
     logger.info("Starting TeslaUSB coordinator")
@@ -608,6 +628,121 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 1
 
 
+SYSTEMD_SERVICE = """\
+[Unit]
+Description=TeslaUSB Archiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/teslausb gadget on
+ExecStart=/usr/local/bin/teslausb run
+ExecStop=/usr/local/bin/teslausb gadget off
+EnvironmentFile=-/etc/teslausb.conf
+TimeoutStartSec=60
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+SYSTEMD_SERVICE_PATH = Path("/etc/systemd/system/teslausb.service")
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """Manage systemd service."""
+    if args.service_command is None:
+        args.service_parser.print_help()
+        return 1
+
+    if args.service_command == "install":
+        # Check if already installed
+        if SYSTEMD_SERVICE_PATH.exists() and not args.force:
+            print(f"Service already installed at {SYSTEMD_SERVICE_PATH}")
+            print("Use --force to overwrite")
+            return 1
+
+        # Find the teslausb binary path
+        result = _run_cmd(["which", "teslausb"], capture_stdout=True)
+        if result.returncode != 0:
+            print("Error: Could not find teslausb in PATH")
+            return 1
+        teslausb_path = result.stdout.decode().strip()
+
+        # Generate service file with correct path
+        service_content = SYSTEMD_SERVICE.replace("/usr/local/bin/teslausb", teslausb_path)
+
+        print("Installing systemd service...")
+        print(f"  Writing {SYSTEMD_SERVICE_PATH}")
+        try:
+            SYSTEMD_SERVICE_PATH.write_text(service_content)
+        except PermissionError:
+            print("Error: Permission denied. Run with sudo.")
+            return 1
+
+        print("  Reloading systemd daemon...")
+        result = _run_cmd(["systemctl", "daemon-reload"])
+        if result.returncode != 0:
+            print("Warning: Failed to reload systemd daemon")
+
+        print("  Enabling service...")
+        result = _run_cmd(["systemctl", "enable", "teslausb.service"])
+        if result.returncode != 0:
+            print("Warning: Failed to enable service")
+
+        print()
+        print("Service installed successfully!")
+        print()
+        print("Next steps:")
+        print("  1. Create /etc/teslausb.conf with your configuration")
+        print("  2. Run: sudo teslausb init")
+        print("  3. Start the service: sudo systemctl start teslausb")
+        print()
+        print("Useful commands:")
+        print("  sudo systemctl start teslausb    # Start now")
+        print("  sudo systemctl status teslausb   # Check status")
+        print("  sudo journalctl -u teslausb -f   # Follow logs")
+        return 0
+
+    elif args.service_command == "uninstall":
+        if not SYSTEMD_SERVICE_PATH.exists():
+            print("Service is not installed")
+            return 0
+
+        print("Uninstalling systemd service...")
+
+        print("  Stopping service...")
+        _run_cmd(["systemctl", "stop", "teslausb.service"])
+
+        print("  Disabling service...")
+        _run_cmd(["systemctl", "disable", "teslausb.service"])
+
+        print(f"  Removing {SYSTEMD_SERVICE_PATH}")
+        try:
+            SYSTEMD_SERVICE_PATH.unlink()
+        except PermissionError:
+            print("Error: Permission denied. Run with sudo.")
+            return 1
+
+        print("  Reloading systemd daemon...")
+        _run_cmd(["systemctl", "daemon-reload"])
+
+        print("Service uninstalled successfully!")
+        return 0
+
+    elif args.service_command == "status":
+        if not SYSTEMD_SERVICE_PATH.exists():
+            print("Service is not installed")
+            print("Run 'teslausb service install' to install")
+            return 1
+
+        return _run_cmd(["systemctl", "status", "teslausb.service"])
+
+    return 1
+
+
 def cmd_gadget(args: argparse.Namespace) -> int:
     """Manage USB gadget."""
     if args.gadget_command is None:
@@ -719,6 +854,22 @@ def main() -> int:
     gadget_status = gadget_subparsers.add_parser("status", help="Show gadget status")
     gadget_status.add_argument("--json", action="store_true", help="Output as JSON")
 
+    # service command with subcommands
+    service_parser = subparsers.add_parser("service", help="Manage systemd service")
+    service_parser.set_defaults(service_parser=service_parser)
+    service_subparsers = service_parser.add_subparsers(
+        dest="service_command", help="Service command"
+    )
+
+    service_install = service_subparsers.add_parser(
+        "install", help="Install and enable systemd service"
+    )
+    service_install.add_argument(
+        "--force", action="store_true", help="Overwrite existing service file"
+    )
+    service_subparsers.add_parser("uninstall", help="Remove systemd service")
+    service_subparsers.add_parser("status", help="Show service status")
+
     args = parser.parse_args()
 
     configure_logging(verbose=args.verbose, debug=args.debug)
@@ -736,6 +887,7 @@ def main() -> int:
         "snapshots": cmd_snapshots,
         "clean": cmd_clean,
         "gadget": cmd_gadget,
+        "service": cmd_service,
     }
 
     try:
