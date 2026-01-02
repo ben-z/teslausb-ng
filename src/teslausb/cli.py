@@ -2,6 +2,7 @@
 
 Usage:
     teslausb init          # Create disk images and directory structure
+    teslausb deinit        # Remove disk images and clean up
     teslausb mount         # Mount the backingfiles image
     teslausb run           # Run the main coordinator loop
     teslausb archive       # Run a single archive cycle
@@ -277,6 +278,54 @@ def cmd_mount(args: argparse.Namespace) -> int:
 
     if not already_mounted:
         print(f"Mounted {backingfiles_img} at {config.backingfiles_path}")
+    return 0
+
+
+def cmd_deinit(args: argparse.Namespace) -> int:
+    """Remove TeslaUSB disk images and clean up."""
+    config = load_config(args)
+    backingfiles_img = config.mutable_path / "backingfiles.img"
+
+    if not backingfiles_img.exists():
+        print(f"Nothing to do: {backingfiles_img} does not exist")
+        return 0
+
+    # Confirm unless --yes flag is provided
+    if not args.yes:
+        print(f"This will permanently delete:")
+        print(f"  {backingfiles_img}")
+        print(f"  All snapshots and cam disk data")
+        print()
+        response = input("Are you sure? [y/N] ")
+        if response.lower() not in ("y", "yes"):
+            print("Aborted")
+            return 1
+
+    print(f"Deinitializing TeslaUSB...")
+
+    # Unmount backingfiles if mounted
+    if _is_mounted(config.backingfiles_path):
+        print(f"  Unmounting {config.backingfiles_path}...")
+        result = _run_cmd(["umount", str(config.backingfiles_path)])
+        if result.returncode != 0:
+            print(f"  Failed to unmount {config.backingfiles_path}")
+            print(f"  Make sure no processes are using files in {config.backingfiles_path}")
+            return 1
+
+    # Remove backingfiles image
+    print(f"  Removing {backingfiles_img}...")
+    backingfiles_img.unlink()
+
+    # Remove mount directory if empty
+    if config.backingfiles_path.exists():
+        try:
+            config.backingfiles_path.rmdir()
+            print(f"  Removed {config.backingfiles_path}")
+        except OSError:
+            # Directory not empty or other issue, that's fine
+            pass
+
+    print(f"Deinitialization complete")
     return 0
 
 
@@ -612,6 +661,12 @@ def main() -> int:
     # init command
     subparsers.add_parser("init", help="Initialize disk images and directory structure")
 
+    # deinit command
+    deinit_parser = subparsers.add_parser("deinit", help="Remove disk images and clean up")
+    deinit_parser.add_argument(
+        "-y", "--yes", action="store_true", help="Skip confirmation prompt"
+    )
+
     # mount command
     subparsers.add_parser("mount", help="Mount the backingfiles image")
 
@@ -663,6 +718,7 @@ def main() -> int:
 
     commands = {
         "init": cmd_init,
+        "deinit": cmd_deinit,
         "mount": cmd_mount,
         "run": cmd_run,
         "archive": cmd_archive,
