@@ -652,6 +652,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_mount(args: argparse.Namespace) -> int:
+    """Mount the backingfiles image."""
+    config = load_config(args)
+    if _ensure_mounted(config):
+        print(f"Backingfiles mounted at {config.backingfiles_path}")
+        return 0
+    return 1
+
+
 SYSTEMD_SERVICE = """\
 [Unit]
 Description=TeslaUSB Archiver
@@ -660,6 +669,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/local/bin/teslausb mount
 ExecStartPre=/usr/local/bin/teslausb gadget on
 ExecStart=/usr/local/bin/teslausb --log-level debug run
 ExecStop=/usr/local/bin/teslausb gadget off
@@ -855,6 +865,9 @@ def main() -> int:
     # archive command
     subparsers.add_parser("archive", help="Run a single archive cycle")
 
+    # mount command
+    subparsers.add_parser("mount", help="Mount the backingfiles image")
+
     # status command
     status_parser = subparsers.add_parser("status", help="Show status (space, snapshots, config)")
     status_parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -907,6 +920,7 @@ def main() -> int:
         "deinit": cmd_deinit,
         "run": cmd_run,
         "archive": cmd_archive,
+        "mount": cmd_mount,
         "status": cmd_status,
         "snapshots": cmd_snapshots,
         "clean": cmd_clean,
