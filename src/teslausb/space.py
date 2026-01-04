@@ -84,7 +84,11 @@ class SpaceInfo:
 
         A snapshot can grow up to cam_size in the worst case (if all blocks
         change while archiving). We need at least cam_size free to be safe.
+        A non-positive cam_size indicates the system is not initialized
+        for snapshots, so this will return False in that case.
         """
+        if self.cam_size_bytes <= 0:
+            return False
         return self.free_bytes >= self.cam_size_bytes
 
     def __str__(self) -> str:
@@ -121,6 +125,9 @@ class SpaceManager:
         self.snapshot_manager = snapshot_manager
         self.backingfiles_path = backingfiles_path
         self.cam_size = cam_size
+        
+        if cam_size <= 0:
+            logger.warning("SpaceManager created with cam_size=%d (system may not be initialized)", cam_size)
 
     def get_space_info(self) -> SpaceInfo:
         """Get current space information."""

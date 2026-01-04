@@ -33,7 +33,7 @@ from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
-from .space import SpaceManager, MIN_CAM_SIZE, DEFAULT_RESERVE, calculate_cam_size
+from .space import MIN_CAM_SIZE, DEFAULT_RESERVE, SpaceManager, calculate_cam_size
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
 logger = logging.getLogger(__name__)

@@ -100,6 +100,26 @@ class TestSpaceInfo:
         )
         assert not info.can_snapshot  # 30 < 40
 
+    def test_cannot_snapshot_when_cam_size_zero(self):
+        """Test can_snapshot is False when cam_size is 0 (not initialized)."""
+        info = SpaceInfo(
+            total_bytes=100 * GB,
+            free_bytes=50 * GB,
+            used_bytes=50 * GB,
+            cam_size_bytes=0,
+        )
+        assert not info.can_snapshot  # cam_size=0 means not initialized
+
+    def test_cannot_snapshot_when_cam_size_negative(self):
+        """Test can_snapshot is False when cam_size is negative."""
+        info = SpaceInfo(
+            total_bytes=100 * GB,
+            free_bytes=50 * GB,
+            used_bytes=50 * GB,
+            cam_size_bytes=-1,
+        )
+        assert not info.can_snapshot  # negative cam_size should never happen
+
     def test_str_representation(self):
         """Test string representation includes key info."""
         info = SpaceInfo(
@@ -220,3 +240,19 @@ class TestSpaceManager:
 
         # Should fail - no snapshots to delete
         assert not manager.ensure_space_for_snapshot()
+
+    def test_space_manager_with_zero_cam_size(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
+        """Test SpaceManager with cam_size=0 (not initialized)."""
+        mock_fs.set_free_space(50 * GB)
+
+        manager = SpaceManager(
+            fs=mock_fs,
+            snapshot_manager=snapshot_manager,
+            backingfiles_path=Path("/backingfiles"),
+            cam_size=0,
+        )
+
+        space_info = manager.get_space_info()
+        # cam_size=0 should result in can_snapshot=False
+        assert not space_info.can_snapshot
+        assert space_info.cam_size_bytes == 0
