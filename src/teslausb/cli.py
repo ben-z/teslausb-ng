@@ -331,6 +331,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     # backingfiles uses all space except RESERVE (for OS use)
     # cam_size is half of usable space (other half for snapshots)
     backingfiles_size = available_space - config.reserve
+
+    if backingfiles_size <= 0:
+        print("Error: Reserve size leaves no space for TeslaUSB backing files")
+        print(f"  Available: {available_space / GB:.1f} GiB")
+        print(f"  Reserve: {config.reserve / GB:.1f} GiB")
+        print("  Reduce the configured reserve or free disk space and try again.")
+        return 1
     cam_size = calculate_cam_size(backingfiles_size)
 
     if cam_size < MIN_CAM_SIZE:
