@@ -107,7 +107,11 @@ def get_cam_size(config: Config) -> int:
 def create_components(config: Config) -> tuple[
     RealFilesystem, SnapshotManager, SpaceManager, ArchiveManager, MockArchiveBackend | RcloneBackend
 ]:
-    """Create all components from configuration."""
+    """Create all components from configuration.
+
+    Raises:
+        RuntimeError: If cam_disk.bin doesn't exist (not initialized)
+    """
     fs = RealFilesystem()
 
     snapshot_manager = SnapshotManager(
@@ -117,6 +121,18 @@ def create_components(config: Config) -> tuple[
     )
 
     cam_size = get_cam_size(config)
+    if cam_size == 0:
+        if not config.cam_disk_path.exists():
+            raise RuntimeError(
+                f"cam_disk.bin not found at {config.cam_disk_path}. "
+                "Run 'teslausb init' to set up the system first."
+            )
+        else:
+            raise RuntimeError(
+                f"cam_disk.bin at {config.cam_disk_path} has zero size. "
+                "Run 'teslausb init' to set up the system first."
+            )
+
     space_manager = SpaceManager(
         fs=fs,
         snapshot_manager=snapshot_manager,
@@ -481,7 +497,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     for warning in warnings:
         logger.warning(f"Config warning: {warning}")
 
-    fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
+    try:
+        fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return 1
 
     # Set up LED controller (auto-detects available LED)
     led_controller = SysfsLedController()
@@ -521,7 +541,11 @@ def cmd_archive(args: argparse.Namespace) -> int:
     if not _ensure_mounted(config):
         return 1
 
-    fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
+    try:
+        fs, snapshot_manager, space_manager, archive_manager, backend = create_components(config)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return 1
 
     coordinator = Coordinator(
         fs=fs,
@@ -557,23 +581,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     space_data = None
     cam_size = get_cam_size(config)
     if backingfiles_mounted:
-        try:
-            space_manager = SpaceManager(
-                fs=fs,
-                snapshot_manager=snapshot_manager,
-                backingfiles_path=config.backingfiles_path,
-                cam_size=cam_size,
-            )
-            space_info = space_manager.get_space_info()
-            space_data = {
-                "total_gb": round(space_info.total_gb, 2),
-                "free_gb": round(space_info.free_gb, 2),
-                "used_gb": round(space_info.used_gb, 2),
-                "cam_size_gb": round(space_info.cam_size_gb, 2),
-                "can_snapshot": space_info.can_snapshot,
-            }
-        except Exception as e:
-            warnings.append(f"Could not get space info: {e}")
+        if cam_size == 0:
+            if not config.cam_disk_path.exists():
+                warnings.append("cam_disk.bin not found (run 'teslausb init' to set up)")
+            else:
+                warnings.append("cam_disk.bin has zero size (run 'teslausb init' to set up)")
+        else:
+            try:
+                space_manager = SpaceManager(
+                    fs=fs,
+                    snapshot_manager=snapshot_manager,
+                    backingfiles_path=config.backingfiles_path,
+                    cam_size=cam_size,
+                )
+                space_info = space_manager.get_space_info()
+                space_data = {
+                    "total_gb": round(space_info.total_gb, 2),
+                    "free_gb": round(space_info.free_gb, 2),
+                    "used_gb": round(space_info.used_gb, 2),
+                    "cam_size_gb": round(space_info.cam_size_gb, 2),
+                    "can_snapshot": space_info.can_snapshot,
+                }
+            except Exception as e:
+                warnings.append(f"Could not get space info: {e}")
     else:
         warnings.append("Backingfiles not mounted (run 'teslausb run' to auto-mount)")
 
@@ -699,7 +729,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if not _ensure_mounted(config):
         return 1
 
-    fs, snapshot_manager, space_manager, _, _ = create_components(config)
+    try:
+        fs, snapshot_manager, space_manager, _, _ = create_components(config)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return 1
 
     if args.dry_run:
         deletable = snapshot_manager.get_deletable_snapshots()
