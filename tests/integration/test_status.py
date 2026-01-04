@@ -113,3 +113,97 @@ class TestCleanCommand:
         result = cli_runner("clean")
 
         assert result.returncode == 0
+
+    def test_clean_all_with_deletable_snapshots(
+        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
+    ):
+        """Clean --all should delete all deletable snapshots."""
+        import subprocess
+        from .conftest import create_test_footage, mount_cam_disk, unmount_cam_disk
+
+        # Create multiple snapshots
+        for i, event_name in enumerate(["event1", "event2", "event3"]):
+            create_test_footage(cam_mount, event_name)
+            subprocess.run(["umount", str(cam_mount)], check=True)
+            cli_runner("archive", check=False)
+
+            # Remount for next iteration (except the last one)
+            if i < 2:
+                loop_dev, partition, kpartx_used = mount_cam_disk(
+                    initialized_env.cam_disk_path, cam_mount
+                )
+
+        # Verify snapshots were created
+        snapshots_before = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_before) == 3, f"Expected 3 snapshots, got {len(snapshots_before)}"
+
+        # Run clean --all
+        result = cli_runner("clean", "--all")
+
+        # Verify all snapshots were deleted
+        assert "Deleted 3 snapshots" in result.stdout
+        snapshots_after = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_after) == 0, f"Expected 0 snapshots after clean, got {len(snapshots_after)}"
+
+    def test_clean_all_dry_run_with_deletable_snapshots(
+        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
+    ):
+        """Clean --all --dry-run should show what would be deleted."""
+        import subprocess
+        from .conftest import create_test_footage, mount_cam_disk, unmount_cam_disk
+
+        # Create multiple snapshots
+        for i, event_name in enumerate(["event1", "event2"]):
+            create_test_footage(cam_mount, event_name)
+            subprocess.run(["umount", str(cam_mount)], check=True)
+            cli_runner("archive", check=False)
+
+            # Remount for next iteration (except the last one)
+            if i < 1:
+                loop_dev, partition, kpartx_used = mount_cam_disk(
+                    initialized_env.cam_disk_path, cam_mount
+                )
+
+        # Verify snapshots were created
+        snapshots_before = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_before) == 2, f"Expected 2 snapshots, got {len(snapshots_before)}"
+
+        # Run clean --all --dry-run
+        result = cli_runner("clean", "--all", "--dry-run")
+
+        # Verify output shows what would be deleted
+        assert "Would delete 2 snapshots:" in result.stdout
+        assert "snap-" in result.stdout
+
+        # Verify snapshots were NOT actually deleted
+        snapshots_after = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_after) == 2, f"Expected 2 snapshots after dry-run, got {len(snapshots_after)}"
+
+    def test_clean_all_deletes_even_when_space_sufficient(
+        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
+    ):
+        """Clean --all should delete snapshots even when space is sufficient."""
+        import subprocess
+        from .conftest import create_test_footage
+
+        # Create a single snapshot (space should be sufficient)
+        create_test_footage(cam_mount, "event1")
+        subprocess.run(["umount", str(cam_mount)], check=True)
+        cli_runner("archive", check=False)
+
+        # Verify snapshot was created
+        snapshots_before = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_before) == 1, f"Expected 1 snapshot, got {len(snapshots_before)}"
+
+        # Verify space is sufficient (status should not indicate low space)
+        status_result = cli_runner("status", "--json")
+        status_data = json.loads(status_result.stdout)
+        assert not status_data["space"]["is_low"], "Space should be sufficient"
+
+        # Run clean --all (should still delete despite sufficient space)
+        result = cli_runner("clean", "--all")
+
+        # Verify snapshot was deleted
+        assert "Deleted 1 snapshot" in result.stdout
+        snapshots_after = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_after) == 0, f"Expected 0 snapshots after clean, got {len(snapshots_after)}"
