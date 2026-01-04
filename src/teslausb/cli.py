@@ -632,16 +632,19 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  Total: {space_data['total_gb']} GiB")
             print(f"  Free: {space_data['free_gb']} GiB")
             print(f"  Cam size: {space_data['cam_size_gb']} GiB")
-            cam_size_gb = space_data.get("cam_size_gb")
             if space_data["can_snapshot"]:
                 can_snapshot_str = "Yes"
-            elif not cam_size_gb:
+            elif cam_size == 0:
                 can_snapshot_str = "Not initialized (run 'teslausb init' first)"
             else:
-                can_snapshot_str = "NO (need cam_size free)"
+                cam_size_gb = space_data.get("cam_size_gb", 0)
+                can_snapshot_str = f"NO (need {cam_size_gb} GiB free)"
             print(f"  Can snapshot: {can_snapshot_str}")
         else:
-            print("  (not available)")
+            if cam_size == 0:
+                print("  Not initialized (run 'teslausb init' first)")
+            else:
+                print("  (not available)")
         print()
 
         # Snapshots
