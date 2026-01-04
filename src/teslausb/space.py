@@ -125,7 +125,7 @@ class SpaceManager:
         self.snapshot_manager = snapshot_manager
         self.backingfiles_path = backingfiles_path
         self.cam_size = cam_size
-        
+
         if cam_size <= 0:
             logger.warning("SpaceManager created with cam_size=%d (system may not be initialized)", cam_size)
 
