@@ -634,7 +634,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             cam_size_gb = space_data.get("cam_size_gb")
             if space_data["can_snapshot"]:
                 can_snapshot_str = "Yes"
-            elif not cam_size_gb:
+            elif cam_size_gb is None:
                 can_snapshot_str = "Not initialized (run 'teslausb init' first)"
             else:
                 can_snapshot_str = "NO (need cam_size free)"
