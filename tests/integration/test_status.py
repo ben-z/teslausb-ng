@@ -189,7 +189,7 @@ class TestCleanCommand:
         # Verify space is sufficient (status should not indicate low space)
         status_result = cli_runner("status", "--json")
         status_data = json.loads(status_result.stdout)
-        assert not status_data["space"]["is_low"], "Space should be sufficient"
+        assert status_data["space"]["can_snapshot"], "Space should be sufficient"
 
         # Run clean --all (should still delete despite sufficient space)
         result = cli_runner("clean", "--all")
