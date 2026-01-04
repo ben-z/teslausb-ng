@@ -60,7 +60,7 @@ The device will automatically connect to whichever saved network is available.
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install -y python3-pip rclone xfsprogs parted dosfstools
+sudo apt install -y python3-pip rclone xfsprogs parted dosfstools kpartx
 
 # Install teslausb-ng
 pip install git+https://github.com/ben-z/teslausb-ng.git
@@ -85,7 +85,7 @@ For headless setup, rclone provides a URL to authorize on another device.
 Create `/etc/teslausb.conf`:
 
 ```bash
-CAM_SIZE=40G
+RESERVE=10G
 ARCHIVE_SYSTEM=rclone
 RCLONE_DRIVE=gdrive
 RCLONE_PATH=/TeslaCam
@@ -95,7 +95,7 @@ Or export environment variables directly.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CAM_SIZE` | Camera disk size | `40G` |
+| `RESERVE` | Space to leave free for OS | `10G` |
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
 | `RCLONE_PATH` | Path within remote | |
@@ -103,6 +103,20 @@ Or export environment variables directly.
 | `ARCHIVE_SENTRYCLIPS` | Archive SentryClips | `true` |
 | `ARCHIVE_RECENTCLIPS` | Archive RecentClips (rolling buffer) | `false` |
 | `ARCHIVE_TRACKMODECLIPS` | Archive TrackMode clips | `true` |
+
+### Space Management
+
+The cam disk size is **automatically calculated** from available disk space:
+
+```
+available_disk - RESERVE = backingfiles size
+backingfiles - 2 GiB (XFS overhead) = usable space
+usable space / 2 = cam_size
+```
+
+For example, on a 128 GiB SD card with `RESERVE=10G`:
+- backingfiles.img = 118 GiB
+- cam_size = 58 GiB (half for cam disk, half for snapshots)
 
 ---
 
@@ -246,7 +260,7 @@ sudo journalctl -u teslausb -f
    teslausb clean            # Actually delete
    ```
 
-3. If space is consistently low, reduce `CAM_SIZE` in your config to leave more room for snapshots.
+3. If space is consistently low, increase `RESERVE` in your config to leave more room for the OS and reduce the cam disk size.
 
 ### Service won't start
 
