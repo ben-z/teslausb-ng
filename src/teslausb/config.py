@@ -22,10 +22,6 @@ class ConfigError(Exception):
     """Configuration error."""
 
 
-# Minimum 1 GiB - smaller sizes are not useful for TeslaCam footage
-MIN_CAM_SIZE = 1 * GB
-
-
 def parse_size(size_str: str) -> int:
     """Parse a size string like '40G' or '500M' to bytes.
 
@@ -98,12 +94,6 @@ class Config:
     backingfiles_path: Path = Path("/backingfiles")
     mutable_path: Path = Path("/mutable")
 
-    # Sizes
-    cam_size: int = 40 * GB
-
-    # Space management
-    reserve: int = 10 * GB
-
     # Archive
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
 
@@ -124,15 +114,6 @@ class Config:
         """
         warnings: list[str] = []
 
-        if self.cam_size <= 0:
-            warnings.append("CAM_SIZE must be positive")
-
-        if self.cam_size < 10 * GB:
-            warnings.append(f"CAM_SIZE ({self.cam_size / GB:.1f}GB) is very small")
-
-        if self.reserve < 0:
-            warnings.append("reserve must be non-negative")
-
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
 
@@ -143,7 +124,6 @@ def load_from_env() -> Config:
     """Load configuration from environment variables.
 
     Reads environment variables:
-    - CAM_SIZE
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
@@ -159,12 +139,6 @@ def load_from_env() -> Config:
         config.mutable_path = Path(path)
     if path := os.environ.get("BACKINGFILES_PATH"):
         config.backingfiles_path = Path(path)
-
-    if size := os.environ.get("CAM_SIZE"):
-        try:
-            config.cam_size = parse_size(size)
-        except ConfigError as e:
-            raise ConfigError(f"Invalid CAM_SIZE: {e}") from e
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()

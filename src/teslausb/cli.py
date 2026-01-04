@@ -26,14 +26,14 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
-from .config import Config, ConfigError, GB, MIN_CAM_SIZE, load_from_env, load_from_file
+from .config import Config, ConfigError, GB, load_from_env, load_from_file, parse_size
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
-from .space import GB, SpaceManager
+from .space import DEFAULT_RESERVE, MIN_CAM_SIZE, SpaceManager, calculate_cam_size
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,17 @@ def load_config(args: argparse.Namespace) -> Config:
         return load_from_env()
 
 
+def get_cam_size(config: Config) -> int:
+    """Get cam_size from the actual cam_disk.bin file.
+
+    Returns:
+        Size of cam_disk.bin in bytes, or 0 if not found
+    """
+    if config.cam_disk_path.exists():
+        return config.cam_disk_path.stat().st_size
+    return 0
+
+
 def create_components(config: Config) -> tuple[
     RealFilesystem, SnapshotManager, SpaceManager, ArchiveManager, MockArchiveBackend | RcloneBackend
 ]:
@@ -106,12 +117,12 @@ def create_components(config: Config) -> tuple[
         snapshots_path=config.snapshots_path,
     )
 
+    cam_size = get_cam_size(config)
     space_manager = SpaceManager(
         fs=fs,
         snapshot_manager=snapshot_manager,
         backingfiles_path=config.backingfiles_path,
-        cam_size=config.cam_size,
-        reserve=config.reserve,
+        cam_size=cam_size,
     )
 
     # Create backend based on archive system
@@ -312,18 +323,72 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"Run 'teslausb deinit' to remove it first")
         return 1
 
-    if config.cam_size < MIN_CAM_SIZE:
-        print(f"Error: CAM_SIZE is too small ({config.cam_size} bytes)")
-        print(f"Minimum is {MIN_CAM_SIZE // GB} GiB")
+    # Get available disk space
+    config.mutable_path.mkdir(parents=True, exist_ok=True)
+    stat = os.statvfs(config.mutable_path)
+    available_space = stat.f_bavail * stat.f_frsize
+
+    # Get reserve size from CLI arg or prompt interactively
+    if args.reserve:
+        try:
+            reserve = parse_size(args.reserve)
+        except ConfigError as e:
+            print(f"Error: Invalid --reserve value: {e}")
+            return 1
+    else:
+        # Interactive prompt - require TTY
+        if not sys.stdin.isatty():
+            print("Error: --reserve is required when running non-interactively")
+            print("Example: teslausb init --reserve 10G")
+            return 1
+
+        print(f"Available disk space: {available_space / GB:.1f} GiB")
+        print()
+        print("How much space should be reserved for the OS?")
+        print("(This space will NOT be used by TeslaUSB)")
+        print()
+        default_str = f"{DEFAULT_RESERVE // GB}G"
+        try:
+            response = input(f"Reserve size [{default_str}]: ").strip()
+            if not response:
+                reserve = DEFAULT_RESERVE
+            else:
+                reserve = parse_size(response)
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted")
+            return 1
+        except ConfigError as e:
+            print(f"Error: Invalid size: {e}")
+            return 1
+        print()
+
+    # Calculate sizes
+    # backingfiles uses all space except reserve (for OS use)
+    # cam_size is half of usable space (other half for snapshots)
+    backingfiles_size = available_space - reserve
+
+    if backingfiles_size <= 0:
+        print("Error: Reserve size leaves no space for TeslaUSB backing files")
+        print(f"  Available: {available_space / GB:.1f} GiB")
+        print(f"  Reserve: {reserve / GB:.1f} GiB")
+        print("  Reduce the reserve size or free disk space and try again.")
+        return 1
+    cam_size = calculate_cam_size(backingfiles_size)
+
+    if cam_size < MIN_CAM_SIZE:
+        print(f"Error: Not enough disk space")
+        print(f"  Available: {available_space / GB:.1f} GiB")
+        print(f"  Reserve: {reserve / GB:.1f} GiB")
+        print(f"  Would create cam disk: {cam_size / GB:.1f} GiB")
+        print(f"  Minimum cam disk size: {MIN_CAM_SIZE / GB:.1f} GiB")
         return 1
 
     print(f"Initializing TeslaUSB...")
-    print(f"  Cam disk size: {config.cam_size / GB:.1f} GiB")
+    print(f"  Available space: {available_space / GB:.1f} GiB")
+    print(f"  Reserve for OS: {reserve / GB:.1f} GiB")
+    print(f"  Backingfiles size: {backingfiles_size / GB:.1f} GiB")
+    print(f"  Cam disk size: {cam_size / GB:.1f} GiB")
 
-    # Create XFS backingfiles image
-    # size: cam_disk + one full snapshot + reserve
-    backingfiles_size = config.cam_size * 2 + config.reserve
-    config.mutable_path.mkdir(parents=True, exist_ok=True)
     if not _create_backingfiles_image(backingfiles_img, backingfiles_size):
         return 1
 
@@ -341,7 +406,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Create snapshots directory and cam disk
     config.snapshots_path.mkdir(parents=True, exist_ok=True)
 
-    if not _create_cam_disk(config.cam_disk_path, config.cam_size):
+    if not _create_cam_disk(config.cam_disk_path, cam_size):
         return 1
 
     print(f"\nInitialization complete!")
@@ -489,30 +554,23 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     # Get space info if mounted
     space_data = None
+    cam_size = get_cam_size(config)
     if backingfiles_mounted:
         try:
             space_manager = SpaceManager(
                 fs=fs,
                 snapshot_manager=snapshot_manager,
                 backingfiles_path=config.backingfiles_path,
-                cam_size=config.cam_size,
-                reserve=config.reserve,
+                cam_size=cam_size,
             )
             space_info = space_manager.get_space_info()
             space_data = {
                 "total_gb": round(space_info.total_gb, 2),
                 "free_gb": round(space_info.free_gb, 2),
                 "used_gb": round(space_info.used_gb, 2),
-                "reserve_gb": round(space_info.reserve_gb, 2),
-                "snapshot_budget_gb": round(space_info.snapshot_budget_gb, 2),
-                "is_low": space_info.is_low,
+                "cam_size_gb": round(space_info.cam_size_gb, 2),
+                "can_snapshot": space_info.can_snapshot,
             }
-
-            # Add space validation warnings
-            space_warnings = space_manager.validate_configuration(
-                total_space=int(space_info.total_gb * GB),
-            )
-            warnings.extend(space_warnings)
         except Exception as e:
             warnings.append(f"Could not get space info: {e}")
     else:
@@ -553,7 +611,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "reachable": archive_reachable,
         },
         "config": {
-            "cam_size_gb": round(config.cam_size / GB, 2),
+            "cam_size_gb": round(cam_size / GB, 2) if cam_size else None,
         },
     }
 
@@ -572,9 +630,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         if space_data:
             print(f"  Total: {space_data['total_gb']} GiB")
             print(f"  Free: {space_data['free_gb']} GiB")
-            print(f"  Reserve: {space_data['reserve_gb']} GiB")
-            print(f"  Snapshot budget: {space_data['snapshot_budget_gb']} GiB")
-            print(f"  Low space: {'YES' if space_data['is_low'] else 'No'}")
+            print(f"  Cam size: {space_data['cam_size_gb']} GiB")
+            cam_size_gb = space_data.get("cam_size_gb")
+            if space_data["can_snapshot"]:
+                can_snapshot_str = "Yes"
+            elif cam_size_gb is None:
+                can_snapshot_str = "Not initialized (run 'teslausb init' first)"
+            else:
+                can_snapshot_str = "NO (need cam_size free)"
+            print(f"  Can snapshot: {can_snapshot_str}")
         else:
             print("  (not available)")
         print()
@@ -891,7 +955,11 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # init command
-    subparsers.add_parser("init", help="Initialize disk images and directory structure")
+    init_parser = subparsers.add_parser("init", help="Initialize disk images and directory structure")
+    init_parser.add_argument(
+        "--reserve", type=str, default=None,
+        help="Space to reserve for OS (e.g., 10G). If not specified, prompts interactively."
+    )
 
     # deinit command
     deinit_parser = subparsers.add_parser("deinit", help="Remove disk images and clean up")

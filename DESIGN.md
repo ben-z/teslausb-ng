@@ -104,9 +104,22 @@ Archives continuously while WiFi is available. Idle detection gates each cycle.
 
 ## Space Management
 
+**Simple model**: User sets `RESERVE` (space for OS), everything else is automatic.
+
 ```
-backingfiles.img size = CAM_SIZE * 2 + reserve
-    ├── cam_disk.bin (CAM_SIZE)
-    ├── snapshots/ (up to CAM_SIZE worth)
-    └── reserve (10 GiB default)
+available_disk - RESERVE = backingfiles.img size
+backingfiles.img - XFS_OVERHEAD (2 GiB) = usable space
+usable space / 2 = cam_size (half for cam_disk, half for snapshot)
 ```
+
+Example with 128 GiB SD card:
+- RESERVE = 10 GiB (for OS)
+- backingfiles.img = 118 GiB
+- usable = 116 GiB
+- cam_size = 58 GiB
+
+**Key invariant**: Always maintain `cam_size` free space so the next snapshot is guaranteed to succeed.
+
+- Snapshots use XFS reflinks (copy-on-write), so they start small
+- Worst case: snapshot grows to full `cam_size` if all blocks change during archiving
+- Cleanup deletes oldest snapshots until `free_space >= cam_size`

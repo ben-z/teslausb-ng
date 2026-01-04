@@ -60,7 +60,7 @@ The device will automatically connect to whichever saved network is available.
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install -y python3-pip rclone xfsprogs parted dosfstools
+sudo apt install -y python3-pip rclone xfsprogs parted dosfstools kpartx
 
 # Install teslausb-ng
 pip install git+https://github.com/ben-z/teslausb-ng.git
@@ -85,7 +85,6 @@ For headless setup, rclone provides a URL to authorize on another device.
 Create `/etc/teslausb.conf`:
 
 ```bash
-CAM_SIZE=40G
 ARCHIVE_SYSTEM=rclone
 RCLONE_DRIVE=gdrive
 RCLONE_PATH=/TeslaCam
@@ -95,7 +94,6 @@ Or export environment variables directly.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CAM_SIZE` | Camera disk size | `40G` |
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
 | `RCLONE_PATH` | Path within remote | |
@@ -115,6 +113,25 @@ First, create the disk images and directory structure:
 ```bash
 sudo teslausb init
 ```
+
+You'll be prompted to specify how much space to reserve for the OS (default: 10 GiB).
+Alternatively, use the `--reserve` flag:
+
+```bash
+sudo teslausb init --reserve 10G
+```
+
+The cam disk size is **automatically calculated** from available disk space:
+
+```
+available_disk - reserve = backingfiles size
+backingfiles - 2 GiB (XFS overhead) = usable space
+usable space / 2 = cam_size
+```
+
+For example, on a 128 GiB SD card with 10 GiB reserved:
+- backingfiles.img = 118 GiB
+- cam_size = 58 GiB (half for cam disk, half for snapshots)
 
 This creates:
 - `/mutable/backingfiles.img` - XFS disk image (for reflink snapshots)
@@ -151,7 +168,7 @@ sudo teslausb run
 
 | Command | Description |
 |---------|-------------|
-| `teslausb init` | Initialize disk images and directories |
+| `teslausb init [--reserve SIZE]` | Initialize disk images and directories |
 | `teslausb deinit` | Remove disk images and clean up |
 | `teslausb run` | Main loop: wait for WiFi, snapshot, archive, repeat |
 | `teslausb archive` | Single archive cycle |
@@ -246,7 +263,11 @@ sudo journalctl -u teslausb -f
    teslausb clean            # Actually delete
    ```
 
-3. If space is consistently low, reduce `CAM_SIZE` in your config to leave more room for snapshots.
+3. If space is consistently low, reinitialize with a larger reserve to leave more room for the OS (this reduces the cam disk size):
+   ```bash
+   sudo teslausb deinit
+   sudo teslausb init --reserve 20G
+   ```
 
 ### Service won't start
 
