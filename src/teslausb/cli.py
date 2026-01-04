@@ -33,7 +33,7 @@ from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
-from .space import SpaceManager, MIN_CAM_SIZE, calculate_cam_size
+from .space import SpaceManager, MIN_CAM_SIZE, DEFAULT_RESERVE, calculate_cam_size
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
 logger = logging.getLogger(__name__)
@@ -328,30 +328,66 @@ def cmd_init(args: argparse.Namespace) -> int:
     stat = os.statvfs(config.mutable_path)
     available_space = stat.f_bavail * stat.f_frsize
 
+    # Get reserve size from CLI arg or prompt interactively
+    if args.reserve:
+        try:
+            from .config import parse_size
+            reserve = parse_size(args.reserve)
+        except ConfigError as e:
+            print(f"Error: Invalid --reserve value: {e}")
+            return 1
+    else:
+        # Interactive prompt - require TTY
+        if not sys.stdin.isatty():
+            print("Error: --reserve is required when running non-interactively")
+            print("Example: teslausb init --reserve 10G")
+            return 1
+
+        print(f"Available disk space: {available_space / GB:.1f} GiB")
+        print()
+        print("How much space should be reserved for the OS?")
+        print("(This space will NOT be used by TeslaUSB)")
+        print()
+        default_str = f"{DEFAULT_RESERVE // GB}G"
+        try:
+            response = input(f"Reserve size [{default_str}]: ").strip()
+            if not response:
+                reserve = DEFAULT_RESERVE
+            else:
+                from .config import parse_size
+                reserve = parse_size(response)
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted")
+            return 1
+        except ConfigError as e:
+            print(f"Error: Invalid size: {e}")
+            return 1
+        print()
+
     # Calculate sizes
-    # backingfiles uses all space except RESERVE (for OS use)
+    # backingfiles uses all space except reserve (for OS use)
     # cam_size is half of usable space (other half for snapshots)
-    backingfiles_size = available_space - config.reserve
+    backingfiles_size = available_space - reserve
 
     if backingfiles_size <= 0:
         print("Error: Reserve size leaves no space for TeslaUSB backing files")
         print(f"  Available: {available_space / GB:.1f} GiB")
-        print(f"  Reserve: {config.reserve / GB:.1f} GiB")
-        print("  Reduce the configured reserve or free disk space and try again.")
+        print(f"  Reserve: {reserve / GB:.1f} GiB")
+        print("  Reduce the reserve size or free disk space and try again.")
         return 1
     cam_size = calculate_cam_size(backingfiles_size)
 
     if cam_size < MIN_CAM_SIZE:
         print(f"Error: Not enough disk space")
         print(f"  Available: {available_space / GB:.1f} GiB")
-        print(f"  Reserve: {config.reserve / GB:.1f} GiB")
+        print(f"  Reserve: {reserve / GB:.1f} GiB")
         print(f"  Would create cam disk: {cam_size / GB:.1f} GiB")
         print(f"  Minimum cam disk size: {MIN_CAM_SIZE / GB:.1f} GiB")
         return 1
 
     print(f"Initializing TeslaUSB...")
     print(f"  Available space: {available_space / GB:.1f} GiB")
-    print(f"  Reserve for OS: {config.reserve / GB:.1f} GiB")
+    print(f"  Reserve for OS: {reserve / GB:.1f} GiB")
     print(f"  Backingfiles size: {backingfiles_size / GB:.1f} GiB")
     print(f"  Cam disk size: {cam_size / GB:.1f} GiB")
 
@@ -577,7 +613,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             "reachable": archive_reachable,
         },
         "config": {
-            "reserve_gb": round(config.reserve / GB, 2),
             "cam_size_gb": round(cam_size / GB, 2) if cam_size else None,
         },
     }
@@ -922,7 +957,11 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # init command
-    subparsers.add_parser("init", help="Initialize disk images and directory structure")
+    init_parser = subparsers.add_parser("init", help="Initialize disk images and directory structure")
+    init_parser.add_argument(
+        "--reserve", type=str, default=None,
+        help="Space to reserve for OS (e.g., 10G). If not specified, prompts interactively."
+    )
 
     # deinit command
     deinit_parser = subparsers.add_parser("deinit", help="Remove disk images and clean up")

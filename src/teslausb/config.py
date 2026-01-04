@@ -88,21 +88,11 @@ class ArchiveConfig:
 
 @dataclass
 class Config:
-    """Main configuration for TeslaUSB.
-
-    Space model:
-    - RESERVE: Space to leave free on root filesystem (for OS, logs, etc.)
-    - backingfiles.img uses remaining space: total_disk - RESERVE
-    - cam_size is auto-calculated: (backingfiles - XFS_OVERHEAD) / 2
-    """
+    """Main configuration for TeslaUSB."""
 
     # Paths
     backingfiles_path: Path = Path("/backingfiles")
     mutable_path: Path = Path("/mutable")
-
-    # Space management
-    # RESERVE: space to leave free on root filesystem for OS use
-    reserve: int = 10 * GB
 
     # Archive
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
@@ -124,9 +114,6 @@ class Config:
         """
         warnings: list[str] = []
 
-        if self.reserve < 0:
-            warnings.append("RESERVE must be non-negative")
-
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
 
@@ -137,7 +124,6 @@ def load_from_env() -> Config:
     """Load configuration from environment variables.
 
     Reads environment variables:
-    - RESERVE: Space to leave free on root filesystem (default 10G)
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
@@ -153,12 +139,6 @@ def load_from_env() -> Config:
         config.mutable_path = Path(path)
     if path := os.environ.get("BACKINGFILES_PATH"):
         config.backingfiles_path = Path(path)
-
-    if size := os.environ.get("RESERVE"):
-        try:
-            config.reserve = parse_size(size)
-        except ConfigError as e:
-            raise ConfigError(f"Invalid RESERVE: {e}") from e
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()

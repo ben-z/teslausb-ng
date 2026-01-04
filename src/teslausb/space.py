@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 XFS_OVERHEAD = 2 * GB  # Reserved for XFS metadata
 MIN_CAM_SIZE = 1 * GB  # Minimum useful cam disk size
+DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 
 
 def calculate_cam_size(backingfiles_size: int) -> int:
