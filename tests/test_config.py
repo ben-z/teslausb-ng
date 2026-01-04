@@ -84,7 +84,8 @@ class TestConfig:
         """Test default configuration values."""
         config = Config()
 
-        assert config.reserve == 10 * GB
+        assert config.backingfiles_path == Path("/backingfiles")
+        assert config.mutable_path == Path("/mutable")
 
     def test_derived_paths(self):
         """Test derived path properties."""
@@ -99,13 +100,6 @@ class TestConfig:
 
         warnings = config.validate()
         assert len(warnings) == 0
-
-    def test_validate_negative_reserve(self):
-        """Test validation catches negative reserve."""
-        config = Config(reserve=-1)
-
-        warnings = config.validate()
-        assert any("RESERVE" in w for w in warnings)
 
     def test_validate_invalid_archive_system(self):
         """Test validation catches invalid archive system."""
@@ -136,34 +130,18 @@ class TestLoadFromEnv:
         """Test loading with no environment variables set."""
         # Clear relevant env vars
         env_vars = [
-            "RESERVE", "ARCHIVE_SYSTEM", "ARCHIVE_RECENTCLIPS",
+            "ARCHIVE_SYSTEM", "ARCHIVE_RECENTCLIPS",
         ]
         old_values = {k: os.environ.pop(k, None) for k in env_vars}
 
         try:
             config = load_from_env()
 
-            assert config.reserve == 10 * GB
             assert config.archive.system == "none"
         finally:
             for k, v in old_values.items():
                 if v is not None:
                     os.environ[k] = v
-
-    def test_load_reserve(self):
-        """Test loading RESERVE from env."""
-        old_value = os.environ.get("RESERVE")
-
-        try:
-            os.environ["RESERVE"] = "20G"
-            config = load_from_env()
-
-            assert config.reserve == 20 * GB
-        finally:
-            if old_value is not None:
-                os.environ["RESERVE"] = old_value
-            else:
-                os.environ.pop("RESERVE", None)
 
     def test_load_archive_system(self):
         """Test loading ARCHIVE_SYSTEM from env."""
@@ -180,21 +158,6 @@ class TestLoadFromEnv:
             else:
                 os.environ.pop("ARCHIVE_SYSTEM", None)
 
-    def test_load_invalid_size_raises(self):
-        """Test that invalid size raises ConfigError."""
-        old_value = os.environ.get("RESERVE")
-
-        try:
-            os.environ["RESERVE"] = "invalid"
-
-            with pytest.raises(ConfigError):
-                load_from_env()
-        finally:
-            if old_value is not None:
-                os.environ["RESERVE"] = old_value
-            else:
-                os.environ.pop("RESERVE", None)
-
 
 class TestLoadFromFile:
     """Tests for load_from_file function."""
@@ -202,7 +165,6 @@ class TestLoadFromFile:
     def test_load_simple_config(self):
         """Test loading a simple config file."""
         config_content = """
-RESERVE=10G
 ARCHIVE_SYSTEM=rclone
 RCLONE_DRIVE=gdrive
 RCLONE_PATH=/TeslaCam
@@ -214,7 +176,6 @@ RCLONE_PATH=/TeslaCam
         try:
             config = load_from_file(config_path)
 
-            assert config.reserve == 10 * GB
             assert config.archive.system == "rclone"
             assert config.archive.rclone_drive == "gdrive"
             assert config.archive.rclone_path == "/TeslaCam"
@@ -224,7 +185,6 @@ RCLONE_PATH=/TeslaCam
     def test_load_config_with_exports(self):
         """Test loading config with export statements."""
         config_content = """
-export RESERVE=20G
 export ARCHIVE_SYSTEM=rclone
 export RCLONE_DRIVE=s3
 """
@@ -235,7 +195,6 @@ export RCLONE_DRIVE=s3
         try:
             config = load_from_file(config_path)
 
-            assert config.reserve == 20 * GB
             assert config.archive.system == "rclone"
             assert config.archive.rclone_drive == "s3"
         finally:
@@ -245,9 +204,8 @@ export RCLONE_DRIVE=s3
         """Test loading config with comments."""
         config_content = """
 # This is a comment
-RESERVE=10G
-# Another comment
 ARCHIVE_SYSTEM=none
+# Another comment
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
             f.write(config_content)
@@ -256,7 +214,6 @@ ARCHIVE_SYSTEM=none
         try:
             config = load_from_file(config_path)
 
-            assert config.reserve == 10 * GB
             assert config.archive.system == "none"
         finally:
             config_path.unlink()
@@ -264,7 +221,6 @@ ARCHIVE_SYSTEM=none
     def test_load_config_with_quotes(self):
         """Test loading config with quoted values."""
         config_content = """
-RESERVE="10G"
 RCLONE_DRIVE='gdrive'
 RCLONE_PATH="/My Drive/TeslaCam"
 """
@@ -275,7 +231,6 @@ RCLONE_PATH="/My Drive/TeslaCam"
         try:
             config = load_from_file(config_path)
 
-            assert config.reserve == 10 * GB
             assert config.archive.rclone_drive == "gdrive"
             assert config.archive.rclone_path == "/My Drive/TeslaCam"
         finally:

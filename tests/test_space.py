@@ -12,6 +12,7 @@ from teslausb.space import (
     GB,
     XFS_OVERHEAD,
     MIN_CAM_SIZE,
+    DEFAULT_RESERVE,
     calculate_cam_size,
 )
 
@@ -46,6 +47,10 @@ class TestCalculateCamSize:
     def test_min_cam_size_constant(self):
         """Test MIN_CAM_SIZE is 1GB."""
         assert MIN_CAM_SIZE == 1 * GB
+
+    def test_default_reserve_constant(self):
+        """Test DEFAULT_RESERVE is 10GB."""
+        assert DEFAULT_RESERVE == 10 * GB
 
 
 class TestSpaceInfo:

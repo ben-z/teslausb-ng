@@ -19,7 +19,7 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should create the backingfiles.img XFS image."""
-        result = cli_runner("init")
+        result = cli_runner("init", "--reserve", "10G")
 
         assert test_env.backingfiles_img.exists()
         assert "Initialization complete" in result.stdout
@@ -28,7 +28,7 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should mount backingfiles.img."""
-        cli_runner("init")
+        cli_runner("init", "--reserve", "10G")
 
         # Check mount point is active
         result = subprocess.run(
@@ -40,7 +40,7 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should create XFS filesystem (required for reflinks)."""
-        cli_runner("init")
+        cli_runner("init", "--reserve", "10G")
 
         # Check filesystem type
         result = subprocess.run(
@@ -54,7 +54,7 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should create cam_disk.bin with FAT32 partition."""
-        cli_runner("init")
+        cli_runner("init", "--reserve", "10G")
 
         assert test_env.cam_disk_path.exists()
 
@@ -70,7 +70,7 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should create snapshots directory."""
-        cli_runner("init")
+        cli_runner("init", "--reserve", "10G")
 
         assert test_env.snapshots_path.exists()
         assert test_env.snapshots_path.is_dir()
@@ -79,10 +79,10 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should fail if backingfiles.img already exists."""
-        cli_runner("init")
+        cli_runner("init", "--reserve", "10G")
 
         # Second init should fail
-        result = cli_runner("init", check=False)
+        result = cli_runner("init", "--reserve", "10G", check=False)
         assert result.returncode != 0
         assert "already exists" in result.stdout
 
@@ -90,11 +90,20 @@ class TestInitCommand:
         self, test_env: IntegrationTestEnv, cli_runner
     ):
         """Init should show helpful next steps."""
-        result = cli_runner("init")
+        result = cli_runner("init", "--reserve", "10G")
 
         assert "Next steps" in result.stdout
         assert "gadget on" in result.stdout
         assert "run" in result.stdout
+
+    def test_init_requires_reserve_non_interactive(
+        self, test_env: IntegrationTestEnv, cli_runner
+    ):
+        """Init should fail without --reserve when running non-interactively."""
+        result = cli_runner("init", check=False)
+
+        assert result.returncode != 0
+        assert "--reserve is required" in result.stdout
 
 
 class TestXfsReflinks:

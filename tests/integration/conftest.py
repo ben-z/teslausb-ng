@@ -171,9 +171,7 @@ def test_env(tmp_path: Path) -> Generator[IntegrationTestEnv, None, None]:
     backingfiles_path.mkdir()
 
     # Create config file with test settings
-    # Use 1G to meet minimum CAM_SIZE requirement
     config_content = f"""
-CAM_SIZE=1G
 MUTABLE_PATH={mutable_path}
 BACKINGFILES_PATH={backingfiles_path}
 ARCHIVE_SYSTEM=rclone
@@ -238,7 +236,7 @@ def cli_runner(test_env: IntegrationTestEnv):
 @pytest.fixture
 def initialized_env(test_env: IntegrationTestEnv, cli_runner) -> IntegrationTestEnv:
     """Test environment with init already run."""
-    cli_runner("init")
+    cli_runner("init", "--reserve", "10G")
     return test_env
 
 
