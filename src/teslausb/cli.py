@@ -97,7 +97,7 @@ def get_cam_size(config: Config) -> int:
     """Get cam_size from the actual cam_disk.bin file.
 
     Returns:
-        Size of cam_disk.bin in bytes, or 0 if not found
+        Size of cam_disk.bin in bytes, or 0 if not found or empty
     """
     if config.cam_disk_path.exists():
         return config.cam_disk_path.stat().st_size
@@ -122,10 +122,16 @@ def create_components(config: Config) -> tuple[
 
     cam_size = get_cam_size(config)
     if cam_size == 0:
-        raise RuntimeError(
-            f"cam_disk.bin not found at {config.cam_disk_path}. "
-            "Run 'teslausb init' to set up the system first."
-        )
+        if not config.cam_disk_path.exists():
+            raise RuntimeError(
+                f"cam_disk.bin not found at {config.cam_disk_path}. "
+                "Run 'teslausb init' to set up the system first."
+            )
+        else:
+            raise RuntimeError(
+                f"cam_disk.bin at {config.cam_disk_path} is empty or has zero size. "
+                "Run 'teslausb init' to set up the system first."
+            )
 
     space_manager = SpaceManager(
         fs=fs,
@@ -533,7 +539,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     cam_size = get_cam_size(config)
     if backingfiles_mounted:
         if cam_size == 0:
-            warnings.append("cam_disk.bin not found (run 'teslausb init' to set up)")
+            if not config.cam_disk_path.exists():
+                warnings.append("cam_disk.bin not found (run 'teslausb init' to set up)")
+            else:
+                warnings.append("cam_disk.bin is empty or has zero size (run 'teslausb init' to set up)")
         else:
             try:
                 space_manager = SpaceManager(
