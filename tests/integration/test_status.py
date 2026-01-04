@@ -104,7 +104,7 @@ class TestCleanCommand:
         """Clean --dry-run should work with no snapshots."""
         result = cli_runner("clean", "--dry-run")
 
-        assert "Would delete 0 snapshots" in result.stdout
+        assert "No deletable snapshots" in result.stdout
 
     def test_clean_no_snapshots(
         self, initialized_env: IntegrationTestEnv, cli_runner
