@@ -108,7 +108,7 @@ def create_components(config: Config) -> tuple[
     RealFilesystem, SnapshotManager, SpaceManager, ArchiveManager, MockArchiveBackend | RcloneBackend
 ]:
     """Create all components from configuration.
-    
+
     Raises:
         RuntimeError: If cam_disk.bin doesn't exist (not initialized)
     """
@@ -126,7 +126,7 @@ def create_components(config: Config) -> tuple[
             f"cam_disk.bin not found at {config.cam_disk_path}. "
             "Run 'teslausb init' to set up the system first."
         )
-    
+
     space_manager = SpaceManager(
         fs=fs,
         snapshot_manager=snapshot_manager,

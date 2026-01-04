@@ -83,7 +83,7 @@ class SpaceInfo:
 
         A snapshot can grow up to cam_size in the worst case (if all blocks
         change while archiving). We need at least cam_size free to be safe.
-        
+
         Returns False if cam_size is 0 (not initialized).
         """
         if self.cam_size_bytes == 0:
