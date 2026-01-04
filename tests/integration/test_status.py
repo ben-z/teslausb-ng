@@ -119,7 +119,7 @@ class TestCleanCommand:
     ):
         """Clean --all should delete all deletable snapshots."""
         import subprocess
-        from .conftest import create_test_footage, mount_cam_disk, unmount_cam_disk
+        from .conftest import create_test_footage, mount_cam_disk
 
         # Create multiple snapshots
         for i, event_name in enumerate(["event1", "event2", "event3"]):
@@ -150,7 +150,7 @@ class TestCleanCommand:
     ):
         """Clean --all --dry-run should show what would be deleted."""
         import subprocess
-        from .conftest import create_test_footage, mount_cam_disk, unmount_cam_disk
+        from .conftest import create_test_footage, mount_cam_disk
 
         # Create multiple snapshots
         for i, event_name in enumerate(["event1", "event2"]):
