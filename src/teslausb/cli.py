@@ -7,7 +7,8 @@ Usage:
     teslausb archive       # Run a single archive cycle
     teslausb status        # Show status (space, snapshots, config)
     teslausb snapshots     # List snapshots
-    teslausb clean         # Clean up old snapshots
+    teslausb clean         # Clean up old snapshots (until space threshold met)
+    teslausb clean --all   # Delete all deletable snapshots
     teslausb gadget        # Manage USB mass storage gadget
     teslausb service       # Manage systemd service
 """
@@ -31,7 +32,7 @@ from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
-from .snapshot import SnapshotManager
+from .snapshot import SnapshotInUseError, SnapshotManager
 from .space import GB, SpaceManager
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
@@ -635,13 +636,52 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     fs, snapshot_manager, space_manager, _, _ = create_components(config)
 
+    deletable = snapshot_manager.get_deletable_snapshots()
+
     if args.dry_run:
-        deletable = snapshot_manager.get_deletable_snapshots()
-        print(f"Would delete {len(deletable)} snapshots:")
+        if not deletable:
+            print("No deletable snapshots")
+            return 0
+
+        n = len(deletable)
+        if args.all:
+            print(f"Would delete {n} snapshot{'s' if n != 1 else ''}:")
+        else:
+            print(f"Deletable snapshots: {n}")
+
         for snap in deletable:
             print(f"  {snap.id}: {snap.path}")
+
+        if not args.all:
+            space_info = space_manager.get_space_info()
+            if space_info.can_snapshot:
+                print("\nSpace is sufficient, no cleanup needed.")
+            else:
+                print("\nSpace is low, would delete oldest snapshots until sufficient.")
         return 0
 
+    if args.all:
+        if not deletable:
+            print("No deletable snapshots")
+            return 0
+
+        deleted = 0
+        for snap in deletable:
+            try:
+                if snapshot_manager.delete_snapshot(snap.id):
+                    deleted += 1
+                    print(f"Deleted snapshot {snap.id}")
+            except SnapshotInUseError as e:
+                # Race condition - snapshot was acquired between check and delete
+                logger.warning(f"Snapshot {snap.id} is in use, skipping: {e}")
+
+        if deleted == len(deletable):
+            print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
+        else:
+            print(f"Deleted {deleted} of {len(deletable)} snapshots (some could not be deleted)")
+        return 0
+
+    # Default: only clean up until space threshold is met
     success = space_manager.cleanup_if_needed()
 
     if success:
@@ -880,6 +920,9 @@ def main() -> int:
     clean_parser = subparsers.add_parser("clean", help="Clean up old snapshots")
     clean_parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be deleted"
+    )
+    clean_parser.add_argument(
+        "--all", action="store_true", help="Delete all deletable snapshots (ignore space threshold)"
     )
 
     # gadget command with subcommands
