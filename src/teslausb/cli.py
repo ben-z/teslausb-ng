@@ -674,7 +674,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         if deleted == len(deletable):
             print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
         else:
-            print(f"Deleted {deleted} of {len(deletable)} snapshots (some deletions failed)")
+            print(f"Deleted {deleted} of {len(deletable)} snapshots (some could not be deleted)")
         return 0
 
     # Default: only clean up until space threshold is met
