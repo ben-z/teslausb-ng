@@ -57,6 +57,12 @@ def space_manager(mock_fs: MockFilesystem, snapshot_manager: SnapshotManager) ->
 
 
 @pytest.fixture
+def cam_size() -> int:
+    """Default cam_size for tests."""
+    return 40 * GB
+
+
+@pytest.fixture
 def mock_backend() -> MockArchiveBackend:
     """Create a mock archive backend."""
     return MockArchiveBackend(reachable=True)

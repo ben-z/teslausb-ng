@@ -22,10 +22,6 @@ class ConfigError(Exception):
     """Configuration error."""
 
 
-# Minimum 1 GiB - smaller sizes are not useful for TeslaCam footage
-MIN_CAM_SIZE = 1 * GB
-
-
 def parse_size(size_str: str) -> int:
     """Parse a size string like '40G' or '500M' to bytes.
 
@@ -92,16 +88,20 @@ class ArchiveConfig:
 
 @dataclass
 class Config:
-    """Main configuration for TeslaUSB."""
+    """Main configuration for TeslaUSB.
+
+    Space model:
+    - RESERVE: Space to leave free on root filesystem (for OS, logs, etc.)
+    - backingfiles.img uses remaining space: total_disk - RESERVE
+    - cam_size is auto-calculated: (backingfiles - XFS_OVERHEAD) / 2
+    """
 
     # Paths
     backingfiles_path: Path = Path("/backingfiles")
     mutable_path: Path = Path("/mutable")
 
-    # Sizes
-    cam_size: int = 40 * GB
-
     # Space management
+    # RESERVE: space to leave free on root filesystem for OS use
     reserve: int = 10 * GB
 
     # Archive
@@ -124,14 +124,8 @@ class Config:
         """
         warnings: list[str] = []
 
-        if self.cam_size <= 0:
-            warnings.append("CAM_SIZE must be positive")
-
-        if self.cam_size < 10 * GB:
-            warnings.append(f"CAM_SIZE ({self.cam_size / GB:.1f}GB) is very small")
-
         if self.reserve < 0:
-            warnings.append("reserve must be non-negative")
+            warnings.append("RESERVE must be non-negative")
 
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
@@ -143,7 +137,7 @@ def load_from_env() -> Config:
     """Load configuration from environment variables.
 
     Reads environment variables:
-    - CAM_SIZE
+    - RESERVE: Space to leave free on root filesystem (default 10G)
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
     - RCLONE_DRIVE, RCLONE_PATH
@@ -160,11 +154,11 @@ def load_from_env() -> Config:
     if path := os.environ.get("BACKINGFILES_PATH"):
         config.backingfiles_path = Path(path)
 
-    if size := os.environ.get("CAM_SIZE"):
+    if size := os.environ.get("RESERVE"):
         try:
-            config.cam_size = parse_size(size)
+            config.reserve = parse_size(size)
         except ConfigError as e:
-            raise ConfigError(f"Invalid CAM_SIZE: {e}") from e
+            raise ConfigError(f"Invalid RESERVE: {e}") from e
 
     # Archive system
     archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()
