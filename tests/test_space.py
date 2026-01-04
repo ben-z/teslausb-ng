@@ -6,7 +6,46 @@ import pytest
 
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
-from teslausb.space import SpaceManager, SpaceInfo, GB
+from teslausb.space import (
+    SpaceManager,
+    SpaceInfo,
+    GB,
+    XFS_OVERHEAD,
+    MIN_CAM_SIZE,
+    calculate_cam_size,
+)
+
+
+class TestCalculateCamSize:
+    """Tests for calculate_cam_size function."""
+
+    def test_basic_calculation(self):
+        """Test basic cam_size calculation."""
+        # 100GB backingfiles - 2GB overhead = 98GB usable
+        # 98GB / 2 = 49GB cam_size
+        result = calculate_cam_size(100 * GB)
+        assert result == 49 * GB
+
+    def test_small_backingfiles(self):
+        """Test with small backingfiles size."""
+        # 10GB backingfiles - 2GB overhead = 8GB usable
+        # 8GB / 2 = 4GB cam_size
+        result = calculate_cam_size(10 * GB)
+        assert result == 4 * GB
+
+    def test_very_small_returns_zero(self):
+        """Test that very small backingfiles returns 0."""
+        # 1GB backingfiles - 2GB overhead = -1GB (clamped to 0)
+        result = calculate_cam_size(1 * GB)
+        assert result == 0
+
+    def test_xfs_overhead_constant(self):
+        """Test XFS_OVERHEAD is 2GB."""
+        assert XFS_OVERHEAD == 2 * GB
+
+    def test_min_cam_size_constant(self):
+        """Test MIN_CAM_SIZE is 1GB."""
+        assert MIN_CAM_SIZE == 1 * GB
 
 
 class TestSpaceInfo:
@@ -18,57 +57,65 @@ class TestSpaceInfo:
             total_bytes=100 * GB,
             free_bytes=50 * GB,
             used_bytes=50 * GB,
-            reserve_bytes=12 * GB,
-            snapshot_budget_bytes=38 * GB,
+            cam_size_bytes=40 * GB,
         )
 
         assert info.total_gb == 100.0
         assert info.free_gb == 50.0
         assert info.used_gb == 50.0
-        assert info.reserve_gb == 12.0
-        assert info.snapshot_budget_gb == 38.0
+        assert info.cam_size_gb == 40.0
 
-    def test_space_info_is_low(self):
-        """Test is_low property."""
-        # Not low: free > reserve
-        info1 = SpaceInfo(
+    def test_can_snapshot_when_enough_space(self):
+        """Test can_snapshot is True when free >= cam_size."""
+        info = SpaceInfo(
             total_bytes=100 * GB,
-            free_bytes=20 * GB,
-            used_bytes=80 * GB,
-            reserve_bytes=12 * GB,
-            snapshot_budget_bytes=8 * GB,
+            free_bytes=50 * GB,
+            used_bytes=50 * GB,
+            cam_size_bytes=40 * GB,
         )
-        assert not info1.is_low
+        assert info.can_snapshot  # 50 >= 40
 
-        # Low: free < reserve
-        info2 = SpaceInfo(
+    def test_can_snapshot_when_exact_space(self):
+        """Test can_snapshot is True when free == cam_size."""
+        info = SpaceInfo(
             total_bytes=100 * GB,
-            free_bytes=10 * GB,
-            used_bytes=90 * GB,
-            reserve_bytes=12 * GB,
-            snapshot_budget_bytes=0,
+            free_bytes=40 * GB,
+            used_bytes=60 * GB,
+            cam_size_bytes=40 * GB,
         )
-        assert info2.is_low
+        assert info.can_snapshot  # 40 >= 40
+
+    def test_cannot_snapshot_when_low_space(self):
+        """Test can_snapshot is False when free < cam_size."""
+        info = SpaceInfo(
+            total_bytes=100 * GB,
+            free_bytes=30 * GB,
+            used_bytes=70 * GB,
+            cam_size_bytes=40 * GB,
+        )
+        assert not info.can_snapshot  # 30 < 40
+
+    def test_str_representation(self):
+        """Test string representation includes key info."""
+        info = SpaceInfo(
+            total_bytes=100 * GB,
+            free_bytes=50 * GB,
+            used_bytes=50 * GB,
+            cam_size_bytes=40 * GB,
+        )
+        s = str(info)
+        assert "50.0" in s  # free
+        assert "100.0" in s  # total
+        assert "40.0" in s  # cam_size
+        assert "OK" in s  # status
 
 
 class TestSpaceManager:
     """Tests for SpaceManager."""
 
-    def test_reserve_calculation(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test reserve calculation."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-            reserve=10 * GB,
-        )
-
-        assert manager.reserve_bytes == 10 * GB
-
     def test_get_space_info(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
         """Test getting space info."""
-        mock_fs.set_total_space(256 * GB)
+        mock_fs.set_free_space(100 * GB)
 
         manager = SpaceManager(
             fs=mock_fs,
@@ -79,12 +126,12 @@ class TestSpaceManager:
 
         info = manager.get_space_info()
 
-        assert info.total_bytes == 256 * GB
-        assert info.reserve_bytes == manager.reserve_bytes
-        assert info.snapshot_budget_bytes == info.free_bytes - info.reserve_bytes
+        assert info.free_bytes == 100 * GB
+        assert info.cam_size_bytes == 40 * GB
+        assert info.can_snapshot  # 100 >= 40
 
-    def test_is_space_low_with_plenty_free(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test is_space_low returns False when plenty of space."""
+    def test_cleanup_not_needed_when_space_ok(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
+        """Test cleanup_if_needed returns True immediately when space is OK."""
         mock_fs.set_free_space(100 * GB)
 
         manager = SpaceManager(
@@ -94,65 +141,21 @@ class TestSpaceManager:
             cam_size=40 * GB,
         )
 
-        assert not manager.is_space_low()
-
-    def test_is_space_low_when_below_reserve(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test is_space_low returns True when below reserve."""
-        mock_fs.set_free_space(5 * GB)  # Below 10GB + 3% reserve
-
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        assert manager.is_space_low()
-
-    def test_has_snapshot_budget(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test has_snapshot_budget."""
-        mock_fs.set_free_space(50 * GB)  # Plenty of space
-
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        assert manager.has_snapshot_budget()
-        assert manager.has_snapshot_budget(required_bytes=30 * GB)
-
-    def test_has_snapshot_budget_when_tight(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test has_snapshot_budget when space is tight."""
-        # Reserve is about 11.2GB, set free to 15GB
-        # Budget would be about 3.8GB
-        mock_fs.set_free_space(15 * GB)
-
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        assert manager.has_snapshot_budget()  # Some budget
-        assert not manager.has_snapshot_budget(required_bytes=10 * GB)  # Not enough
+        assert manager.cleanup_if_needed()
 
     def test_cleanup_if_needed_deletes_snapshots(self, mock_fs: MockFilesystem):
         """Test cleanup_if_needed deletes old snapshots."""
-        # Create snapshot manager and some snapshots
         snapshot_manager = SnapshotManager(
             fs=mock_fs,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        snap1 = snapshot_manager.create_snapshot()
-        snap2 = snapshot_manager.create_snapshot()
+        snapshot_manager.create_snapshot()
+        snapshot_manager.create_snapshot()
 
-        # Set low free space
-        mock_fs.set_free_space(5 * GB)
+        # Set low free space (below cam_size)
+        mock_fs.set_free_space(30 * GB)
 
         manager = SpaceManager(
             fs=mock_fs,
@@ -161,17 +164,9 @@ class TestSpaceManager:
             cam_size=40 * GB,
         )
 
-        # Now simulate cleanup freeing space
-        # In mock, deleting snapshots doesn't actually free space,
-        # so we need to manually increase free space after deletion
-        initial_snapshots = len(snapshot_manager.get_snapshots())
-        assert initial_snapshots == 2
-
-        # Since mock doesn't free space on delete, this will keep trying
-        # until no more deletable snapshots
-        # For this test, let's verify it at least tries to delete
-        deletable_before = len(snapshot_manager.get_deletable_snapshots())
-        assert deletable_before == 2
+        # Verify snapshots exist
+        assert len(snapshot_manager.get_snapshots()) == 2
+        assert len(snapshot_manager.get_deletable_snapshots()) == 2
 
     def test_cleanup_if_needed_no_snapshots(self, mock_fs: MockFilesystem):
         """Test cleanup_if_needed when no snapshots to delete."""
@@ -181,7 +176,7 @@ class TestSpaceManager:
             snapshots_path=Path("/backingfiles/snapshots"),
         )
 
-        mock_fs.set_free_space(5 * GB)
+        mock_fs.set_free_space(30 * GB)
 
         manager = SpaceManager(
             fs=mock_fs,
@@ -192,66 +187,6 @@ class TestSpaceManager:
 
         # No snapshots to delete, should return False
         assert not manager.cleanup_if_needed()
-
-    def test_get_recommended_cam_size(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test recommended cam_size calculation."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        # 256GB total
-        # Available = 256 - 10 = 246GB
-        # Recommended = 246 / 2 = 123GB
-        recommended = manager.get_recommended_cam_size(total_space=256 * GB)
-
-        assert recommended == 123 * GB
-
-    def test_validate_configuration_good(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test configuration validation with good config."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=40 * GB,
-        )
-
-        # 256GB is plenty for 40GB cam
-        warnings = manager.validate_configuration(total_space=256 * GB)
-
-        assert len(warnings) == 0
-
-    def test_validate_configuration_cam_too_large(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test configuration validation with cam_size too large."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=100 * GB,  # Large cam size
-        )
-
-        # 128GB is too small for 100GB cam
-        warnings = manager.validate_configuration(total_space=128 * GB)
-
-        assert len(warnings) > 0
-        assert any("exceeds recommended" in w for w in warnings)
-
-    def test_validate_configuration_insufficient_space(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
-        """Test configuration validation with insufficient total space."""
-        manager = SpaceManager(
-            fs=mock_fs,
-            snapshot_manager=snapshot_manager,
-            backingfiles_path=Path("/backingfiles"),
-            cam_size=100 * GB,
-        )
-
-        # Total space less than cam + reserve
-        warnings = manager.validate_configuration(total_space=100 * GB)
-
-        assert len(warnings) > 0
-        assert any("less than minimum" in w for w in warnings)
 
     def test_ensure_space_for_snapshot(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
         """Test ensure_space_for_snapshot."""
@@ -266,3 +201,17 @@ class TestSpaceManager:
 
         # Should succeed with plenty of space
         assert manager.ensure_space_for_snapshot()
+
+    def test_ensure_space_for_snapshot_when_low(self, mock_fs: MockFilesystem, snapshot_manager: SnapshotManager):
+        """Test ensure_space_for_snapshot when space is low and no snapshots."""
+        mock_fs.set_free_space(30 * GB)
+
+        manager = SpaceManager(
+            fs=mock_fs,
+            snapshot_manager=snapshot_manager,
+            backingfiles_path=Path("/backingfiles"),
+            cam_size=40 * GB,
+        )
+
+        # Should fail - no snapshots to delete
+        assert not manager.ensure_space_for_snapshot()
