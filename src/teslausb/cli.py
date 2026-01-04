@@ -26,14 +26,14 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .archive import ArchiveManager, MockArchiveBackend, RcloneBackend
-from .config import Config, ConfigError, GB, load_from_env, load_from_file
+from .config import Config, ConfigError, GB, load_from_env, load_from_file, parse_size
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
-from .space import MIN_CAM_SIZE, DEFAULT_RESERVE, SpaceManager, calculate_cam_size
+from .space import DEFAULT_RESERVE, MIN_CAM_SIZE, SpaceManager, calculate_cam_size
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
 logger = logging.getLogger(__name__)
@@ -331,7 +331,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Get reserve size from CLI arg or prompt interactively
     if args.reserve:
         try:
-            from .config import parse_size
             reserve = parse_size(args.reserve)
         except ConfigError as e:
             print(f"Error: Invalid --reserve value: {e}")
@@ -354,7 +353,6 @@ def cmd_init(args: argparse.Namespace) -> int:
             if not response:
                 reserve = DEFAULT_RESERVE
             else:
-                from .config import parse_size
                 reserve = parse_size(response)
         except (EOFError, KeyboardInterrupt):
             print("\nAborted")
