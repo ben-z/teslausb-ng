@@ -8,27 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import IntegrationTestEnv, mount_cam_disk, unmount_cam_disk
+from .conftest import (
+    IntegrationTestEnv,
+    mount_cam_disk,
+    unmount_cam_disk,
+    create_test_footage,
+)
 
 pytestmark = pytest.mark.integration
-
-
-def _create_test_footage(cam_mount: Path, event_name: str = "2024-01-15_10-30-00") -> None:
-    """Create test TeslaCam footage structure."""
-    saved = cam_mount / "TeslaCam" / "SavedClips"
-    saved.mkdir(parents=True, exist_ok=True)
-
-    event_dir = saved / event_name
-    event_dir.mkdir(exist_ok=True)
-
-    # Create fake video files
-    for cam in ["front", "back", "left_repeater", "right_repeater"]:
-        video = event_dir / f"{event_name}-{cam}.mp4"
-        video.write_bytes(b"fake video content " * 100)
-
-    # Create event.json
-    event_json = event_dir / "event.json"
-    event_json.write_text('{"timestamp": "2024-01-15T10:30:00"}')
 
 
 class TestArchiveCycle:
@@ -38,7 +25,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """Archive should create a snapshot."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
 
         # Unmount cam_disk so archive can create snapshot
         subprocess.run(["umount", str(cam_mount)], check=True)
@@ -54,7 +41,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """Archive snapshot should have .toc file (completion marker)."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
@@ -69,7 +56,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """Archive snapshot should have metadata.json."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
@@ -89,7 +76,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """After archive, snapshots command should list the snapshot."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
@@ -101,7 +88,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """After archive, snapshots --json should include snapshot data."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
@@ -118,7 +105,7 @@ class TestArchiveCycle:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
         """After archive, status should show snapshot count."""
-        _create_test_footage(cam_mount)
+        create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
@@ -137,7 +124,7 @@ class TestMultipleArchiveCycles:
     ):
         """Multiple archive cycles should create multiple snapshots."""
         # First archive
-        _create_test_footage(cam_mount, "event1")
+        create_test_footage(cam_mount, "event1")
         subprocess.run(["umount", str(cam_mount)], check=True)
         cli_runner("archive", check=False)
 
@@ -146,7 +133,7 @@ class TestMultipleArchiveCycles:
             initialized_env.cam_disk_path, cam_mount
         )
 
-        _create_test_footage(cam_mount, "event2")
+        create_test_footage(cam_mount, "event2")
         unmount_cam_disk(cam_mount, loop_dev, kpartx_used)
 
         # Second archive
@@ -161,7 +148,7 @@ class TestMultipleArchiveCycles:
     ):
         """Snapshot IDs should increment monotonically."""
         # First archive
-        _create_test_footage(cam_mount, "event1")
+        create_test_footage(cam_mount, "event1")
         subprocess.run(["umount", str(cam_mount)], check=True)
         cli_runner("archive", check=False)
 
@@ -170,7 +157,7 @@ class TestMultipleArchiveCycles:
             initialized_env.cam_disk_path, cam_mount
         )
 
-        _create_test_footage(cam_mount, "event2")
+        create_test_footage(cam_mount, "event2")
         unmount_cam_disk(cam_mount, loop_dev, kpartx_used)
 
         cli_runner("archive", check=False)

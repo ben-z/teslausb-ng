@@ -151,6 +151,24 @@ def unmount_cam_disk(mount_point: Path, loop_dev: str, kpartx_used: bool) -> Non
     subprocess.run(["losetup", "-d", loop_dev], check=False)
 
 
+def create_test_footage(cam_mount: Path, event_name: str = "2024-01-15_10-30-00") -> None:
+    """Create test TeslaCam footage structure."""
+    saved = cam_mount / "TeslaCam" / "SavedClips"
+    saved.mkdir(parents=True, exist_ok=True)
+
+    event_dir = saved / event_name
+    event_dir.mkdir(exist_ok=True)
+
+    # Create fake video files
+    for cam in ["front", "back", "left_repeater", "right_repeater"]:
+        video = event_dir / f"{event_name}-{cam}.mp4"
+        video.write_bytes(b"fake video content " * 100)
+
+    # Create event.json
+    event_json = event_dir / "event.json"
+    event_json.write_text('{"timestamp": "2024-01-15T10:30:00"}')
+
+
 @pytest.fixture
 def test_env(tmp_path: Path) -> Generator[IntegrationTestEnv, None, None]:
     """Create an isolated test environment.
