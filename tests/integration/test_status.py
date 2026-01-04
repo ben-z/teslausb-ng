@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
-from .conftest import IntegrationTestEnv
+from .conftest import IntegrationTestEnv, create_test_footage, mount_cam_disk
 
 pytestmark = pytest.mark.integration
 
@@ -118,9 +119,6 @@ class TestCleanCommand:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
     ):
         """Clean --all should delete all deletable snapshots."""
-        import subprocess
-        from .conftest import create_test_footage, mount_cam_disk
-
         # Create multiple snapshots
         for i, event_name in enumerate(["event1", "event2", "event3"]):
             create_test_footage(cam_mount, event_name)
@@ -149,9 +147,6 @@ class TestCleanCommand:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
     ):
         """Clean --all --dry-run should show what would be deleted."""
-        import subprocess
-        from .conftest import create_test_footage, mount_cam_disk
-
         # Create multiple snapshots
         for i, event_name in enumerate(["event1", "event2"]):
             create_test_footage(cam_mount, event_name)
@@ -183,9 +178,6 @@ class TestCleanCommand:
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
     ):
         """Clean --all should delete snapshots even when space is sufficient."""
-        import subprocess
-        from .conftest import create_test_footage
-
         # Create a single snapshot (space should be sufficient)
         create_test_footage(cam_mount, "event1")
         subprocess.run(["umount", str(cam_mount)], check=True)
