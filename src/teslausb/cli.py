@@ -32,7 +32,7 @@ from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
 from .led import SysfsLedController
 from .mount import mount_image
-from .snapshot import SnapshotManager
+from .snapshot import SnapshotInUseError, SnapshotManager
 from .space import GB, SpaceManager
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
 
@@ -667,11 +667,18 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
         deleted = 0
         for snap in deletable:
-            if snapshot_manager.delete_snapshot(snap.id):
-                deleted += 1
-                print(f"Deleted snapshot {snap.id}")
+            try:
+                if snapshot_manager.delete_snapshot(snap.id):
+                    deleted += 1
+                    print(f"Deleted snapshot {snap.id}")
+            except SnapshotInUseError as e:
+                # Race condition - snapshot was acquired between check and delete
+                logger.warning(f"Snapshot {snap.id} is in use, skipping: {e}")
 
-        print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
+        if deleted == len(deletable):
+            print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
+        else:
+            print(f"Deleted {deleted} of {len(deletable)} snapshots (some could not be deleted)")
         return 0
 
     # Default: only clean up until space threshold is met
