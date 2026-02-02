@@ -768,8 +768,8 @@ def cmd_mount(args: argparse.Namespace) -> int:
 SYSTEMD_SERVICE = """\
 [Unit]
 Description=TeslaUSB Archiver
-After=network-online.target
-Wants=network-online.target
+After=local-fs.target
+Wants=local-fs.target
 
 [Service]
 Type=simple
