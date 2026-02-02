@@ -42,6 +42,36 @@ sudo nmcli device wifi connect "YourNetworkName" password "YourPassword"
 nmcli connection show
 ```
 
+Alternatively, configure WiFi using netplan:
+
+```sh
+# List available networks
+iw wlan0 scan
+
+# Add networks to netplan settings
+cat > /etc/netplan/20-wifi.yaml << 'EOF'
+network:
+   version: 2
+   renderer: networkd
+   wifis:
+   wlan0:
+      dhcp4: true
+      dhcp6: true
+      access-points:
+         "YourSSID":
+         password: "YourPassword"
+EOF
+
+# Apply the configuration
+netplan apply
+
+# Show wifi status
+iw wlan0 link
+# or
+networkctl status wlan0
+```
+
+
 ### Multiple Networks
 
 You can save multiple WiFi networks (home, work, mobile hotspot):
