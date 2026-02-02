@@ -29,7 +29,7 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 ## WiFi Setup
 
-Configure WiFi using NetworkManager:
+### NetworkManager (nmcli)
 
 ```bash
 # List available networks
@@ -42,7 +42,18 @@ sudo nmcli device wifi connect "YourNetworkName" password "YourPassword"
 nmcli connection show
 ```
 
-Alternatively, configure WiFi using netplan:
+#### Multiple Networks
+
+You can save multiple WiFi networks (home, work, mobile hotspot):
+
+```bash
+sudo nmcli device wifi connect "WorkWiFi" password "WorkPassword"
+sudo nmcli device wifi connect "iPhone" password "HotspotPassword"
+```
+
+The device will automatically connect to whichever saved network is available.
+
+### Netplan
 
 ```sh
 # List available networks
@@ -70,18 +81,6 @@ iw wlan0 link
 # or
 networkctl status wlan0
 ```
-
-
-### Multiple Networks
-
-You can save multiple WiFi networks (home, work, mobile hotspot):
-
-```bash
-sudo nmcli device wifi connect "WorkWiFi" password "WorkPassword"
-sudo nmcli device wifi connect "iPhone" password "HotspotPassword"
-```
-
-The device will automatically connect to whichever saved network is available.
 
 ---
 
