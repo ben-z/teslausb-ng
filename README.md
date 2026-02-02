@@ -96,6 +96,64 @@ sudo apt install -y python3-pip rclone xfsprogs parted dosfstools kpartx
 pip install git+https://github.com/ben-z/teslausb-ng.git
 ```
 
+### Updating
+
+To update to the latest version:
+
+```bash
+pip install --force-reinstall git+https://github.com/ben-z/teslausb-ng.git
+
+# If running as a service, reinstall it to pick up any service file changes
+sudo teslausb service uninstall
+sudo teslausb service install
+sudo systemctl start teslausb
+```
+
+---
+
+## Board-Specific Setup
+
+### Rock 5C (RK3588S)
+
+The Rock 5C requires a device tree overlay to enable USB gadget mode. Without this, you'll see `No USB Device Controller found` when running `teslausb gadget on`.
+
+**Enable the USB peripheral overlay:**
+
+1. Edit `/boot/armbianEnv.txt`:
+   ```bash
+   sudo nano /boot/armbianEnv.txt
+   ```
+
+2. Add this line:
+   ```
+   overlays=rk3588-dwc3-peripheral
+   ```
+
+3. Reboot:
+   ```bash
+   sudo reboot
+   ```
+
+4. Verify the UDC is available:
+   ```bash
+   ls /sys/class/udc/
+   # Should show: fc000000.usb
+   ```
+
+**Note:** The first boot after enabling the overlay may fail with "gave up waiting for root file system device". Simply reboot again and it should work. This is a one-time timing issue during initial overlay application.
+
+**Important:** Once peripheral mode is enabled, the USB-C port used for gadget mode will **only** work as a device port (connecting to Tesla). It will no longer work as a USB host port. Ensure you have another way to connect peripherals if needed.
+
+### Raspberry Pi
+
+Raspberry Pi boards typically work out of the box with the `dwc2` overlay. If you encounter issues, ensure your `/boot/config.txt` contains:
+
+```
+dtoverlay=dwc2
+```
+
+And `/boot/cmdline.txt` includes `modules-load=dwc2` after `rootwait`.
+
 ---
 
 ## rclone Configuration
@@ -248,6 +306,42 @@ sudo journalctl -u teslausb -f
 ---
 
 ## Troubleshooting
+
+### No USB Device Controller found
+
+If you see this error when running `teslausb gadget on`:
+
+```
+Failed to enable gadget: No USB Device Controller found
+```
+
+This means the USB gadget driver isn't loaded or the device tree isn't configured for peripheral/OTG mode.
+
+**Diagnose:**
+
+```bash
+# Check if any UDC exists
+ls /sys/class/udc/
+
+# Check current USB mode (if available)
+cat /sys/firmware/devicetree/base/usbdrd3_0/usb@fc000000/dr_mode 2>/dev/null
+
+# Check loaded USB modules
+lsmod | grep -E 'dwc|gadget'
+```
+
+**Solutions by board:**
+
+- **Rock 5C / RK3588**: See [Board-Specific Setup](#rock-5c-rk3588s) - requires `overlays=rk3588-dwc3-peripheral` in `/boot/armbianEnv.txt`
+- **Raspberry Pi**: Ensure `dtoverlay=dwc2` is in `/boot/config.txt`
+- **Other boards**: Check your board's documentation for enabling USB gadget/OTG mode. You may need to enable a device tree overlay or load kernel modules.
+
+**After making changes**, reboot and verify:
+
+```bash
+ls /sys/class/udc/  # Should show a device like fc000000.usb or musb-hdrc.0
+sudo teslausb gadget on
+```
 
 ### Tesla doesn't see the USB drive
 
