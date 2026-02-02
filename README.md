@@ -144,6 +144,22 @@ The Rock 5C requires a device tree overlay to enable USB gadget mode. Without th
 
 **Important:** Once peripheral mode is enabled, the USB-C port used for gadget mode will **only** work as a device port (connecting to Tesla). It will no longer work as a USB host port. Ensure you have another way to connect peripherals if needed.
 
+**Power stability (recommended):**
+
+If your Rock 5C reboots randomly during boot (especially with lower-quality power supplies), you can reduce power draw by limiting the CPU cores. The RK3588S has 4 "big" performance cores and 4 "little" efficiency cores. For teslausb, the 4 little cores are sufficient.
+
+Edit `/boot/armbianEnv.txt` and add to the `extraargs` line:
+
+```
+extraargs=cma=256M cpufreq.default_governor=powersave maxcpus=4
+```
+
+This will:
+- `maxcpus=4` - Only enable the 4 little cores (cpu0-3), disabling the power-hungry big cores
+- `cpufreq.default_governor=powersave` - Run at minimum frequency when idle
+
+This significantly reduces power spikes during boot and is more than enough for teslausb's workload (which is I/O-bound, not CPU-bound).
+
 ### Raspberry Pi
 
 Raspberry Pi boards typically work out of the box with the `dwc2` overlay. If you encounter issues, ensure your `/boot/config.txt` contains:
