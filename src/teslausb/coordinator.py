@@ -337,7 +337,7 @@ class Coordinator:
             "space": {
                 "free_gb": space_info.free_gb,
                 "total_gb": space_info.total_gb,
-                "cam_size_gb": space_info.cam_size_gb,
+                "min_free_gb": space_info.min_free_gb,
                 "can_snapshot": space_info.can_snapshot,
             },
             "snapshots": {

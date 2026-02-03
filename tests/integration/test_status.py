@@ -64,7 +64,7 @@ class TestStatusCommand:
         space = data["space"]
         assert "total_gb" in space
         assert "free_gb" in space
-        assert "cam_size_gb" in space
+        assert "min_free_gb" in space
         assert "can_snapshot" in space
 
     def test_status_shows_archive_system(
