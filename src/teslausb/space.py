@@ -5,7 +5,7 @@ This module provides:
 
 Space model:
 - backingfiles.img = available_disk - RESERVE
-- cam_size = (backingfiles - XFS_OVERHEAD) / 2
+- cam_size = (backingfiles - 3% overhead) / 2
 - Snapshots use XFS reflinks (copy-on-write), so they start small but can grow
 - Worst case: a snapshot grows to full cam_size (if all blocks change)
 - To guarantee the next snapshot succeeds, we need cam_size free space
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 GB = 1024 * 1024 * 1024
-XFS_OVERHEAD = 2 * GB  # Reserved for XFS metadata
+XFS_OVERHEAD_PROPORTION = 0.03  # 3% reserved for XFS metadata (measured ~2% in practice)
 MIN_CAM_SIZE = 1 * GB  # Minimum useful cam disk size
 DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 
@@ -36,12 +36,12 @@ DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 def calculate_cam_size(backingfiles_size: int) -> int:
     """Calculate cam_size from backingfiles size.
 
-    Formula: cam_size = (backingfiles_size - XFS_OVERHEAD) / 2
+    Formula: cam_size = (backingfiles_size - xfs_overhead) / 2
 
     This ensures space for:
     - cam_disk.bin (1x cam_size)
     - 1 full snapshot worst case (1x cam_size)
-    - XFS metadata overhead
+    - XFS metadata overhead (~2-3% of filesystem size)
 
     Args:
         backingfiles_size: Total size of backingfiles.img in bytes
@@ -49,7 +49,8 @@ def calculate_cam_size(backingfiles_size: int) -> int:
     Returns:
         Recommended cam_size in bytes
     """
-    usable = backingfiles_size - XFS_OVERHEAD
+    xfs_overhead = int(backingfiles_size * XFS_OVERHEAD_PROPORTION)
+    usable = backingfiles_size - xfs_overhead
     return max(0, usable // 2)
 
 

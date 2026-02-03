@@ -108,15 +108,15 @@ Archives continuously while WiFi is available. Idle detection gates each cycle.
 
 ```
 available_disk - RESERVE = backingfiles.img size
-backingfiles.img - XFS_OVERHEAD (2 GiB) = usable space
+backingfiles.img - 3% XFS overhead = usable space
 usable space / 2 = cam_size (half for cam_disk, half for snapshot)
 ```
 
 Example with 128 GiB SD card:
 - RESERVE = 10 GiB (for OS)
 - backingfiles.img = 118 GiB
-- usable = 116 GiB
-- cam_size = 58 GiB
+- XFS overhead = 3.5 GiB (3%)
+- cam_size = 57 GiB
 
 **Key invariant**: Always maintain `cam_size` free space so the next snapshot is guaranteed to succeed.
 

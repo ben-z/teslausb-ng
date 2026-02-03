@@ -10,7 +10,7 @@ from teslausb.space import (
     SpaceManager,
     SpaceInfo,
     GB,
-    XFS_OVERHEAD,
+    XFS_OVERHEAD_PROPORTION,
     MIN_CAM_SIZE,
     DEFAULT_RESERVE,
     calculate_cam_size,
@@ -20,36 +20,32 @@ from teslausb.space import (
 class TestCalculateCamSize:
     """Tests for calculate_cam_size function."""
 
-    def test_basic_calculation(self):
-        """Test basic cam_size calculation."""
-        # 100GB backingfiles - 2GB overhead = 98GB usable
-        # 98GB / 2 = 49GB cam_size
-        result = calculate_cam_size(100 * GB)
-        assert result == 49 * GB
+    def test_cam_size_is_just_under_half_of_backingfiles(self):
+        """Test that cam_size is slightly less than half due to XFS overhead."""
+        backingfiles = 100 * GB
+        result = calculate_cam_size(backingfiles)
 
-    def test_small_backingfiles(self):
-        """Test with small backingfiles size."""
-        # 10GB backingfiles - 2GB overhead = 8GB usable
-        # 8GB / 2 = 4GB cam_size
-        result = calculate_cam_size(10 * GB)
-        assert result == 4 * GB
+        # Should be less than half (due to overhead)
+        assert result < backingfiles // 2
+        # But not by much - within 2% of half
+        assert result > backingfiles * 0.48
 
-    def test_very_small_returns_zero(self):
-        """Test that very small backingfiles returns 0."""
-        # 1GB backingfiles - 2GB overhead = -1GB (clamped to 0)
-        result = calculate_cam_size(1 * GB)
-        assert result == 0
+    def test_scales_linearly_with_size(self):
+        """Test that cam_size scales proportionally with backingfiles size."""
+        small = calculate_cam_size(50 * GB)
+        large = calculate_cam_size(100 * GB)
 
-    def test_xfs_overhead_constant(self):
-        """Test XFS_OVERHEAD is 2GB."""
-        assert XFS_OVERHEAD == 2 * GB
+        # Doubling backingfiles should approximately double cam_size
+        assert large == small * 2
 
-    def test_min_cam_size_constant(self):
-        """Test MIN_CAM_SIZE is 1GB."""
+    def test_zero_returns_zero(self):
+        """Test that zero backingfiles returns 0."""
+        assert calculate_cam_size(0) == 0
+
+    def test_constants_have_expected_values(self):
+        """Verify constants are set correctly."""
+        assert XFS_OVERHEAD_PROPORTION == 0.03  # 3%
         assert MIN_CAM_SIZE == 1 * GB
-
-    def test_default_reserve_constant(self):
-        """Test DEFAULT_RESERVE is 10GB."""
         assert DEFAULT_RESERVE == 10 * GB
 
 
