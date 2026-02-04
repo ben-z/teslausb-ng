@@ -94,15 +94,26 @@ def load_config(args: argparse.Namespace) -> Config:
         return load_from_env()
 
 
-def get_cam_size(config: Config) -> int:
-    """Get cam_size from the actual cam_disk.bin file.
+def get_min_free_for_snapshot(config: Config) -> int:
+    """Calculate minimum free space required for a snapshot.
+
+    Formula: cam_size * snapshot_space_proportion
+
+    This is configurable because worst-case (100% COW copy) is unrealistic.
+    Default 50% provides safety margin while not being overly conservative.
 
     Returns:
-        Size of cam_disk.bin in bytes, or 0 if not found
+        Minimum free space in bytes, or 0 if backingfiles not mounted
     """
-    if config.cam_disk_path.exists():
-        return config.cam_disk_path.stat().st_size
-    return 0
+    if not config.backingfiles_path.exists():
+        return 0
+    try:
+        statvfs = os.statvfs(config.backingfiles_path)
+        backingfiles_size = statvfs.f_blocks * statvfs.f_frsize
+        cam_size = calculate_cam_size(backingfiles_size)
+        return int(cam_size * config.snapshot_space_proportion)
+    except OSError:
+        return 0
 
 
 def create_components(config: Config) -> tuple[
@@ -117,12 +128,12 @@ def create_components(config: Config) -> tuple[
         snapshots_path=config.snapshots_path,
     )
 
-    cam_size = get_cam_size(config)
+    min_free_threshold = get_min_free_for_snapshot(config)
     space_manager = SpaceManager(
         fs=fs,
         snapshot_manager=snapshot_manager,
         backingfiles_path=config.backingfiles_path,
-        cam_size=cam_size,
+        min_free_threshold=min_free_threshold,
     )
 
     # Create backend based on archive system
@@ -554,21 +565,21 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     # Get space info if mounted
     space_data = None
-    cam_size = get_cam_size(config)
+    min_free_threshold = get_min_free_for_snapshot(config)
     if backingfiles_mounted:
         try:
             space_manager = SpaceManager(
                 fs=fs,
                 snapshot_manager=snapshot_manager,
                 backingfiles_path=config.backingfiles_path,
-                cam_size=cam_size,
+                min_free_threshold=min_free_threshold,
             )
             space_info = space_manager.get_space_info()
             space_data = {
                 "total_gb": round(space_info.total_gb, 2),
                 "free_gb": round(space_info.free_gb, 2),
                 "used_gb": round(space_info.used_gb, 2),
-                "cam_size_gb": round(space_info.cam_size_gb, 2),
+                "min_free_gb": round(space_info.min_free_gb, 2),
                 "can_snapshot": space_info.can_snapshot,
             }
         except Exception as e:
@@ -611,7 +622,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "reachable": archive_reachable,
         },
         "config": {
-            "cam_size_gb": round(cam_size / GB, 2) if cam_size else None,
+            "min_free_gb": round(min_free_threshold / GB, 2) if min_free_threshold else None,
         },
     }
 
@@ -630,14 +641,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         if space_data:
             print(f"  Total: {space_data['total_gb']} GiB")
             print(f"  Free: {space_data['free_gb']} GiB")
-            print(f"  Cam size: {space_data['cam_size_gb']} GiB")
-            cam_size_gb = space_data.get("cam_size_gb")
+            print(f"  Min free: {space_data['min_free_gb']} GiB")
+            min_free_gb = space_data.get("min_free_gb")
             if space_data["can_snapshot"]:
                 can_snapshot_str = "Yes"
-            elif cam_size_gb is None:
+            elif min_free_gb is None:
                 can_snapshot_str = "Not initialized (run 'teslausb init' first)"
             else:
-                can_snapshot_str = "NO (need cam_size free)"
+                can_snapshot_str = "NO (need more free space)"
             print(f"  Can snapshot: {can_snapshot_str}")
         else:
             print("  (not available)")

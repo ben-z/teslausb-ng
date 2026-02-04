@@ -52,14 +52,8 @@ def space_manager(mock_fs: MockFilesystem, snapshot_manager: SnapshotManager) ->
         fs=mock_fs,
         snapshot_manager=snapshot_manager,
         backingfiles_path=Path("/backingfiles"),
-        cam_size=40 * GB,
+        min_free_threshold=40 * GB,
     )
-
-
-@pytest.fixture
-def cam_size() -> int:
-    """Default cam_size for tests."""
-    return 40 * GB
 
 
 @pytest.fixture

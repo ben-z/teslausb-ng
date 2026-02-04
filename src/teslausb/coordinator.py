@@ -245,10 +245,11 @@ class Coordinator:
             if self.config.on_error:
                 self.config.on_error(str(e))
             return False
-
-        # Clean up old snapshots
-        self._set_state(CoordinatorState.CLEANING)
-        self.space_manager.cleanup_if_needed()
+        finally:
+            # Always clean up old snapshots, even after failure
+            # This prevents orphaned snapshots from filling up space
+            self._set_state(CoordinatorState.CLEANING)
+            self.space_manager.cleanup_if_needed()
 
         return True
 
@@ -337,7 +338,7 @@ class Coordinator:
             "space": {
                 "free_gb": space_info.free_gb,
                 "total_gb": space_info.total_gb,
-                "cam_size_gb": space_info.cam_size_gb,
+                "min_free_gb": space_info.min_free_gb,
                 "can_snapshot": space_info.can_snapshot,
             },
             "snapshots": {

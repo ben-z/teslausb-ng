@@ -97,6 +97,9 @@ class Config:
     # Archive
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
 
+    # Space management
+    snapshot_space_proportion: float = 0.5  # Fraction of cam_size needed for snapshot
+
     # Derived paths
     @property
     def cam_disk_path(self) -> Path:
@@ -154,6 +157,10 @@ def load_from_env() -> Config:
     archive.archive_track = os.environ.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false"
 
     config.archive = archive
+
+    # Space management
+    if proportion := os.environ.get("SNAPSHOT_SPACE_PROPORTION"):
+        config.snapshot_space_proportion = float(proportion)
 
     return config
 
