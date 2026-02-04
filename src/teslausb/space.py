@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 GB = 1024 * 1024 * 1024
+SECTOR_SIZE = 512  # Disk sector size for alignment
 XFS_OVERHEAD_PROPORTION = 0.03  # 3% reserved for XFS metadata (measured ~2% in practice)
 MIN_CAM_SIZE = 1 * GB  # Minimum useful cam disk size
 DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
@@ -36,22 +37,29 @@ DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 def calculate_cam_size(backingfiles_size: int) -> int:
     """Calculate cam_size from backingfiles size.
 
-    Formula: cam_size = (backingfiles_size - xfs_overhead) / 2
+    Formula: cam_size = (backingfiles_size - xfs_overhead) / 2, aligned to sector boundary
 
     This ensures space for:
     - cam_disk.bin (1x cam_size)
     - 1 full snapshot worst case (1x cam_size)
     - XFS metadata overhead (~2-3% of filesystem size)
 
+    The result is aligned down to a 512-byte sector boundary to prevent
+    losetup from truncating the file. Without alignment, the partition
+    table may reference sectors beyond the loop device boundary, causing
+    write failures and read-only filesystem remounts.
+
     Args:
         backingfiles_size: Total size of backingfiles.img in bytes
 
     Returns:
-        Recommended cam_size in bytes
+        Recommended cam_size in bytes (sector-aligned)
     """
     xfs_overhead = int(backingfiles_size * XFS_OVERHEAD_PROPORTION)
     usable = backingfiles_size - xfs_overhead
-    return max(0, usable // 2)
+    cam_size = usable // 2
+    # Align down to sector boundary to prevent losetup truncation issues
+    return max(0, (cam_size // SECTOR_SIZE) * SECTOR_SIZE)
 
 
 @dataclass

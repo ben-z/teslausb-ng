@@ -10,6 +10,7 @@ from teslausb.space import (
     SpaceManager,
     SpaceInfo,
     GB,
+    SECTOR_SIZE,
     XFS_OVERHEAD_PROPORTION,
     MIN_CAM_SIZE,
     DEFAULT_RESERVE,
@@ -47,6 +48,55 @@ class TestCalculateCamSize:
         assert XFS_OVERHEAD_PROPORTION == 0.03  # 3%
         assert MIN_CAM_SIZE == 1 * GB
         assert DEFAULT_RESERVE == 10 * GB
+        assert SECTOR_SIZE == 512
+
+    def test_result_is_sector_aligned(self):
+        """Test that cam_size is always aligned to 512-byte sector boundary.
+
+        Without alignment, losetup will truncate the file to the nearest
+        sector boundary, causing the partition to extend beyond the loop
+        device and resulting in write failures and read-only remounts.
+        """
+        # Test various sizes that would produce non-aligned values without the fix
+        test_sizes = [
+            100 * GB,
+            118 * GB,  # Common real-world size
+            127 * GB,
+            200 * GB,
+            # Pathological cases
+            100 * GB + 1,
+            100 * GB + 255,
+            100 * GB + 511,
+            100 * GB + 513,
+        ]
+
+        for size in test_sizes:
+            result = calculate_cam_size(size)
+            assert result % SECTOR_SIZE == 0, f"cam_size {result} not sector-aligned for backingfiles_size {size}"
+
+    def test_alignment_does_not_increase_size(self):
+        """Test that alignment rounds down, never up (to stay within space budget)."""
+        # The aligned size should never exceed the unaligned calculation
+        for backingfiles in [50 * GB, 100 * GB, 200 * GB]:
+            xfs_overhead = int(backingfiles * XFS_OVERHEAD_PROPORTION)
+            usable = backingfiles - xfs_overhead
+            max_cam_size = usable // 2
+
+            actual = calculate_cam_size(backingfiles)
+            assert actual <= max_cam_size, (
+                f"Alignment should round down, not up: "
+                f"actual={actual}, max={max_cam_size}"
+            )
+            # Should be within one sector of the max
+            assert actual >= max_cam_size - SECTOR_SIZE + 1
+
+    def test_small_size_rounds_to_zero(self):
+        """Test that very small backingfiles sizes round down to zero gracefully."""
+        # A size so small that after overhead and division, it's less than one sector
+        tiny_size = 500  # Less than 2 sectors after overhead
+        result = calculate_cam_size(tiny_size)
+        assert result == 0
+        assert result % SECTOR_SIZE == 0  # Still "aligned" (zero is aligned)
 
 
 class TestSpaceInfo:
