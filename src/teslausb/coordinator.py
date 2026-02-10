@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 from .archive import ArchiveBackend, ArchiveManager, ArchiveResult, ArchiveState
 from .filesystem import Filesystem
@@ -60,6 +60,10 @@ class CoordinatorConfig:
     led_controller: LedController | None = None
     idle_detector: IdleDetector | None = None  # If set, waits for car to stop writing before snapshot
     temperature_monitor: TemperatureMonitor | None = None
+    gadget: Any | None = None  # USB gadget (enable/disable/is_enabled) - disabled during cam_disk cleanup
+
+    # Backoff
+    max_idle_interval: float = 300.0  # Max seconds between cycles when nothing to archive
 
     # Callbacks (optional)
     on_state_change: Callable[[CoordinatorState], None] | None = None
@@ -75,13 +79,15 @@ class Coordinator:
     1. Wait for archive to become reachable (WiFi connected, server up)
     2. Wait for car to stop writing (idle detection)
     3. Take snapshot and archive
-    4. Clean up old snapshots if needed
-    5. Repeat
+    4. Disable gadget, delete archived files from cam_disk, re-enable gadget
+    5. Clean up old snapshots if needed
+    6. Repeat
 
     This design ensures:
     - Snapshots are only taken when we're about to archive
     - Snapshots are locked during archiving (can't be deleted)
     - Space cleanup only deletes unreferenced snapshots
+    - cam_disk.bin is never mounted while the gadget is active
     - Clean shutdown on SIGTERM/SIGINT
     """
 
@@ -116,6 +122,7 @@ class Coordinator:
         self._last_archive: ArchiveResult | None = None
         self._archive_count = 0
         self._error_count = 0
+        self._consecutive_empty = 0
 
         # Share stop event with backend if it supports it (for interruptible operations)
         if hasattr(self.backend, 'stop_event'):
@@ -186,9 +193,9 @@ class Coordinator:
 
         1. Wait for idle (car stops writing)
         2. Ensure space is available
-        3. Take snapshot
-        4. Archive snapshot
-        5. Clean up if needed
+        3. Take snapshot and archive (safe - reads from snapshot only)
+        4. Disable gadget, delete archived files from cam_disk, re-enable gadget
+        5. Clean up old snapshots if needed
 
         Returns:
             True if successful, False on error or stop
@@ -215,10 +222,11 @@ class Coordinator:
             except Exception as e:
                 logger.warning(f"Archive start callback error: {e}")
 
-        # Create snapshot and archive
+        # Create snapshot and archive (deletion handled separately below)
         try:
             result = self.archive_manager.archive_new_snapshot(
                 mount_fn=self.config.mount_fn,
+                delete_after_archive=False,
             )
             self._last_archive = result
             self._archive_count += 1
@@ -228,6 +236,10 @@ class Coordinator:
                     f"Archive cycle {self._archive_count} complete: "
                     f"{result.files_transferred} files transferred"
                 )
+                # Delete archived files with gadget disabled to prevent
+                # FAT corruption from concurrent access to cam_disk.bin
+                if result.archived_files and self.archive_manager.cam_disk_path:
+                    self._delete_archived_files(result)
             else:
                 logger.warning(f"Archive cycle {self._archive_count} had issues: {result.error}")
                 self._error_count += 1
@@ -252,6 +264,57 @@ class Coordinator:
             self.space_manager.cleanup_if_needed()
 
         return True
+
+    def _delete_archived_files(self, result: ArchiveResult) -> None:
+        """Delete archived files from cam_disk, disabling gadget during the operation.
+
+        The USB gadget exposes cam_disk.bin to the car as a block device.
+        Mounting it simultaneously via loop device for deletion causes FAT
+        filesystem corruption from dual writer access. The gadget must be
+        disabled first - this causes a brief USB disconnect that the car
+        handles gracefully (removable media). The original teslausb project
+        uses the same approach.
+
+        After disabling the gadget, we run fsck to repair any FAT errors
+        from the car's abrupt disconnection, then mount and delete files.
+        """
+        from .mount import fsck_image, mount_image
+
+        gadget = self.config.gadget
+        gadget_was_enabled = False
+
+        # Disable gadget to prevent concurrent access to cam_disk.bin
+        if gadget and gadget.is_enabled():
+            logger.info("Disabling USB gadget for cam_disk cleanup")
+            try:
+                gadget.disable()
+            except Exception as e:
+                logger.error(f"Failed to disable gadget, skipping file deletion: {e}")
+                return
+            # Verify disable succeeded - UsbGadget.disable() may silently fail
+            if gadget.is_enabled():
+                logger.error("Gadget still enabled after disable, skipping file deletion")
+                return
+            gadget_was_enabled = True
+
+        try:
+            # Repair any FAT errors from the car's abrupt disconnection
+            cam_disk = self.archive_manager.cam_disk_path
+            if not fsck_image(cam_disk):
+                logger.warning("fsck failed, proceeding with mount anyway")
+
+            with mount_image(cam_disk, readonly=False) as cam_mount:
+                deleted, skipped = self.archive_manager.delete_archived_files(result, cam_mount)
+                logger.info(f"Cleanup complete: {deleted} deleted, {skipped} skipped")
+        except Exception as e:
+            logger.error(f"Failed to delete archived files: {e}")
+        finally:
+            if gadget_was_enabled:
+                try:
+                    gadget.enable()
+                    logger.info("USB gadget re-enabled")
+                except Exception as e:
+                    logger.error(f"Failed to re-enable gadget: {e}")
 
     def run_once(self) -> bool:
         """Run a single archive cycle.
@@ -298,12 +361,24 @@ class Coordinator:
                 # Do archive cycle (waits for idle, then archives)
                 if not self._do_archive_cycle():
                     # On error, wait before retrying
+                    self._consecutive_empty = 0
                     if not self._wait_interruptible(30):
                         break
                     continue
 
-                # Brief pause before next cycle
-                if not self._wait_interruptible(self.config.poll_interval):
+                # Backoff when nothing to archive to avoid hot-looping
+                if self._last_archive and self._last_archive.files_transferred == 0:
+                    self._consecutive_empty += 1
+                    backoff = min(
+                        self.config.poll_interval * (2 ** self._consecutive_empty),
+                        self.config.max_idle_interval,
+                    )
+                    logger.info(f"No files to archive, waiting {backoff:.0f}s before next cycle")
+                else:
+                    self._consecutive_empty = 0
+                    backoff = self.config.poll_interval
+
+                if not self._wait_interruptible(backoff):
                     break
 
         finally:
