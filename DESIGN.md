@@ -117,9 +117,11 @@ Example with 128 GiB SD card:
 - backingfiles.img = 118 GiB
 - XFS overhead = 3.5 GiB (3%)
 - cam_size = 57 GiB
+- min_free_threshold = 28.5 GiB (50% of cam_size by default)
 
-**Key invariant**: Always maintain `cam_size` free space so the next snapshot is guaranteed to succeed.
+**Key invariant**: Always maintain at least `min_free_threshold` (default 50% of `cam_size`) free space so the next snapshot is guaranteed to succeed.
 
 - Snapshots use XFS reflinks (copy-on-write), so they start small
 - Worst case: snapshot grows to full `cam_size` if all blocks change during archiving
-- Cleanup deletes oldest snapshots until `free_space >= cam_size`
+- The threshold is configurable via `SNAPSHOT_SPACE_PROPORTION` (default 0.5) because worst-case 100% COW copy is unrealistic
+- Cleanup deletes oldest snapshots until `free_space >= min_free_threshold`
