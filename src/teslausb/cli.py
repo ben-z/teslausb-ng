@@ -86,10 +86,18 @@ def configure_logging(log_level: str) -> None:
     )
 
 
+DEFAULT_CONFIG_PATH = Path("/etc/teslausb.conf")
+
+
 def load_config(args: argparse.Namespace) -> Config:
-    """Load configuration from file or environment."""
+    """Load configuration from file or environment.
+
+    Priority: --config flag > /etc/teslausb.conf > environment variables.
+    """
     if args.config:
         return load_from_file(Path(args.config))
+    elif DEFAULT_CONFIG_PATH.exists():
+        return load_from_file(DEFAULT_CONFIG_PATH)
     else:
         return load_from_env()
 
@@ -792,7 +800,6 @@ ExecStartPre=/usr/local/bin/teslausb mount
 ExecStartPre=/usr/local/bin/teslausb gadget on
 ExecStart=/usr/local/bin/teslausb --log-level debug run
 ExecStop=/usr/local/bin/teslausb gadget off
-EnvironmentFile=-/etc/teslausb.conf
 TimeoutStartSec=60
 Restart=always
 RestartSec=10
