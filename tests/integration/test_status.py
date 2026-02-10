@@ -40,7 +40,8 @@ class TestStatusCommand:
 
         assert "Total:" in result.stdout
         assert "Free:" in result.stdout
-        assert "Cam size:" in result.stdout
+        assert "Min free:" in result.stdout
+        assert "Can snapshot:" in result.stdout
 
     def test_status_json_output(
         self, initialized_env: IntegrationTestEnv, cli_runner
