@@ -70,4 +70,4 @@ pytest tests/ -v
 **Changing space management:**
 1. Logic in `space.py`
 2. Reserve is fixed at 10GB
-3. Formula: `recommended_cam_size = (total - 10GB) / 2`
+3. Formula: `cam_size = (backingfiles_size - 3% overhead) / 2`

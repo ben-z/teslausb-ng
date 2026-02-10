@@ -5,14 +5,15 @@ This module provides:
 
 Space model:
 - backingfiles.img = available_disk - RESERVE
-- cam_size = (backingfiles - XFS_OVERHEAD) / 2
+- cam_size = (backingfiles - 3% overhead) / 2
 - Snapshots use XFS reflinks (copy-on-write), so they start small but can grow
 - Worst case: a snapshot grows to full cam_size (if all blocks change)
-- To guarantee the next snapshot succeeds, we need cam_size free space
+- To allow the next snapshot to succeed, we maintain min_free_threshold free space
+  (configurable, defaults to 50% of cam_size as a safety margin)
 
 Cleanup strategy:
-- Delete oldest snapshots until free_space >= cam_size
-- This ensures there's always room for one full snapshot
+- Delete oldest snapshots until free_space >= min_free_threshold
+- This provides a safety margin while not being overly conservative
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 GB = 1024 * 1024 * 1024
-XFS_OVERHEAD = 2 * GB  # Reserved for XFS metadata
+SECTOR_SIZE = 512  # Disk sector size for alignment
+XFS_OVERHEAD_PROPORTION = 0.03  # 3% reserved for XFS metadata (measured ~2% in practice)
 MIN_CAM_SIZE = 1 * GB  # Minimum useful cam disk size
 DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 
@@ -36,21 +38,29 @@ DEFAULT_RESERVE = 10 * GB  # Default space to reserve for OS
 def calculate_cam_size(backingfiles_size: int) -> int:
     """Calculate cam_size from backingfiles size.
 
-    Formula: cam_size = (backingfiles_size - XFS_OVERHEAD) / 2
+    Formula: cam_size = (backingfiles_size - xfs_overhead) / 2, aligned to sector boundary
 
     This ensures space for:
     - cam_disk.bin (1x cam_size)
     - 1 full snapshot worst case (1x cam_size)
-    - XFS metadata overhead
+    - XFS metadata overhead (~2-3% of filesystem size)
+
+    The result is aligned down to a 512-byte sector boundary to prevent
+    losetup from truncating the file. Without alignment, the partition
+    table may reference sectors beyond the loop device boundary, causing
+    write failures and read-only filesystem remounts.
 
     Args:
         backingfiles_size: Total size of backingfiles.img in bytes
 
     Returns:
-        Recommended cam_size in bytes
+        Recommended cam_size in bytes (sector-aligned)
     """
-    usable = backingfiles_size - XFS_OVERHEAD
-    return max(0, usable // 2)
+    xfs_overhead = int(backingfiles_size * XFS_OVERHEAD_PROPORTION)
+    usable = backingfiles_size - xfs_overhead
+    cam_size = usable // 2
+    # Align down to sector boundary to prevent losetup truncation issues
+    return max(0, (cam_size // SECTOR_SIZE) * SECTOR_SIZE)
 
 
 @dataclass
@@ -60,7 +70,7 @@ class SpaceInfo:
     total_bytes: int
     free_bytes: int
     used_bytes: int
-    cam_size_bytes: int
+    min_free_threshold: int
 
     @property
     def total_gb(self) -> float:
@@ -75,34 +85,34 @@ class SpaceInfo:
         return self.used_bytes / GB
 
     @property
-    def cam_size_gb(self) -> float:
-        return self.cam_size_bytes / GB
+    def min_free_gb(self) -> float:
+        return self.min_free_threshold / GB
 
     @property
     def can_snapshot(self) -> bool:
         """Whether there's enough free space for a new snapshot.
 
-        A snapshot can grow up to cam_size in the worst case (if all blocks
-        change while archiving). We need at least cam_size free to be safe.
-        A non-positive cam_size indicates the system is not initialized
+        A snapshot can grow significantly in the worst case (if many blocks
+        change while archiving). We need at least min_free_threshold free to be safe.
+        A non-positive threshold indicates the system is not initialized
         for snapshots, so this will return False in that case.
         """
-        if self.cam_size_bytes <= 0:
+        if self.min_free_threshold <= 0:
             return False
-        return self.free_bytes >= self.cam_size_bytes
+        return self.free_bytes >= self.min_free_threshold
 
     def __str__(self) -> str:
         status = "OK" if self.can_snapshot else "LOW"
         return (
             f"Space: {self.free_gb:.1f} GiB free / {self.total_gb:.1f} GiB total "
-            f"(need {self.cam_size_gb:.1f} GiB for snapshot) [{status}]"
+            f"(need {self.min_free_gb:.1f} GiB for snapshot) [{status}]"
         )
 
 
 class SpaceManager:
     """Manages disk space and coordinates cleanup.
 
-    The key invariant: always maintain cam_size free space so the next
+    The key invariant: always maintain min_free_threshold free space so the next
     snapshot is guaranteed to succeed (worst case = full COW copy).
     """
 
@@ -111,7 +121,7 @@ class SpaceManager:
         fs: Filesystem,
         snapshot_manager: SnapshotManager,
         backingfiles_path: Path,
-        cam_size: int,
+        min_free_threshold: int,
     ):
         """Initialize SpaceManager.
 
@@ -119,15 +129,15 @@ class SpaceManager:
             fs: Filesystem abstraction
             snapshot_manager: SnapshotManager instance
             backingfiles_path: Path to backingfiles directory
-            cam_size: Size of cam_disk in bytes (also the cleanup threshold)
+            min_free_threshold: Minimum free space required before creating a snapshot
         """
         self.fs = fs
         self.snapshot_manager = snapshot_manager
         self.backingfiles_path = backingfiles_path
-        self.cam_size = cam_size
+        self.min_free_threshold = min_free_threshold
 
-        if cam_size <= 0:
-            logger.warning("SpaceManager created with cam_size=%d (system may not be initialized)", cam_size)
+        if min_free_threshold <= 0:
+            logger.warning("SpaceManager created with min_free_threshold=%d (system may not be initialized)", min_free_threshold)
 
     def get_space_info(self) -> SpaceInfo:
         """Get current space information."""
@@ -141,13 +151,13 @@ class SpaceManager:
             total_bytes=total,
             free_bytes=free,
             used_bytes=used,
-            cam_size_bytes=self.cam_size,
+            min_free_threshold=self.min_free_threshold,
         )
 
     def cleanup_if_needed(self) -> bool:
         """Clean up old snapshots if space is low.
 
-        Deletes oldest deletable snapshots until free_space >= cam_size.
+        Deletes oldest deletable snapshots until free_space >= min_free_threshold.
 
         Returns:
             True if space is now sufficient (can_snapshot), False if still low
@@ -177,7 +187,7 @@ class SpaceManager:
     def ensure_space_for_snapshot(self) -> bool:
         """Ensure there's space for a new snapshot.
 
-        Cleans up old snapshots until free_space >= cam_size.
+        Cleans up old snapshots until free_space >= min_free_threshold.
 
         Returns:
             True if space is available, False if not

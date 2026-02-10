@@ -40,7 +40,8 @@ class TestStatusCommand:
 
         assert "Total:" in result.stdout
         assert "Free:" in result.stdout
-        assert "Cam size:" in result.stdout
+        assert "Min free:" in result.stdout
+        assert "Can snapshot:" in result.stdout
 
     def test_status_json_output(
         self, initialized_env: IntegrationTestEnv, cli_runner
@@ -64,7 +65,7 @@ class TestStatusCommand:
         space = data["space"]
         assert "total_gb" in space
         assert "free_gb" in space
-        assert "cam_size_gb" in space
+        assert "min_free_gb" in space
         assert "can_snapshot" in space
 
     def test_status_shows_archive_system(
