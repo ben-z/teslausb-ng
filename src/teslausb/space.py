@@ -8,11 +8,12 @@ Space model:
 - cam_size = (backingfiles - 3% overhead) / 2
 - Snapshots use XFS reflinks (copy-on-write), so they start small but can grow
 - Worst case: a snapshot grows to full cam_size (if all blocks change)
-- To guarantee the next snapshot succeeds, we need cam_size free space
+- To allow the next snapshot to succeed, we maintain min_free_threshold free space
+  (configurable, defaults to 50% of cam_size as a safety margin)
 
 Cleanup strategy:
 - Delete oldest snapshots until free_space >= min_free_threshold
-- This ensures there's always room for one full snapshot
+- This provides a safety margin while not being overly conservative
 """
 
 from __future__ import annotations
