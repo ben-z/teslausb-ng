@@ -179,7 +179,7 @@ class RealFilesystem(Filesystem):
             # XFS lazy superblock counters (sb_lazysbcount) aggregate per-CPU
             # free block counts on demand. After unlink(), the cached aggregate
             # is stale. The first statvfs() triggers aggregation; the second
-            # reads the accurate result (~0.5ms total).
+            # reads the accurate result with a small additional overhead.
             os.statvfs(path)
             st = os.statvfs(path)
             return StatVfsResult(
