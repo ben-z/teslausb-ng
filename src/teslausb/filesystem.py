@@ -176,6 +176,11 @@ class RealFilesystem(Filesystem):
 
     def statvfs(self, path: Path) -> StatVfsResult:
         try:
+            # XFS lazy superblock counters (sb_lazysbcount) aggregate per-CPU
+            # free block counts on demand. After unlink(), the cached aggregate
+            # is stale. The first statvfs() triggers aggregation; the second
+            # reads the accurate result (~0.5ms total).
+            os.statvfs(path)
             st = os.statvfs(path)
             return StatVfsResult(
                 block_size=st.f_frsize,
