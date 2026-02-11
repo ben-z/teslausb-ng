@@ -1,12 +1,15 @@
 """Tests for the filesystem abstraction layer."""
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from teslausb.filesystem import (
     FileNotFoundError_,
     MockFilesystem,
+    RealFilesystem,
     StatResult,
     StatVfsResult,
 )
@@ -259,3 +262,16 @@ class TestMockFilesystem:
         assert statvfs.total_bytes == 9 * 4096
         # Free should be 8 blocks
         assert statvfs.free_bytes == 8 * 4096
+
+
+class TestRealFilesystem:
+    """Tests for RealFilesystem."""
+
+    def test_statvfs_primes_xfs_lazy_counters(self, tmp_path):
+        """statvfs calls os.statvfs twice to work around XFS lazy counters."""
+        fs = RealFilesystem()
+        mock_result = os.statvfs(tmp_path)
+        with patch("teslausb.filesystem.os.statvfs", return_value=mock_result) as mock:
+            result = fs.statvfs(tmp_path)
+            assert mock.call_count == 2
+            assert result.block_size == mock_result.f_frsize
