@@ -84,6 +84,7 @@ class ArchiveConfig:
     archive_saved: bool = True
     archive_sentry: bool = True
     archive_track: bool = True
+    archive_photobooth: bool = True
 
 
 @dataclass
@@ -155,6 +156,7 @@ def load_from_env() -> Config:
     archive.archive_saved = os.environ.get("ARCHIVE_SAVEDCLIPS", "true").lower() != "false"
     archive.archive_sentry = os.environ.get("ARCHIVE_SENTRYCLIPS", "true").lower() != "false"
     archive.archive_track = os.environ.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false"
+    archive.archive_photobooth = os.environ.get("ARCHIVE_PHOTOBOOTH", "true").lower() != "false"
 
     config.archive = archive
 

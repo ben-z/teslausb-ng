@@ -121,6 +121,7 @@ class TestArchiveConfig:
         assert config.archive_saved is True
         assert config.archive_sentry is True
         assert config.archive_recent is False
+        assert config.archive_photobooth is True
 
 
 class TestLoadFromEnv:
@@ -248,6 +249,7 @@ ARCHIVE_RECENTCLIPS=true
 ARCHIVE_SAVEDCLIPS=false
 ARCHIVE_SENTRYCLIPS=true
 ARCHIVE_TRACKMODECLIPS=false
+ARCHIVE_PHOTOBOOTH=false
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
             f.write(config_content)
@@ -260,5 +262,6 @@ ARCHIVE_TRACKMODECLIPS=false
             assert config.archive.archive_saved is False
             assert config.archive.archive_sentry is True
             assert config.archive.archive_track is False
+            assert config.archive.archive_photobooth is False
         finally:
             config_path.unlink()
