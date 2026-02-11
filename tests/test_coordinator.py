@@ -13,7 +13,7 @@ from teslausb.archive import (
     ArchiveState,
     MockArchiveBackend,
 )
-from teslausb.coordinator import Coordinator, CoordinatorConfig
+from teslausb.coordinator import Coordinator, CoordinatorConfig, _backoff_intervals
 from teslausb.filesystem import MockFilesystem
 from teslausb.gadget import LunConfig, MockGadget
 from teslausb.snapshot import SnapshotManager
@@ -295,61 +295,145 @@ class TestGadgetCoordination:
         )
 
 
-class TestArchiveBackoff:
-    """Tests for exponential backoff when nothing to archive."""
+class TestBackoffIntervals:
+    """Tests for the _backoff_intervals generator."""
 
-    def test_consecutive_empty_resets_on_transfer(self, coordinator: Coordinator):
-        """Test that consecutive empty counter resets when files are transferred."""
-        coordinator._consecutive_empty = 5
+    def test_yields_correct_sequence(self):
+        """Test backoff progression: 5, 10, 20, 40, 80, 160, 300, 300..."""
+        gen = _backoff_intervals(5.0, 300.0)
+        expected = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0, 300.0]
+        for exp in expected:
+            assert next(gen) == exp
 
-        result_with_files = ArchiveResult(
-            snapshot_id=1,
-            state=ArchiveState.COMPLETED,
-            files_transferred=3,
+    def test_caps_at_maximum(self):
+        """Test that intervals never exceed maximum."""
+        gen = _backoff_intervals(1.0, 10.0)
+        for _ in range(20):
+            assert next(gen) <= 10.0
+
+    def test_base_equals_maximum(self):
+        """Test that base == maximum yields constant intervals."""
+        gen = _backoff_intervals(60.0, 60.0)
+        for _ in range(5):
+            assert next(gen) == 60.0
+
+    def test_base_exceeds_maximum(self):
+        """Test that base > maximum is capped at maximum from the start."""
+        gen = _backoff_intervals(100.0, 50.0)
+        assert next(gen) == 50.0
+        assert next(gen) == 50.0
+
+    def test_rejects_non_positive_base(self):
+        """Test that base <= 0 raises ValueError."""
+        with pytest.raises(ValueError, match="base"):
+            next(_backoff_intervals(0, 10.0))
+        with pytest.raises(ValueError, match="base"):
+            next(_backoff_intervals(-1.0, 10.0))
+
+    def test_rejects_non_positive_maximum(self):
+        """Test that maximum <= 0 raises ValueError."""
+        with pytest.raises(ValueError, match="maximum"):
+            next(_backoff_intervals(1.0, 0))
+        with pytest.raises(ValueError, match="maximum"):
+            next(_backoff_intervals(1.0, -5.0))
+
+
+class TestWaitForArchiveReachable:
+    """Tests for _wait_for_archive_reachable with exponential backoff."""
+
+    def test_returns_immediately_when_reachable(self, coordinator: Coordinator):
+        """Test that no wait occurs if archive is immediately reachable."""
+        coordinator.backend.reachable = True
+        assert coordinator._wait_for_archive_reachable() is True
+
+    def test_backoff_increases_on_consecutive_failures(self, coordinator: Coordinator):
+        """Test that wait intervals increase when archive stays unreachable."""
+        wait_intervals: list[float] = []
+
+        # Unreachable 4 times, then reachable
+        coordinator.backend.is_reachable = MagicMock(
+            side_effect=[False, False, False, False, True]
         )
-        coordinator._last_archive = result_with_files
 
-        # Simulate what run() does
-        if coordinator._last_archive and coordinator._last_archive.files_transferred == 0:
-            coordinator._consecutive_empty += 1
-        else:
-            coordinator._consecutive_empty = 0
+        original_wait = coordinator._wait_interruptible
 
-        assert coordinator._consecutive_empty == 0
+        def tracking_wait(seconds: float) -> bool:
+            wait_intervals.append(seconds)
+            return original_wait(0)  # don't actually sleep
 
-    def test_consecutive_empty_increments_on_zero_files(self, coordinator: Coordinator):
-        """Test that consecutive empty counter increments when no files transferred."""
-        assert coordinator._consecutive_empty == 0
+        coordinator._wait_interruptible = tracking_wait
 
-        empty_result = ArchiveResult(
-            snapshot_id=1,
-            state=ArchiveState.COMPLETED,
-            files_transferred=0,
-        )
-        coordinator._last_archive = empty_result
+        assert coordinator._wait_for_archive_reachable() is True
+        assert wait_intervals == [5.0, 10.0, 20.0, 40.0]
 
-        # Simulate what run() does
-        if coordinator._last_archive and coordinator._last_archive.files_transferred == 0:
-            coordinator._consecutive_empty += 1
+    def test_returns_false_on_stop(self, coordinator: Coordinator):
+        """Test that stop event interrupts the wait."""
+        coordinator.backend.reachable = False
+        coordinator._stop_event.set()
+        assert coordinator._wait_for_archive_reachable() is False
 
-        assert coordinator._consecutive_empty == 1
 
-    def test_backoff_capped_at_max(self, coordinator: Coordinator):
-        """Test that backoff is capped at max_idle_interval."""
-        coordinator._consecutive_empty = 100
-        max_interval = coordinator.config.max_idle_interval
-        poll = coordinator.config.poll_interval
+class TestRunLoopBackoff:
+    """Tests for the run() loop's idle backoff behavior."""
 
-        backoff = min(poll * (2 ** 100), max_interval)
-        assert backoff == max_interval
+    def _run_with_results(
+        self, coordinator: Coordinator, results: list[ArchiveResult]
+    ) -> list[float]:
+        """Run the coordinator loop with canned ArchiveResults, returning wait delays.
 
-    def test_backoff_grows_exponentially(self, coordinator: Coordinator):
-        """Test backoff progression: 10, 20, 40, 80, 160, 300, 300..."""
-        poll = coordinator.config.poll_interval  # 5.0
-        max_interval = coordinator.config.max_idle_interval  # 300.0
+        Each result is returned by a fake _do_archive_cycle (always returns True).
+        The coordinator stops after the last result is consumed.
+        """
+        wait_delays: list[float] = []
+        cycle = 0
 
-        expected = [10, 20, 40, 80, 160, 300, 300]
-        for i, expected_backoff in enumerate(expected):
-            consecutive = i + 1
-            backoff = min(poll * (2 ** consecutive), max_interval)
-            assert backoff == expected_backoff
+        def fake_archive_cycle() -> bool:
+            nonlocal cycle
+            coordinator._last_archive = results[cycle]
+            cycle += 1
+            if cycle >= len(results):
+                coordinator.stop()
+            return True
+
+        coordinator._do_archive_cycle = fake_archive_cycle
+        coordinator.backend.reachable = True
+
+        original_wait = coordinator._wait_interruptible
+
+        def tracking_wait(seconds: float) -> bool:
+            wait_delays.append(seconds)
+            return original_wait(0)
+
+        coordinator._wait_interruptible = tracking_wait
+
+        coordinator.run()
+        return wait_delays
+
+    def test_idle_backoff_increases_then_resets(self, coordinator: Coordinator):
+        """Test that run() backs off on empty cycles and resets when files transfer."""
+        results = [
+            ArchiveResult(snapshot_id=1, state=ArchiveState.COMPLETED, files_transferred=0),
+            ArchiveResult(snapshot_id=2, state=ArchiveState.COMPLETED, files_transferred=0),
+            ArchiveResult(snapshot_id=3, state=ArchiveState.COMPLETED, files_transferred=0),
+            ArchiveResult(snapshot_id=4, state=ArchiveState.COMPLETED, files_transferred=5),
+        ]
+
+        wait_delays = self._run_with_results(coordinator, results)
+
+        # First 3 waits are backoff (5, 10, 20), 4th resets to poll_interval (5)
+        assert wait_delays == [5.0, 10.0, 20.0, 5.0]
+
+    def test_no_backoff_on_failed_archive_result(self, coordinator: Coordinator):
+        """Test that a FAILED ArchiveResult resets backoff instead of escalating it."""
+        results = [
+            ArchiveResult(snapshot_id=1, state=ArchiveState.COMPLETED, files_transferred=0),
+            ArchiveResult(snapshot_id=2, state=ArchiveState.FAILED, files_transferred=0),
+            ArchiveResult(snapshot_id=3, state=ArchiveState.COMPLETED, files_transferred=0),
+        ]
+
+        wait_delays = self._run_with_results(coordinator, results)
+
+        # Cycle 1: success + 0 files -> backoff 5s
+        # Cycle 2: FAILED + 0 files -> not success, so reset backoff -> poll_interval 5s
+        # Cycle 3: success + 0 files -> fresh backoff (reset by cycle 2) -> 5s
+        assert wait_delays == [5.0, 5.0, 5.0]

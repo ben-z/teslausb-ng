@@ -34,6 +34,21 @@ from .temperature import TemperatureMonitor
 logger = logging.getLogger(__name__)
 
 
+def _backoff_intervals(base: float, maximum: float) -> Iterator[float]:
+    """Yield exponentially increasing intervals: base, 2*base, 4*base, ..., capped at maximum.
+
+    Both base and maximum must be positive.
+    """
+    if base <= 0:
+        raise ValueError("base backoff interval must be positive")
+    if maximum <= 0:
+        raise ValueError("maximum backoff interval must be positive")
+    interval = min(base, maximum)
+    while True:
+        yield interval
+        interval = min(interval * 2, maximum)
+
+
 class CoordinatorState(Enum):
     """State of the coordinator."""
 
@@ -63,7 +78,7 @@ class CoordinatorConfig:
     gadget: Any | None = None  # USB gadget (enable/disable/is_enabled) - disabled during cam_disk cleanup
 
     # Backoff
-    max_idle_interval: float = 300.0  # Max seconds between cycles when nothing to archive
+    max_idle_interval: float = 300.0  # Cap for both idle-cycle backoff and archive reachability retry backoff
 
     # Callbacks (optional)
     on_state_change: Callable[[CoordinatorState], None] | None = None
@@ -122,7 +137,6 @@ class Coordinator:
         self._last_archive: ArchiveResult | None = None
         self._archive_count = 0
         self._error_count = 0
-        self._consecutive_empty = 0
 
         # Share stop event with backend if it supports it (for interruptible operations)
         if hasattr(self.backend, 'stop_event'):
@@ -172,21 +186,23 @@ class Coordinator:
     def _wait_for_archive_reachable(self) -> bool:
         """Wait for archive destination to become reachable.
 
+        Uses exponential backoff to avoid log spam during long WiFi outages.
+
         Returns:
             True if reachable, False if stopped
         """
         self._set_state(CoordinatorState.WAITING_FOR_ARCHIVE)
 
-        while not self._stop_event.is_set():
+        for interval in _backoff_intervals(self.config.poll_interval, self.config.max_idle_interval):
             if self.backend.is_reachable():
                 logger.info("Archive is reachable")
                 return True
 
-            logger.debug("Archive not reachable, waiting...")
-            if not self._wait_interruptible(self.config.poll_interval):
+            logger.info(f"Archive not reachable, retrying in {interval:.0f}s")
+            if not self._wait_interruptible(interval):
                 return False
 
-        return False
+        return False  # unreachable: _backoff_intervals is infinite, but mypy needs this
 
     def _do_archive_cycle(self) -> bool:
         """Perform one archive cycle.
@@ -353,6 +369,11 @@ class Coordinator:
         try:
             logger.info("Coordinator starting")
 
+            def new_idle_backoff() -> Iterator[float]:
+                return _backoff_intervals(self.config.poll_interval, self.config.max_idle_interval)
+
+            idle_backoff = new_idle_backoff()
+
             while not self._stop_event.is_set():
                 # Wait for archive to be reachable
                 if not self._wait_for_archive_reachable():
@@ -360,25 +381,25 @@ class Coordinator:
 
                 # Do archive cycle (waits for idle, then archives)
                 if not self._do_archive_cycle():
-                    # On error, wait before retrying
-                    self._consecutive_empty = 0
+                    # On error, reset backoff and wait before retrying
+                    idle_backoff = new_idle_backoff()
                     if not self._wait_interruptible(30):
                         break
                     continue
 
-                # Backoff when nothing to archive to avoid hot-looping
-                if self._last_archive and self._last_archive.files_transferred == 0:
-                    self._consecutive_empty += 1
-                    backoff = min(
-                        self.config.poll_interval * (2 ** self._consecutive_empty),
-                        self.config.max_idle_interval,
-                    )
-                    logger.info(f"No files to archive, waiting {backoff:.0f}s before next cycle")
+                # Backoff when nothing to archive to avoid hot-looping.
+                # Only back off on successful cycles with zero transfers (truly idle).
+                # Failed cycles are handled by the error path above.
+                if (self._last_archive
+                        and self._last_archive.success
+                        and self._last_archive.files_transferred == 0):
+                    delay = next(idle_backoff)
+                    logger.info(f"No files to archive, waiting {delay:.0f}s before next cycle")
                 else:
-                    self._consecutive_empty = 0
-                    backoff = self.config.poll_interval
+                    idle_backoff = new_idle_backoff()
+                    delay = self.config.poll_interval
 
-                if not self._wait_interruptible(backoff):
+                if not self._wait_interruptible(delay):
                     break
 
         finally:
