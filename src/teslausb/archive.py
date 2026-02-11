@@ -448,7 +448,7 @@ class ArchiveManager:
         else:
             result.state = ArchiveState.COMPLETED
 
-        logger.info(f"Archive complete: {total_files} files, {format_size(total_bytes)}")
+        logger.info(f"Archive complete: transferred {total_files} files, {format_size(total_bytes)}")
 
         return result
 
