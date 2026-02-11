@@ -137,10 +137,14 @@ class ProcIdleDetector:
     def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
         """Wait for the car to become idle.
 
-        Uses a state machine to detect idle:
-        1. UNDETERMINED: Wait for first significant write
-        2. WRITING: Car is actively writing
-        3. IDLE: No writes for IDLE_CONFIRM_SECONDS
+        Uses a state machine with three states:
+        - UNDETERMINED: Initial, waiting for baseline sample
+        - WRITING: Active writes detected (>500KB/sec)
+        - IDLE: Below threshold; confirmed after IDLE_CONFIRM_SECONDS quiet samples
+
+        UNDETERMINED and IDLE share identical transition logic: accumulate
+        quiet samples toward the confirmation threshold, or enter WRITING
+        on a large delta.
 
         Args:
             timeout: Maximum seconds to wait
@@ -176,13 +180,7 @@ class ProcIdleDetector:
             delta = written - self._prev_written
             self._prev_written = written
 
-            if self._state == IdleState.UNDETERMINED:
-                if delta > WRITE_THRESHOLD:
-                    logger.info("Write in progress")
-                    self._state = IdleState.WRITING
-                    self._burst_size = delta
-
-            elif self._state == IdleState.WRITING:
+            if self._state == IdleState.WRITING:
                 if delta < WRITE_THRESHOLD:
                     logger.info(f"No longer writing, wrote {self._burst_size} bytes")
                     self._state = IdleState.IDLE
@@ -191,9 +189,12 @@ class ProcIdleDetector:
                 else:
                     self._burst_size += delta
 
-            elif self._state == IdleState.IDLE:
+            else:
+                # UNDETERMINED and IDLE share the same transition logic:
+                # accumulate quiet samples, return on confirmation threshold,
+                # or enter WRITING on a big delta.
                 if delta > WRITE_THRESHOLD:
-                    logger.info("Going back to writing state")
+                    logger.info("Write in progress")
                     self._state = IdleState.WRITING
                     self._burst_size = delta
                     self._idle_count = 0
@@ -203,6 +204,7 @@ class ProcIdleDetector:
                         logger.info(
                             f"No writes seen in the last {IDLE_CONFIRM_SECONDS} seconds"
                         )
+                        self._state = IdleState.IDLE
                         return True
 
         logger.warning("Couldn't determine idle interval")
