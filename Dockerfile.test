@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -27,8 +27,10 @@ COPY pyproject.toml README.md ./
 COPY src/ src/
 COPY tests/ tests/
 
-# Install the package with test dependencies
-RUN pip3 install -e ".[test]"
+# Install the package with test dependencies in a venv
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install -e ".[test]"
 
 # Default command runs integration tests
 CMD ["pytest", "tests/integration", "-v", "--tb=short"]
