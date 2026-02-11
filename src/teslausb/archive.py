@@ -266,7 +266,6 @@ class RcloneBackend(ArchiveBackend):
 
             # Parse output for stats
             files_transferred = 0
-            bytes_transferred = 0
             output = result.stderr.decode() if result.stderr else ""
 
             for line in output.splitlines():
@@ -284,7 +283,7 @@ class RcloneBackend(ArchiveBackend):
             return CopyResult(
                 success=True,
                 files_transferred=files_transferred,
-                bytes_transferred=bytes_transferred,
+                bytes_transferred=sum(f.size for f in archived_files),
                 archived_files=archived_files,
             )
 
