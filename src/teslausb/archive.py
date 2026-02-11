@@ -25,6 +25,18 @@ from .snapshot import SnapshotHandle, SnapshotManager
 logger = logging.getLogger(__name__)
 
 
+def format_size(num_bytes: int | float) -> str:
+    """Format a byte count as a human-readable string (e.g. '2.3 GB')."""
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(value) < 1000 or unit == "GB":
+            precision = 0 if value % 1 == 0 else 1
+            return f"{value:.{precision}f} {unit}"
+        value /= 1000
+    # Unreachable: the loop always returns at "GB"
+    return f"{value:.1f} GB"
+
+
 class ArchiveState(Enum):
     """State of an archive operation."""
 
@@ -420,7 +432,10 @@ class ArchiveManager:
                 # Track archived files for deletion (only for successful directories)
                 if copy_result.archived_files:
                     result.archived_files[dst_name] = copy_result.archived_files
-                logger.info(f"  {dst_name}: {copy_result.files_transferred} files")
+                logger.info(
+                    f"  {dst_name}: transferred {copy_result.files_transferred} files"
+                    f" ({format_size(copy_result.bytes_transferred)})"
+                )
             else:
                 errors.append(f"{dst_name}: {copy_result.error}")
                 logger.error(f"  {dst_name}: failed - {copy_result.error}")
@@ -435,7 +450,7 @@ class ArchiveManager:
         else:
             result.state = ArchiveState.COMPLETED
 
-        logger.info(f"Archive complete: {total_files} files transferred")
+        logger.info(f"Archive complete: {total_files} files, {format_size(total_bytes)}")
 
         return result
 
