@@ -57,7 +57,6 @@ class CoordinatorState(Enum):
     ARCHIVING = "archiving"
     CLEANING = "cleaning"
     STOPPED = "stopped"
-    ERROR = "error"
 
 
 @dataclass
