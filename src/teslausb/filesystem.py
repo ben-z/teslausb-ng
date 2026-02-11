@@ -23,6 +23,25 @@ from typing import Iterator
 logger = logging.getLogger(__name__)
 
 
+def _get_syncfs():
+    """Resolve the libc syncfs function once, or None if unavailable."""
+    if sys.platform != "linux":
+        return None
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        return None
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    fn = getattr(libc, "syncfs", None)
+    if fn is None:
+        return None
+    fn.argtypes = [ctypes.c_int]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_libc_syncfs = _get_syncfs()
+
+
 def _syncfs(fd: int) -> None:
     """Flush the filesystem journal so statvfs() returns accurate free space.
 
@@ -30,13 +49,9 @@ def _syncfs(fd: int) -> None:
     syncfs() forces a journal commit so subsequent statvfs() reads see the
     freed blocks.
     """
-    if sys.platform != "linux":
+    if _libc_syncfs is None:
         return
-    libc_name = ctypes.util.find_library("c")
-    if libc_name is None:
-        return
-    libc = ctypes.CDLL(libc_name, use_errno=True)
-    ret = libc.syncfs(fd)
+    ret = _libc_syncfs(fd)
     if ret != 0:
         errno = ctypes.get_errno()
         logger.warning("syncfs() failed with errno %d", errno)

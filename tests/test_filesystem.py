@@ -271,10 +271,8 @@ class TestRealFilesystem:
         """statvfs flushes the XFS journal via syncfs before reading counters."""
         fs = RealFilesystem()
         expected = os.statvfs(tmp_path)
-        with (
-            patch("teslausb.filesystem._syncfs") as mock_syncfs,
-            patch("teslausb.filesystem.os.statvfs", return_value=expected),
-        ):
+        with patch("teslausb.filesystem._syncfs") as mock_syncfs, \
+             patch("teslausb.filesystem.os.statvfs", return_value=expected):
             result = fs.statvfs(tmp_path)
             mock_syncfs.assert_called_once()
             assert result.block_size == expected.f_frsize
