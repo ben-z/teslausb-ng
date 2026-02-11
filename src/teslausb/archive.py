@@ -26,15 +26,15 @@ logger = logging.getLogger(__name__)
 
 
 def format_size(num_bytes: int | float) -> str:
-    """Format a byte count as a human-readable string (e.g. '2.3 GB')."""
+    """Format a byte count as a human-readable string (e.g. '2.3 GiB')."""
     value = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(value) < 1000 or unit == "GB":
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024 or unit == "GiB":
             precision = 0 if value % 1 == 0 else 1
             return f"{value:.{precision}f} {unit}"
-        value /= 1000
-    # Unreachable: the loop always returns at "GB"
-    return f"{value:.1f} GB"
+        value /= 1024
+    # Unreachable: the loop always returns at "GiB"
+    return f"{value:.1f} GiB"
 
 
 class ArchiveState(Enum):
