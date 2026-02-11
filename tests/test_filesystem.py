@@ -267,11 +267,14 @@ class TestMockFilesystem:
 class TestRealFilesystem:
     """Tests for RealFilesystem."""
 
-    def test_statvfs_primes_xfs_lazy_counters(self, tmp_path):
-        """statvfs calls os.statvfs twice to work around XFS lazy counters."""
+    def test_statvfs_calls_syncfs_before_reading(self, tmp_path):
+        """statvfs flushes the XFS journal via syncfs before reading counters."""
         fs = RealFilesystem()
-        mock_result = os.statvfs(tmp_path)
-        with patch("teslausb.filesystem.os.statvfs", return_value=mock_result) as mock:
+        expected = os.statvfs(tmp_path)
+        with (
+            patch("teslausb.filesystem._syncfs") as mock_syncfs,
+            patch("teslausb.filesystem.os.statvfs", return_value=expected),
+        ):
             result = fs.statvfs(tmp_path)
-            assert mock.call_count == 2
-            assert result.block_size == mock_result.f_frsize
+            mock_syncfs.assert_called_once()
+            assert result.block_size == expected.f_frsize
