@@ -109,6 +109,21 @@ class TestConfig:
         warnings = config.validate()
         assert any("Unknown archive system" in w for w in warnings)
 
+    def test_validate_snapshot_space_proportion_out_of_range(self):
+        """Test validation catches out-of-range snapshot_space_proportion."""
+        for bad_value in [0, -0.5, 1.5, 2.0]:
+            config = Config(snapshot_space_proportion=bad_value)
+            warnings = config.validate()
+            assert any("snapshot_space_proportion" in w for w in warnings), \
+                f"Expected warning for proportion={bad_value}"
+
+    def test_validate_snapshot_space_proportion_valid(self):
+        """Test validation accepts valid snapshot_space_proportion values."""
+        for good_value in [0.1, 0.5, 1.0]:
+            config = Config(snapshot_space_proportion=good_value)
+            warnings = config.validate()
+            assert warnings == [], f"Unexpected warning for proportion={good_value}"
+
 
 class TestArchiveConfig:
     """Tests for ArchiveConfig dataclass."""

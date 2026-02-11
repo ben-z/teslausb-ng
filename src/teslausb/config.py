@@ -121,6 +121,12 @@ class Config:
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
 
+        if not (0 < self.snapshot_space_proportion <= 1):
+            warnings.append(
+                f"snapshot_space_proportion must be between 0 and 1, "
+                f"got {self.snapshot_space_proportion}"
+            )
+
         return warnings
 
 
