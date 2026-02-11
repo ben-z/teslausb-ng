@@ -205,6 +205,7 @@ Or export environment variables directly.
 | `ARCHIVE_SENTRYCLIPS` | Archive SentryClips | `true` |
 | `ARCHIVE_RECENTCLIPS` | Archive RecentClips (rolling buffer) | `false` |
 | `ARCHIVE_TRACKMODECLIPS` | Archive TrackMode clips | `true` |
+| `ARCHIVE_PHOTOBOOTH` | Archive Photobooth selfies | `true` |
 
 ---
 

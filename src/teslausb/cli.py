@@ -164,6 +164,7 @@ def create_components(config: Config) -> tuple[
         archive_saved=config.archive.archive_saved,
         archive_sentry=config.archive.archive_sentry,
         archive_track=config.archive.archive_track,
+        archive_photobooth=config.archive.archive_photobooth,
     )
 
     return fs, snapshot_manager, space_manager, archive_manager, backend

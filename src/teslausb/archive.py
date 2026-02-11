@@ -300,6 +300,7 @@ class ArchiveManager:
         "SentryClips": "TeslaCam/SentryClips",
         "RecentClips": "TeslaCam/RecentClips",
         "TrackMode": "TeslaTrackMode",
+        "Photobooth": "Photobooth",
     }
 
     def __init__(
@@ -312,6 +313,7 @@ class ArchiveManager:
         archive_saved: bool = True,
         archive_sentry: bool = True,
         archive_track: bool = True,
+        archive_photobooth: bool = True,
     ):
         """Initialize ArchiveManager.
 
@@ -324,6 +326,7 @@ class ArchiveManager:
             archive_saved: Whether to archive SavedClips
             archive_sentry: Whether to archive SentryClips
             archive_track: Whether to archive TrackMode clips
+            archive_photobooth: Whether to archive Photobooth selfies
         """
         self.fs = fs
         self.snapshot_manager = snapshot_manager
@@ -333,6 +336,7 @@ class ArchiveManager:
         self.archive_saved = archive_saved
         self.archive_sentry = archive_sentry
         self.archive_track = archive_track
+        self.archive_photobooth = archive_photobooth
 
     def _get_dirs_to_archive(self, snapshot_mount: Path) -> list[tuple[Path, str]]:
         """Get list of directories to archive.
@@ -364,6 +368,11 @@ class ArchiveManager:
             path = snapshot_mount / "TeslaTrackMode"
             if self.fs.exists(path):
                 dirs.append((path, "TrackMode"))
+
+        if self.archive_photobooth:
+            path = snapshot_mount / "Photobooth"
+            if self.fs.exists(path):
+                dirs.append((path, "Photobooth"))
 
         return dirs
 

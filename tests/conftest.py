@@ -93,4 +93,9 @@ def mock_fs_with_teslacam(mock_fs: MockFilesystem) -> MockFilesystem:
     fs.mkdir(event2, parents=True)
     fs.write_bytes(event2 / "2024-01-15_11-00-00-front.mp4", b"x" * 600_000)
 
+    # Create Photobooth structure
+    photobooth = snap_dir / "mnt" / "Photobooth"
+    fs.mkdir(photobooth, parents=True)
+    fs.write_bytes(photobooth / "selfie_2025-01-01.png", b"x" * 300_000)
+
     return fs

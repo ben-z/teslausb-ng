@@ -80,11 +80,12 @@ class TestArchiveManager:
         snapshot_mount = Path("/backingfiles/snapshots/snap-000000/mnt")
         dirs = manager._get_dirs_to_archive(snapshot_mount)
 
-        # Should find SavedClips and SentryClips (RecentClips exists but not enabled by default)
-        assert len(dirs) == 2
+        # Should find SavedClips, SentryClips, and Photobooth (RecentClips exists but not enabled by default)
+        assert len(dirs) == 3
         dir_names = [d[1] for d in dirs]
         assert "SavedClips" in dir_names
         assert "SentryClips" in dir_names
+        assert "Photobooth" in dir_names
 
     def test_get_dirs_respects_settings(self, mock_fs_with_teslacam: MockFilesystem):
         """Test that directory selection respects archive settings."""
@@ -105,6 +106,7 @@ class TestArchiveManager:
             archive_sentry=False,
             archive_recent=False,
             archive_track=False,
+            archive_photobooth=False,
         )
 
         snapshot_mount = Path("/backingfiles/snapshots/snap-000000/mnt")
@@ -159,8 +161,8 @@ class TestArchiveManager:
 
             assert result.state == ArchiveState.COMPLETED
             assert result.files_transferred > 0
-            # Should have copied SavedClips and SentryClips
-            assert len(backend.copied_dirs) == 2
+            # Should have copied SavedClips, SentryClips, and Photobooth
+            assert len(backend.copied_dirs) == 3
         finally:
             handle.release()
 
@@ -620,6 +622,44 @@ class TestDeleteArchivedFiles:
         assert deleted == 1
         assert skipped == 0
         assert not fs.exists(Path("/cam_mount/TeslaTrackMode/event1/front.mp4"))
+
+    def test_delete_handles_photobooth(self):
+        """Test deletion from Photobooth directory."""
+        fs = MockFilesystem()
+
+        # Set up Photobooth structure
+        fs.mkdir(Path("/cam_mount/Photobooth"), parents=True)
+        fs.write_text(Path("/cam_mount/Photobooth/selfie_2025-01-01.png"), "x" * 1000)
+
+        fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
+        snapshot_manager = SnapshotManager(
+            fs=fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        manager = ArchiveManager(
+            fs=fs,
+            snapshot_manager=snapshot_manager,
+            backend=MockArchiveBackend(),
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={
+                "Photobooth": [
+                    ArchivedFile(relative_path="selfie_2025-01-01.png", size=1000),
+                ],
+            },
+        )
+
+        deleted, skipped = manager.delete_archived_files(result, Path("/cam_mount"))
+
+        assert deleted == 1
+        assert skipped == 0
+        assert not fs.exists(Path("/cam_mount/Photobooth/selfie_2025-01-01.png"))
 
     def test_delete_ignores_unknown_directory(self):
         """Test that unknown directory names are logged and skipped."""
