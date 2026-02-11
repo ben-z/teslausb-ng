@@ -33,8 +33,6 @@ def format_size(num_bytes: int | float) -> str:
             precision = 0 if value % 1 == 0 else 1
             return f"{value:.{precision}f} {unit}"
         value /= 1024
-    # Unreachable: the loop always returns at "GiB"
-    return f"{value:.1f} GiB"
 
 
 class ArchiveState(Enum):
@@ -450,7 +448,7 @@ class ArchiveManager:
         else:
             result.state = ArchiveState.COMPLETED
 
-        logger.info(f"Archive complete: {total_files} files, {format_size(total_bytes)}")
+        logger.info(f"Archive complete: transferred {total_files} files, {format_size(total_bytes)}")
 
         return result
 
