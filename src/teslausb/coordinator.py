@@ -174,6 +174,8 @@ class Coordinator:
             led.set_pattern(LedPattern.SLOW_BLINK)
         elif state == CoordinatorState.ARCHIVING:
             led.set_pattern(LedPattern.FAST_BLINK)
+        elif state == CoordinatorState.CLEANING:
+            led.set_pattern(LedPattern.HEARTBEAT)
         elif state == CoordinatorState.STOPPED:
             led.set_pattern(LedPattern.OFF)
 
