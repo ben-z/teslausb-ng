@@ -7,10 +7,13 @@ This module provides a protocol for filesystem operations and two implementation
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import logging
 import os
 import shutil
 import subprocess
+import sys
 from abc import ABC, abstractmethod
 
 from dataclasses import dataclass, field
@@ -18,6 +21,25 @@ from pathlib import Path
 from typing import Iterator
 
 logger = logging.getLogger(__name__)
+
+
+def _syncfs(fd: int) -> None:
+    """Flush the filesystem journal so statvfs() returns accurate free space.
+
+    XFS with reflinks defers block freeing via the journal after unlink().
+    syncfs() forces a journal commit so subsequent statvfs() reads see the
+    freed blocks.
+    """
+    if sys.platform != "linux":
+        return
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        return
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    ret = libc.syncfs(fd)
+    if ret != 0:
+        errno = ctypes.get_errno()
+        logger.warning("syncfs() failed with errno %d", errno)
 
 
 @dataclass
@@ -176,11 +198,12 @@ class RealFilesystem(Filesystem):
 
     def statvfs(self, path: Path) -> StatVfsResult:
         try:
-            # XFS lazy superblock counters (sb_lazysbcount) aggregate per-CPU
-            # free block counts on demand. After unlink(), the cached aggregate
-            # is stale. The first statvfs() triggers aggregation; the second
-            # reads the accurate result with a small additional overhead.
-            os.statvfs(path)
+            # Flush the XFS journal so freed blocks are visible to statvfs.
+            fd = os.open(str(path), os.O_RDONLY)
+            try:
+                _syncfs(fd)
+            finally:
+                os.close(fd)
             st = os.statvfs(path)
             return StatVfsResult(
                 block_size=st.f_frsize,
