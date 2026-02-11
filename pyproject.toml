@@ -7,7 +7,7 @@ name = "teslausb"
 version = "2.0.0"
 description = "TeslaUSB Core - Snapshot and Archive Management"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "TeslaUSB Contributors" }
@@ -39,14 +39,14 @@ markers = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
