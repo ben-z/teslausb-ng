@@ -86,10 +86,18 @@ def configure_logging(log_level: str) -> None:
     )
 
 
+DEFAULT_CONFIG_PATH = Path("/etc/teslausb.conf")
+
+
 def load_config(args: argparse.Namespace) -> Config:
-    """Load configuration from file or environment."""
+    """Load configuration from file or environment.
+
+    Priority: --config flag > /etc/teslausb.conf > environment variables.
+    """
     if args.config:
         return load_from_file(Path(args.config))
+    elif DEFAULT_CONFIG_PATH.exists():
+        return load_from_file(DEFAULT_CONFIG_PATH)
     else:
         return load_from_env()
 
@@ -505,6 +513,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     )
 
+    # Create gadget reference for coordinated disable/enable during cleanup.
+    # The gadget is already initialized and enabled by systemd ExecStartPre.
+    gadget = UsbGadget()
+
     coordinator = Coordinator(
         fs=fs,
         snapshot_manager=snapshot_manager,
@@ -515,6 +527,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             mount_fn=mount_image,
             led_controller=led_controller,
             temperature_monitor=temp_monitor,
+            gadget=gadget,
         ),
     )
 
@@ -642,10 +655,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  Total: {space_data['total_gb']} GiB")
             print(f"  Free: {space_data['free_gb']} GiB")
             print(f"  Min free: {space_data['min_free_gb']} GiB")
-            min_free_gb = space_data.get("min_free_gb")
             if space_data["can_snapshot"]:
                 can_snapshot_str = "Yes"
-            elif min_free_gb is None:
+            elif not space_data["min_free_gb"]:
                 can_snapshot_str = "Not initialized (run 'teslausb init' first)"
             else:
                 can_snapshot_str = "NO (need more free space)"
@@ -788,7 +800,6 @@ ExecStartPre=/usr/local/bin/teslausb mount
 ExecStartPre=/usr/local/bin/teslausb gadget on
 ExecStart=/usr/local/bin/teslausb --log-level debug run
 ExecStop=/usr/local/bin/teslausb gadget off
-EnvironmentFile=-/etc/teslausb.conf
 TimeoutStartSec=60
 Restart=always
 RestartSec=10
@@ -887,7 +898,8 @@ def cmd_service(args: argparse.Namespace) -> int:
             print("Run 'teslausb service install' to install")
             return 1
 
-        return _run_cmd(["systemctl", "status", "teslausb.service"])
+        result = _run_cmd(["systemctl", "status", "teslausb.service"])
+        return result.returncode
 
     return 1
 

@@ -102,9 +102,14 @@ class UsbGadget:
         self._udc_path = Path("/sys/class/udc")
 
     def _write(self, path: Path, value: str) -> None:
-        """Write value to a configfs file."""
+        """Write value to a configfs file.
+
+        Appends a newline, matching shell echo behavior. The kernel
+        configfs store handler strips trailing whitespace, and a
+        zero-byte write (empty string without newline) may be ignored.
+        """
         logger.debug(f"Writing '{value}' to {path}")
-        path.write_text(value)
+        path.write_text(value + "\n")
 
     def _read(self, path: Path) -> str:
         """Read value from a configfs file."""

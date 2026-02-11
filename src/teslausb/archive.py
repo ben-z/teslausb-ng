@@ -259,15 +259,10 @@ class RcloneBackend(ArchiveBackend):
 
             for line in output.splitlines():
                 logger.debug(f"rclone: {line}")
-                # Look for transfer stats in output
-                if "Transferred:" in line:
-                    # Parse lines like "Transferred: 5 / 5, 100%, 1.234 MiB/s"
-                    try:
-                        parts = line.split("Transferred:")[1].strip().split(",")
-                        if "/" in parts[0]:
-                            files_transferred = int(parts[0].split("/")[0].strip())
-                    except (IndexError, ValueError):
-                        pass
+                # Count individual file copies (most reliable across rclone versions)
+                # Lines look like: "<6>INFO  : filename.mp4: Copied (new)"
+                if ": Copied (" in line:
+                    files_transferred += 1
 
             if result.returncode != 0:
                 error_msg = output.strip().split("\n")[-1] if output else "Unknown error"
