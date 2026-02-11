@@ -565,43 +565,23 @@ class ArchiveManager:
     def archive_new_snapshot(
         self,
         mount_fn: Callable[[Path], Iterator[Path]],
-        delete_after_archive: bool = True,
     ) -> ArchiveResult:
-        """Create a new snapshot, mount it, archive, and optionally delete archived files.
+        """Create a new snapshot, mount it, and archive.
+
+        File deletion from cam_disk is handled separately by the coordinator,
+        which disables the USB gadget first to prevent FAT corruption.
 
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
-            delete_after_archive: If True and cam_disk_path is set, delete archived
-                files from cam_disk after successful archive.
 
         Returns:
             ArchiveResult with details of the operation
         """
-        from .mount import mount_image
-
         snapshot = self.snapshot_manager.create_snapshot()
         handle = self.snapshot_manager.acquire(snapshot.id)
 
         try:
             with mount_fn(snapshot.image_path) as mount_path:
-                result = self.archive_snapshot(handle, mount_path)
-
-            # Delete archived files from cam_disk if configured and archive succeeded
-            if (
-                delete_after_archive
-                and self.cam_disk_path
-                and result.success
-                and result.archived_files
-            ):
-                logger.info("Deleting archived files from cam_disk...")
-                try:
-                    with mount_image(self.cam_disk_path, readonly=False) as cam_mount:
-                        deleted, skipped = self.delete_archived_files(result, cam_mount)
-                        logger.info(f"Cleanup complete: {deleted} deleted, {skipped} skipped")
-                except Exception as e:
-                    # Don't fail the archive if cleanup fails - files will be re-archived next time
-                    logger.error(f"Failed to delete archived files: {e}")
-
-            return result
+                return self.archive_snapshot(handle, mount_path)
         finally:
             handle.release()

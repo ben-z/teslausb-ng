@@ -276,8 +276,8 @@ class TestGadgetCoordination:
 
         assert mount_called, "Should proceed with deletion when no gadget configured"
 
-    def test_archive_passes_delete_after_archive_false(self, coordinator_with_gadget: Coordinator):
-        """Test that archive_new_snapshot is called with delete_after_archive=False."""
+    def test_archive_called_with_mount_fn(self, coordinator_with_gadget: Coordinator):
+        """Test that archive_new_snapshot receives the configured mount function."""
         success_result = ArchiveResult(
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
@@ -290,8 +290,7 @@ class TestGadgetCoordination:
         coordinator_with_gadget._do_archive_cycle()
 
         coordinator_with_gadget.archive_manager.archive_new_snapshot.assert_called_once_with(
-            mount_fn=mock_mount,
-            delete_after_archive=False,
+            mock_mount,
         )
 
 

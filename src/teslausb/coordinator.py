@@ -242,10 +242,7 @@ class Coordinator:
 
         # Create snapshot and archive (deletion handled separately below)
         try:
-            result = self.archive_manager.archive_new_snapshot(
-                mount_fn=self.config.mount_fn,
-                delete_after_archive=False,
-            )
+            result = self.archive_manager.archive_new_snapshot(self.config.mount_fn)
             self._last_archive = result
             self._archive_count += 1
 
