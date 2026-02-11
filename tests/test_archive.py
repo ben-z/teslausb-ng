@@ -1,6 +1,8 @@
 """Tests for archive management."""
 
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -379,6 +381,24 @@ class TestRcloneBackend:
         by_path = {f.relative_path: f for f in files}
         assert by_path["event1/front.mp4"].size == 1000
         assert by_path["event1/back.mp4"].size == 2000
+
+    def test_bytes_transferred_sums_scanned_file_sizes(self):
+        """Test that bytes_transferred is computed from scanned file sizes."""
+        fs = MockFilesystem()
+        fs.mkdir(Path("/test/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/test/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/SavedClips/event1/back.mp4"), "x" * 2000)
+
+        backend = RcloneBackend(remote="gdrive", fs=fs)
+
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b""
+        )
+        with patch("teslausb.archive.subprocess.run", return_value=fake_result):
+            result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
+
+        assert result.success
+        assert result.bytes_transferred == 3000
 
 
 class TestDeleteArchivedFiles:

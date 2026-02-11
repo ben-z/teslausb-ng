@@ -57,7 +57,6 @@ class CoordinatorState(Enum):
     ARCHIVING = "archiving"
     CLEANING = "cleaning"
     STOPPED = "stopped"
-    ERROR = "error"
 
 
 @dataclass
@@ -138,9 +137,11 @@ class Coordinator:
         self._archive_count = 0
         self._error_count = 0
 
-        # Share stop event with backend if it supports it (for interruptible operations)
+        # Share stop event with backend and idle detector for interruptible waits
         if hasattr(self.backend, 'stop_event'):
             self.backend.stop_event = self._stop_event
+        if self.config.idle_detector and hasattr(self.config.idle_detector, 'stop_event'):
+            self.config.idle_detector.stop_event = self._stop_event
 
     @property
     def state(self) -> CoordinatorState:
@@ -172,6 +173,8 @@ class Coordinator:
             led.set_pattern(LedPattern.SLOW_BLINK)
         elif state == CoordinatorState.ARCHIVING:
             led.set_pattern(LedPattern.FAST_BLINK)
+        elif state == CoordinatorState.CLEANING:
+            led.set_pattern(LedPattern.HEARTBEAT)
         elif state == CoordinatorState.STOPPED:
             led.set_pattern(LedPattern.OFF)
 
@@ -240,10 +243,7 @@ class Coordinator:
 
         # Create snapshot and archive (deletion handled separately below)
         try:
-            result = self.archive_manager.archive_new_snapshot(
-                mount_fn=self.config.mount_fn,
-                delete_after_archive=False,
-            )
+            result = self.archive_manager.archive_new_snapshot(self.config.mount_fn)
             self._last_archive = result
             self._archive_count += 1
 
