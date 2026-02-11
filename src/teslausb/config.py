@@ -130,7 +130,7 @@ def load_from_env() -> Config:
     Reads environment variables:
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
-    - RCLONE_DRIVE, RCLONE_PATH
+    - RCLONE_DRIVE, RCLONE_PATH, RCLONE_FLAGS (space-separated)
 
     Returns:
         Config instance
@@ -150,6 +150,8 @@ def load_from_env() -> Config:
     # rclone settings
     archive.rclone_drive = os.environ.get("RCLONE_DRIVE", "")
     archive.rclone_path = os.environ.get("RCLONE_PATH", "")
+    if flags := os.environ.get("RCLONE_FLAGS"):
+        archive.rclone_flags = flags.split()
 
     # What to archive
     archive.archive_recent = os.environ.get("ARCHIVE_RECENTCLIPS", "false").lower() == "true"

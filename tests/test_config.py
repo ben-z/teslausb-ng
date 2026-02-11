@@ -159,6 +159,32 @@ class TestLoadFromEnv:
             else:
                 os.environ.pop("ARCHIVE_SYSTEM", None)
 
+    def test_load_rclone_flags(self):
+        """Test loading RCLONE_FLAGS from env (space-separated)."""
+        old_value = os.environ.get("RCLONE_FLAGS")
+
+        try:
+            os.environ["RCLONE_FLAGS"] = "--fast-list --transfers 4"
+            config = load_from_env()
+
+            assert config.archive.rclone_flags == ["--fast-list", "--transfers", "4"]
+        finally:
+            if old_value is not None:
+                os.environ["RCLONE_FLAGS"] = old_value
+            else:
+                os.environ.pop("RCLONE_FLAGS", None)
+
+    def test_load_rclone_flags_unset(self):
+        """Test that rclone_flags defaults to empty list when unset."""
+        old_value = os.environ.pop("RCLONE_FLAGS", None)
+
+        try:
+            config = load_from_env()
+            assert config.archive.rclone_flags == []
+        finally:
+            if old_value is not None:
+                os.environ["RCLONE_FLAGS"] = old_value
+
 
 class TestLoadFromFile:
     """Tests for load_from_file function."""
