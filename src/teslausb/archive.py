@@ -33,8 +33,6 @@ def format_size(num_bytes: int | float) -> str:
             precision = 0 if value % 1 == 0 else 1
             return f"{value:.{precision}f} {unit}"
         value /= 1000
-    # Unreachable: the loop always returns at "GB"
-    return f"{value:.1f} GB"
 
 
 class ArchiveState(Enum):
