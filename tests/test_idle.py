@@ -1,5 +1,6 @@
 """Tests for idle detection."""
 
+from threading import Event
 from unittest.mock import patch
 
 import pytest
@@ -193,6 +194,28 @@ class TestProcIdleDetector:
 
         assert result is True
         assert detector._state == IdleState.IDLE
+
+    def test_stop_event_interrupts_wait(self, tmp_path):
+        """Test that setting stop_event causes wait_for_idle to return False promptly."""
+        proc_dir = tmp_path / "1234"
+        proc_dir.mkdir()
+        (proc_dir / "comm").write_text("file-storage\n")
+
+        stop = Event()
+        stop.set()  # Already signaled — should return False on first iteration
+
+        detector = ProcIdleDetector(proc_path=tmp_path, stop_event=stop)
+        result = detector.wait_for_idle(timeout=30)
+
+        assert result is False
+
+    def test_no_stop_event_still_works(self, tmp_path):
+        """Test that ProcIdleDetector works without a stop_event (backwards compat)."""
+        detector = ProcIdleDetector(proc_path=tmp_path)
+
+        # No process → immediate idle, even without stop_event
+        result = detector.wait_for_idle(timeout=2)
+        assert result is True
 
     def test_get_status_initial(self, tmp_path):
         """Test initial status."""

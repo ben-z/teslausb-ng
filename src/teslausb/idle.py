@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -80,15 +81,19 @@ class ProcIdleDetector:
         self,
         proc_path: Path = Path("/proc"),
         process_name: str = "file-storage",
+        stop_event: Event | None = None,
     ):
         """Initialize the idle detector.
 
         Args:
             proc_path: Path to /proc filesystem
             process_name: Name of the mass storage process to monitor
+            stop_event: Optional threading event for interruptible waits.
+                        When set, wait_for_idle returns False immediately.
         """
         self.proc_path = proc_path
         self.process_name = process_name
+        self.stop_event = stop_event
         self._state = IdleState.UNDETERMINED
         self._prev_written = -1
         self._burst_size = 0
@@ -161,7 +166,12 @@ class ProcIdleDetector:
 
         start_time = time.monotonic()
         while (time.monotonic() - start_time) < timeout:
-            time.sleep(1)
+            if self.stop_event:
+                if self.stop_event.wait(timeout=1):
+                    logger.info("Stop requested, aborting idle wait")
+                    return False
+            else:
+                time.sleep(1)
 
             pid = self._find_process_pid()
             if pid is None:

@@ -138,9 +138,11 @@ class Coordinator:
         self._archive_count = 0
         self._error_count = 0
 
-        # Share stop event with backend if it supports it (for interruptible operations)
+        # Share stop event with backend and idle detector for interruptible waits
         if hasattr(self.backend, 'stop_event'):
             self.backend.stop_event = self._stop_event
+        if self.config.idle_detector and hasattr(self.config.idle_detector, 'stop_event'):
+            self.config.idle_detector.stop_event = self._stop_event
 
     @property
     def state(self) -> CoordinatorState:
