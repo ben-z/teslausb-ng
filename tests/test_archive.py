@@ -628,8 +628,8 @@ class TestDeleteArchivedFiles:
         fs = MockFilesystem()
 
         # Set up Photobooth structure
-        fs.mkdir(Path("/cam_mount/Photobooth"), parents=True)
-        fs.write_text(Path("/cam_mount/Photobooth/selfie_2025-01-01.png"), "x" * 1000)
+        fs.mkdir(Path("/cam_mount/TeslaCam/Photobooth"), parents=True)
+        fs.write_text(Path("/cam_mount/TeslaCam/Photobooth/selfie_2025-01-01.png"), "x" * 1000)
 
         fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
         snapshot_manager = SnapshotManager(
@@ -659,7 +659,7 @@ class TestDeleteArchivedFiles:
 
         assert deleted == 1
         assert skipped == 0
-        assert not fs.exists(Path("/cam_mount/Photobooth/selfie_2025-01-01.png"))
+        assert not fs.exists(Path("/cam_mount/TeslaCam/Photobooth/selfie_2025-01-01.png"))
 
     def test_delete_ignores_unknown_directory(self):
         """Test that unknown directory names are logged and skipped."""

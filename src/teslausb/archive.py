@@ -311,8 +311,8 @@ class ArchiveManager:
         "SavedClips": "TeslaCam/SavedClips",
         "SentryClips": "TeslaCam/SentryClips",
         "RecentClips": "TeslaCam/RecentClips",
+        "Photobooth": "TeslaCam/Photobooth",
         "TrackMode": "TeslaTrackMode",
-        "Photobooth": "Photobooth",
     }
 
     def __init__(
@@ -382,7 +382,7 @@ class ArchiveManager:
                 dirs.append((path, "TrackMode"))
 
         if self.archive_photobooth:
-            path = snapshot_mount / "Photobooth"
+            path = snapshot_mount / "TeslaCam" / "Photobooth"
             if self.fs.exists(path):
                 dirs.append((path, "Photobooth"))
 
