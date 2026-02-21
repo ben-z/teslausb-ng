@@ -9,10 +9,7 @@ import pytest
 from teslausb.archive import MockArchiveBackend
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
-from teslausb.space import SpaceManager
-
-GB = 1024 * 1024 * 1024
-MB = 1024 * 1024
+from teslausb.space import GB, SpaceManager
 
 
 @pytest.fixture
@@ -46,13 +43,11 @@ def snapshot_manager(mock_fs: MockFilesystem) -> SnapshotManager:
 
 
 @pytest.fixture
-def space_manager(mock_fs: MockFilesystem, snapshot_manager: SnapshotManager) -> SpaceManager:
+def space_manager(mock_fs: MockFilesystem) -> SpaceManager:
     """Create a SpaceManager with mock filesystem."""
     return SpaceManager(
         fs=mock_fs,
-        snapshot_manager=snapshot_manager,
         backingfiles_path=Path("/backingfiles"),
-        min_free_threshold=40 * GB,
     )
 
 

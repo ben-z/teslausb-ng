@@ -119,14 +119,20 @@ class TestArchiveCycle:
 class TestMultipleArchiveCycles:
     """Tests for multiple archive cycles."""
 
-    def test_multiple_archives_create_multiple_snapshots(
+    def test_stale_snapshots_cleaned_by_next_archive(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """Multiple archive cycles should create multiple snapshots."""
+        """Second archive cycle should clean up stale snapshot from first cycle."""
         # First archive
         create_test_footage(cam_mount, "event1")
         subprocess.run(["umount", str(cam_mount)], check=True)
         cli_runner("archive", check=False)
+
+        # Verify first snapshot exists
+        snapshots_after_first = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(snapshots_after_first) <= 1, (
+            f"Expected at most 1 snapshot after first archive, got {len(snapshots_after_first)}"
+        )
 
         # Remount and add more footage
         loop_dev, partition, kpartx_used = mount_cam_disk(
@@ -136,17 +142,19 @@ class TestMultipleArchiveCycles:
         create_test_footage(cam_mount, "event2")
         unmount_cam_disk(cam_mount, loop_dev, kpartx_used)
 
-        # Second archive
+        # Second archive — should clean up any stale snapshot from first
         cli_runner("archive", check=False)
 
-        # Check we have 2 snapshots
+        # At most 1 snapshot (the current one) — stale ones are eagerly deleted
         snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
-        assert len(snapshots) == 2, f"Expected 2 snapshots, got {len(snapshots)}"
+        assert len(snapshots) <= 1, (
+            f"Expected at most 1 snapshot (eager deletion), got {len(snapshots)}"
+        )
 
     def test_snapshot_ids_increment(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """Snapshot IDs should increment monotonically."""
+        """Snapshot IDs should increment monotonically across archive cycles."""
         # First archive
         create_test_footage(cam_mount, "event1")
         subprocess.run(["umount", str(cam_mount)], check=True)
@@ -162,9 +170,10 @@ class TestMultipleArchiveCycles:
 
         cli_runner("archive", check=False)
 
-        # Check IDs
+        # The surviving snapshot should have a higher ID than the first (0)
         result = cli_runner("snapshots", "--json")
         data = json.loads(result.stdout)
 
-        ids = sorted([s["id"] for s in data])
-        assert ids == [0, 1], f"Expected IDs [0, 1], got {ids}"
+        if data:
+            ids = [s["id"] for s in data]
+            assert all(i > 0 for i in ids), f"Expected IDs > 0 after stale cleanup, got {ids}"

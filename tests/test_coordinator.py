@@ -1,5 +1,6 @@
 """Tests for coordinator behavior."""
 
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -89,51 +90,148 @@ def coordinator_with_gadget(
     )
 
 
-class TestCoordinatorCleanup:
-    """Tests for coordinator cleanup behavior.
+class TestStaleSnapshotCleanup:
+    """Tests for eager stale snapshot deletion at start of archive cycle."""
 
-    These tests verify that cleanup_if_needed is always called at the end
-    of an archive cycle, regardless of success or failure. This prevents
-    orphaned snapshots from accumulating and filling up space.
-    """
+    def test_stale_snapshots_deleted_before_archive(self, coordinator: Coordinator):
+        """Test that stale snapshots are deleted before creating a new one."""
+        # Create two stale snapshots (not locked)
+        coordinator.snapshot_manager.create_snapshot()
+        coordinator.snapshot_manager.create_snapshot()
+        assert len(coordinator.snapshot_manager.get_snapshots()) == 2
 
-    def test_cleanup_called_on_archive_failure(self, coordinator: Coordinator):
-        """Test that cleanup is called even when archive throws an exception.
-
-        This is the critical case - if archive fails repeatedly, we must
-        still clean up or orphaned snapshots will fill the disk.
-        """
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            side_effect=Exception("Simulated archive failure")
-        )
-        coordinator.space_manager.cleanup_if_needed = MagicMock(
-            wraps=coordinator.space_manager.cleanup_if_needed
-        )
-
-        result = coordinator._do_archive_cycle()
-
-        assert result is False, "Archive cycle should return False on failure"
-        coordinator.space_manager.cleanup_if_needed.assert_called()
-
-    def test_cleanup_called_on_archive_success(self, coordinator: Coordinator):
-        """Test that cleanup is called after successful archive."""
         success_result = ArchiveResult(
-            snapshot_id=1,
+            snapshot_id=3,
             state=ArchiveState.COMPLETED,
-            files_transferred=10,
-            bytes_transferred=10000,
+            files_transferred=0,
         )
         coordinator.archive_manager.archive_new_snapshot = MagicMock(
             return_value=success_result
         )
-        coordinator.space_manager.cleanup_if_needed = MagicMock(
-            wraps=coordinator.space_manager.cleanup_if_needed
+
+        coordinator._do_archive_cycle()
+
+        # Both stale snapshots should be deleted before archive_new_snapshot was called
+        # (archive_new_snapshot creates snap 3, which is then deleted post-archive)
+        # At the end, no snapshots should remain
+        assert len(coordinator.snapshot_manager.get_snapshots()) == 0
+
+    def test_stale_snapshot_cleanup_logs_error(self, coordinator: Coordinator, caplog):
+        """Test that stale snapshot cleanup logs at error level."""
+        coordinator.snapshot_manager.create_snapshot()
+
+        success_result = ArchiveResult(
+            snapshot_id=2,
+            state=ArchiveState.COMPLETED,
+            files_transferred=0,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+
+        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+            coordinator._do_archive_cycle()
+
+        assert any("stale snapshot" in r.message.lower() for r in caplog.records)
+
+    def test_no_log_when_zero_stale_snapshots(self, coordinator: Coordinator, caplog):
+        """Test that no stale snapshot log is emitted when there are none."""
+        success_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            files_transferred=0,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+
+        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+            coordinator._do_archive_cycle()
+
+        assert not any("stale snapshot" in r.message.lower() for r in caplog.records)
+
+
+class TestPostArchiveSnapshotDeletion:
+    """Tests for snapshot deletion after archive + cam_disk cleanup."""
+
+    def test_snapshot_deleted_after_successful_archive(self, coordinator: Coordinator):
+        """Test that the archive snapshot is deleted after a successful cycle."""
+        success_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            files_transferred=5,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+        coordinator.snapshot_manager.delete_snapshot = MagicMock()
+
+        coordinator._do_archive_cycle()
+
+        coordinator.snapshot_manager.delete_snapshot.assert_called_with(1)
+
+    def test_snapshot_deletion_failure_does_not_fail_cycle(self, coordinator: Coordinator):
+        """Test that cycle succeeds even if post-archive snapshot deletion fails."""
+        success_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            files_transferred=5,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+        coordinator.snapshot_manager.delete_snapshot = MagicMock(
+            side_effect=Exception("deletion failed")
         )
 
         result = coordinator._do_archive_cycle()
+        assert result is True
 
-        assert result is True, "Archive cycle should return True on success"
-        coordinator.space_manager.cleanup_if_needed.assert_called()
+    def test_no_deletion_when_snapshot_id_none(self, coordinator: Coordinator):
+        """Test that no deletion is attempted when snapshot_id is None."""
+        result_no_snap = ArchiveResult(
+            snapshot_id=None,
+            state=ArchiveState.COMPLETED,
+            files_transferred=0,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=result_no_snap
+        )
+        coordinator.snapshot_manager.delete_snapshot = MagicMock()
+
+        coordinator._do_archive_cycle()
+
+        coordinator.snapshot_manager.delete_snapshot.assert_not_called()
+
+    def test_snapshot_still_deleted_after_failed_archive(self, coordinator: Coordinator):
+        """Test that post-archive deletion runs even for FAILED archives."""
+        failed_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.FAILED,
+            files_transferred=0,
+            error="rclone connection error",
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=failed_result
+        )
+        coordinator.snapshot_manager.delete_snapshot = MagicMock()
+
+        coordinator._do_archive_cycle()
+
+        coordinator.snapshot_manager.delete_snapshot.assert_called_with(1)
+
+
+class TestArchiveCycleFailure:
+    """Tests for archive cycle failure handling."""
+
+    def test_returns_false_on_archive_exception(self, coordinator: Coordinator):
+        """Test that archive cycle returns False when archive throws."""
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            side_effect=Exception("Simulated archive failure")
+        )
+
+        result = coordinator._do_archive_cycle()
+        assert result is False
 
 
 class TestGadgetCoordination:
@@ -437,3 +535,70 @@ class TestRunLoopBackoff:
         # Cycle 2: FAILED + 0 files -> not success, so reset backoff -> poll_interval 5s
         # Cycle 3: success + 0 files -> fresh backoff (reset by cycle 2) -> 5s
         assert wait_delays == [5.0, 5.0, 5.0]
+
+
+class TestStartupCamDiskSizeCheck:
+    """Tests for the cam_disk size check at startup."""
+
+    def _run_startup_only(self, coordinator: Coordinator) -> None:
+        """Run coordinator but stop immediately when it reaches the main loop."""
+        # Make archive unreachable and interrupt the wait to exit cleanly
+        coordinator.backend.reachable = False
+        original_wait = coordinator._wait_interruptible
+
+        def stop_on_first_wait(seconds: float) -> bool:
+            coordinator.stop()
+            return False
+
+        coordinator._wait_interruptible = stop_on_first_wait
+        coordinator.run()
+
+    def test_logs_error_when_cam_disk_exceeds_half(
+        self, mock_fs: MockFilesystem, snapshot_manager, space_manager,
+        mock_backend, caplog,
+    ):
+        """Test that run() logs error when cam_disk > 50% of backing store."""
+        # cam_disk.bin is 21 bytes (from fixture), total space 256 GiB
+        # We need cam_disk > 50% of total, so set total space small
+        mock_fs.set_total_space(20)  # 20 bytes total — cam_disk (21 bytes) > 50%
+
+        archive_manager = ArchiveManager(
+            fs=mock_fs,
+            snapshot_manager=snapshot_manager,
+            backend=mock_backend,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+        )
+
+        coordinator = Coordinator(
+            fs=mock_fs,
+            snapshot_manager=snapshot_manager,
+            archive_manager=archive_manager,
+            space_manager=space_manager,
+            backend=mock_backend,
+            config=CoordinatorConfig(mount_fn=mock_mount),
+        )
+
+        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+            self._run_startup_only(coordinator)
+
+        assert any("exceeds 50%" in r.message for r in caplog.records)
+
+    def test_no_error_when_cam_disk_within_budget(
+        self, coordinator: Coordinator, caplog,
+    ):
+        """Test that no error is logged when cam_disk is within budget."""
+        # Default fixture: cam_disk is 21 bytes, total space 256 GiB — well within 50%
+        coordinator.archive_manager.cam_disk_path = Path("/backingfiles/cam_disk.bin")
+
+        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+            self._run_startup_only(coordinator)
+
+        assert not any("exceeds 50%" in r.message for r in caplog.records)
+
+    def test_no_error_when_no_cam_disk(self, coordinator: Coordinator, caplog):
+        """Test that no error is logged when cam_disk_path is not set."""
+        # archive_manager.cam_disk_path defaults to None
+        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+            self._run_startup_only(coordinator)
+
+        assert not any("exceeds 50%" in r.message for r in caplog.records)

@@ -76,11 +76,15 @@ while running:
     wait_for_archive_reachable()
     wait_for_idle()
 
-    space_manager.ensure_space_for_snapshot()
+    # Delete all stale snapshots from previous runs
+    while snapshot_manager.delete_oldest_if_deletable():
+        pass
+
     with snapshot_manager.snapshot_session() as handle:
         archive_manager.archive_snapshot(handle, mount_path)
 
-    space_manager.cleanup_if_needed()
+    # Delete snapshot immediately after archiving
+    snapshot_manager.delete_snapshot(handle.snapshot_id)
 ```
 
 Archives continuously while WiFi is available. Idle detection gates each cycle.
@@ -117,11 +121,10 @@ Example with 128 GiB SD card:
 - backingfiles.img = 118 GiB
 - XFS overhead = 3.5 GiB (3%)
 - cam_size = 57 GiB
-- min_free_threshold = 28.5 GiB (50% of cam_size by default)
 
-**Key invariant**: Always maintain at least `min_free_threshold` (default 50% of `cam_size`) free space so the next snapshot is guaranteed to succeed.
+**Key invariant**: Since `cam_size` is at most half the XFS volume, eagerly deleting all stale snapshots before creating a new one guarantees enough space — even under worst-case COW divergence where every block changes.
 
 - Snapshots use XFS reflinks (copy-on-write), so they start small
 - Worst case: snapshot grows to full `cam_size` if all blocks change during archiving
-- The threshold is configurable via `SNAPSHOT_SPACE_PROPORTION` (default 0.5) because worst-case 100% COW copy is unrealistic
-- Cleanup deletes oldest snapshots until `free_space >= min_free_threshold`
+- Eager deletion strategy: delete all stale snapshots before each archive cycle, and delete the current snapshot immediately after archiving
+- No threshold checks needed — the half-volume sizing guarantee is sufficient
