@@ -41,8 +41,9 @@ def xfs_volume(tmp_path: Path):
     # 200 MB — large enough for meaningful COW testing, small enough to be fast
     total_bytes = 200 * MB
 
-    _sh(["truncate", "-s", str(total_bytes), str(img)])
-    result = _sh(["mkfs.xfs", "-f", str(img)])
+    result = _sh(["truncate", "-s", str(total_bytes), str(img)])
+    assert result.returncode == 0, f"truncate failed: {result.stderr}"
+    result = _sh(["mkfs.xfs", "-f", "-m", "reflink=1", str(img)])
     assert result.returncode == 0, f"mkfs.xfs failed: {result.stderr}"
 
     result = _sh(["mount", "-o", "loop", str(img), str(mount_path)])

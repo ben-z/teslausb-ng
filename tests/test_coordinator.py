@@ -591,7 +591,6 @@ class TestStartupCamDiskSizeCheck:
         """Run coordinator but stop immediately when it reaches the main loop."""
         # Make archive unreachable and interrupt the wait to exit cleanly
         coordinator.backend.reachable = False
-        original_wait = coordinator._wait_interruptible
 
         def stop_on_first_wait(seconds: float) -> bool:
             coordinator.stop()

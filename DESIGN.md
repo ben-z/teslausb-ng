@@ -84,7 +84,7 @@ while running:
         archive_manager.archive_snapshot(handle, mount_path)
 
     # Delete snapshot immediately after archiving
-    snapshot_manager.delete_snapshot(handle.snapshot_id)
+    snapshot_manager.delete_snapshot(handle.snapshot.id)
 ```
 
 Archives continuously while WiFi is available. Idle detection gates each cycle.
