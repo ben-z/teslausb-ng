@@ -223,8 +223,20 @@ class Coordinator:
         stale = 0
         while self.snapshot_manager.delete_oldest_if_deletable():
             stale += 1
-        if stale:
-            logger.error(f"Deleted {stale} stale snapshot(s) from a previous run")
+        if stale == 1:
+            # One stale snapshot is expected after an unclean shutdown —
+            # the post-archive deletion didn't run.
+            logger.warning(
+                "Deleted 1 stale snapshot (likely unclean shutdown)"
+            )
+        elif stale > 1:
+            # With eager deletion, at most 1 snapshot should ever exist.
+            # Multiple stale snapshots indicate a bug or first run after
+            # upgrading from the old threshold-based cleanup.
+            logger.error(
+                f"Deleted {stale} stale snapshots — expected at most 1. "
+                f"This may indicate a bug in snapshot lifecycle management."
+            )
 
         # Wait for car to stop writing (if idle detector configured)
         if self.config.idle_detector:
@@ -266,8 +278,11 @@ class Coordinator:
             if result.snapshot_id is not None:
                 try:
                     self.snapshot_manager.delete_snapshot(result.snapshot_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete snapshot {result.snapshot_id} "
+                        f"after archive: {e} (will retry next cycle)"
+                    )
 
             # Notify archive complete
             if self.config.on_archive_complete:

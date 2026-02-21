@@ -577,6 +577,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         try:
             snapshots = snapshot_manager.get_snapshots()
             deletable_count = len(snapshot_manager.get_deletable_snapshots())
+            if deletable_count > 0:
+                warnings.append(
+                    f"{deletable_count} stale snapshot(s) found "
+                    f"(run 'teslausb clean' or wait for next archive cycle)"
+                )
         except Exception:
             pass
 

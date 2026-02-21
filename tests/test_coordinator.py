@@ -116,8 +116,8 @@ class TestStaleSnapshotCleanup:
         # At the end, no snapshots should remain
         assert len(coordinator.snapshot_manager.get_snapshots()) == 0
 
-    def test_stale_snapshot_cleanup_logs_error(self, coordinator: Coordinator, caplog):
-        """Test that stale snapshot cleanup logs at error level."""
+    def test_one_stale_snapshot_logs_warning(self, coordinator: Coordinator, caplog):
+        """One stale snapshot logs a warning (likely unclean shutdown)."""
         coordinator.snapshot_manager.create_snapshot()
 
         success_result = ArchiveResult(
@@ -129,13 +129,38 @@ class TestStaleSnapshotCleanup:
             return_value=success_result
         )
 
-        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
 
-        assert any("stale snapshot" in r.message.lower() for r in caplog.records)
+        stale_records = [r for r in caplog.records if "stale snapshot" in r.message.lower()]
+        assert len(stale_records) == 1
+        assert stale_records[0].levelno == logging.WARNING
+        assert "unclean shutdown" in stale_records[0].message
+
+    def test_multiple_stale_snapshots_logs_error(self, coordinator: Coordinator, caplog):
+        """Two+ stale snapshots logs an error (indicates a bug)."""
+        coordinator.snapshot_manager.create_snapshot()
+        coordinator.snapshot_manager.create_snapshot()
+
+        success_result = ArchiveResult(
+            snapshot_id=3,
+            state=ArchiveState.COMPLETED,
+            files_transferred=0,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+
+        with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
+            coordinator._do_archive_cycle()
+
+        stale_records = [r for r in caplog.records if "stale snapshot" in r.message.lower()]
+        assert len(stale_records) == 1
+        assert stale_records[0].levelno == logging.ERROR
+        assert "bug" in stale_records[0].message
 
     def test_no_log_when_zero_stale_snapshots(self, coordinator: Coordinator, caplog):
-        """Test that no stale snapshot log is emitted when there are none."""
+        """No stale snapshot log when there are none."""
         success_result = ArchiveResult(
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
@@ -145,7 +170,7 @@ class TestStaleSnapshotCleanup:
             return_value=success_result
         )
 
-        with caplog.at_level(logging.ERROR, logger="teslausb.coordinator"):
+        with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
 
         assert not any("stale snapshot" in r.message.lower() for r in caplog.records)
@@ -186,6 +211,28 @@ class TestPostArchiveSnapshotDeletion:
 
         result = coordinator._do_archive_cycle()
         assert result is True
+
+    def test_snapshot_deletion_failure_logs_warning(self, coordinator: Coordinator, caplog):
+        """Test that failed post-archive deletion logs a warning."""
+        success_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            files_transferred=5,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+        coordinator.snapshot_manager.delete_snapshot = MagicMock(
+            side_effect=Exception("permission denied")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
+            coordinator._do_archive_cycle()
+
+        warning_records = [r for r in caplog.records if "failed to delete snapshot" in r.message.lower()]
+        assert len(warning_records) == 1
+        assert "permission denied" in warning_records[0].message
+        assert "will retry next cycle" in warning_records[0].message
 
     def test_no_deletion_when_snapshot_id_none(self, coordinator: Coordinator):
         """Test that no deletion is attempted when snapshot_id is None."""
