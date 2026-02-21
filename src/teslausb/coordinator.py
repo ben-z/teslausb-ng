@@ -2,15 +2,11 @@
 
 This module provides the Coordinator class that orchestrates:
 - Waiting for archive connectivity
-- Taking snapshots
+- Idle detection (optional)
+- Snapshot lifecycle (create, archive, eager delete)
 - Archiving footage
-- Managing disk space
-- Cleanup
 - LED status indication
 - Temperature monitoring
-- Idle detection
-
-This replaces the bash archiveloop script with a cleaner implementation.
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ from .filesystem import Filesystem
 from .idle import IdleDetector
 from .led import LedController, LedPattern
 from .snapshot import SnapshotManager
-from .space import SpaceManager
+from .space import GB, SpaceManager
 from .temperature import TemperatureMonitor
 
 logger = logging.getLogger(__name__)
@@ -55,7 +51,6 @@ class CoordinatorState(Enum):
     STARTING = "starting"
     WAITING_FOR_ARCHIVE = "waiting_for_archive"
     ARCHIVING = "archiving"
-    CLEANING = "cleaning"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -92,16 +87,16 @@ class Coordinator:
 
     The main loop:
     1. Wait for archive to become reachable (WiFi connected, server up)
-    2. Wait for car to stop writing (idle detection)
-    3. Take snapshot and archive
-    4. Disable gadget, delete archived files from cam_disk, re-enable gadget
-    5. Clean up old snapshots if needed
-    6. Repeat
+    2. Delete all stale snapshots (eager cleanup)
+    3. Wait for car to stop writing (idle detection, if configured)
+    4. Take snapshot and archive
+    5. Disable gadget, delete archived files from cam_disk, re-enable gadget
+    6. Delete the snapshot
+    7. Repeat
 
     This design ensures:
+    - At most one snapshot exists at any time (eager deletion)
     - Snapshots are only taken when we're about to archive
-    - Snapshots are locked during archiving (can't be deleted)
-    - Space cleanup only deletes unreferenced snapshots
     - cam_disk.bin is never mounted while the gadget is active
     - Clean shutdown on SIGTERM/SIGINT
     """
@@ -207,29 +202,43 @@ class Coordinator:
     def _do_archive_cycle(self) -> bool:
         """Perform one archive cycle.
 
-        1. Wait for idle (car stops writing)
-        2. Ensure space is available
+        1. Delete all stale snapshots from previous runs
+        2. Wait for idle (car stops writing)
         3. Take snapshot and archive (safe - reads from snapshot only)
         4. Disable gadget, delete archived files from cam_disk, re-enable gadget
-        5. Clean up old snapshots if needed
+        5. Delete the snapshot
 
         Returns:
             True if successful, False on error or stop
         """
         self._set_state(CoordinatorState.ARCHIVING)
 
+        # Delete all stale snapshots before creating a new one.
+        # Snapshots pin COW blocks — the car keeps writing via the USB gadget,
+        # and old snapshots prevent XFS from reclaiming space.
+        stale = 0
+        while self.snapshot_manager.delete_oldest_if_deletable():
+            stale += 1
+        if stale == 1:
+            # One stale snapshot is expected after an unclean shutdown —
+            # the post-archive deletion didn't run.
+            logger.warning(
+                "Deleted 1 stale snapshot (likely unclean shutdown)"
+            )
+        elif stale > 1:
+            # With eager deletion, at most 1 snapshot should ever exist.
+            # Multiple stale snapshots indicate a bug or first run after
+            # upgrading from the old threshold-based cleanup.
+            logger.error(
+                f"Deleted {stale} stale snapshots — expected at most 1. "
+                f"This may indicate a bug in snapshot lifecycle management."
+            )
+
         # Wait for car to stop writing (if idle detector configured)
         if self.config.idle_detector:
             logger.info("Waiting for car to become idle...")
             if not self.config.idle_detector.wait_for_idle(self.config.idle_timeout):
                 logger.warning("Timeout waiting for idle, proceeding anyway")
-
-        # Ensure space for snapshot
-        if not self.space_manager.ensure_space_for_snapshot():
-            logger.error("Cannot ensure space for snapshot")
-            if self.config.on_error:
-                self.config.on_error("Cannot ensure space for snapshot")
-            return False
 
         # Notify archive start
         if self.config.on_archive_start:
@@ -260,6 +269,17 @@ class Coordinator:
                 logger.warning(f"Archive cycle {self._archive_count} had issues: {result.error}")
                 self._error_count += 1
 
+            # Delete the snapshot now that archiving and cam_disk cleanup are done.
+            # If this fails, start-of-cycle cleanup will handle it next time.
+            if result.snapshot_id is not None:
+                try:
+                    self.snapshot_manager.delete_snapshot(result.snapshot_id)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete snapshot {result.snapshot_id} "
+                        f"after archive: {e} (will retry next cycle)"
+                    )
+
             # Notify archive complete
             if self.config.on_archive_complete:
                 try:
@@ -273,11 +293,6 @@ class Coordinator:
             if self.config.on_error:
                 self.config.on_error(str(e))
             return False
-        finally:
-            # Always clean up old snapshots, even after failure
-            # This prevents orphaned snapshots from filling up space
-            self._set_state(CoordinatorState.CLEANING)
-            self.space_manager.cleanup_if_needed()
 
         return True
 
@@ -369,6 +384,17 @@ class Coordinator:
         try:
             logger.info("Coordinator starting")
 
+            cam_disk = self.archive_manager.cam_disk_path
+            if cam_disk and self.fs.exists(cam_disk):
+                cam_size = self.fs.stat(cam_disk).size
+                space = self.space_manager.get_space_info()
+                if cam_size > space.total_bytes * 0.50:
+                    logger.error(
+                        f"cam_disk.bin ({cam_size / GB:.1f} GiB) exceeds 50% of "
+                        f"backing store ({space.total_gb:.1f} GiB) — snapshot COW "
+                        f"may exhaust XFS space"
+                    )
+
             def new_idle_backoff() -> Iterator[float]:
                 return _backoff_intervals(self.config.poll_interval, self.config.max_idle_interval)
 
@@ -434,8 +460,6 @@ class Coordinator:
             "space": {
                 "free_gb": space_info.free_gb,
                 "total_gb": space_info.total_gb,
-                "min_free_gb": space_info.min_free_gb,
-                "can_snapshot": space_info.can_snapshot,
             },
             "snapshots": {
                 "count": len(snapshots),

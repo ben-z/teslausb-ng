@@ -1,31 +1,24 @@
 """Space management for TeslaUSB.
 
 This module provides:
-- SpaceManager: Monitors disk space and coordinates cleanup
+- SpaceManager: Monitors disk space
+- SpaceInfo: Disk space usage information
+- calculate_cam_size: Calculate cam disk size from backingfiles size
 
 Space model:
 - backingfiles.img = available_disk - RESERVE
 - cam_size = (backingfiles - 3% overhead) / 2
 - Snapshots use XFS reflinks (copy-on-write), so they start small but can grow
-- Worst case: a snapshot grows to full cam_size (if all blocks change)
-- To allow the next snapshot to succeed, we maintain min_free_threshold free space
-  (configurable, defaults to 50% of cam_size as a safety margin)
-
-Cleanup strategy:
-- Delete oldest snapshots until free_space >= min_free_threshold
-- This provides a safety margin while not being overly conservative
+- cam_disk uses at most half the XFS volume, so proactive snapshot deletion
+  after each archive cycle guarantees enough space without threshold checks
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from .filesystem import Filesystem
-from .snapshot import SnapshotManager
-
-logger = logging.getLogger(__name__)
 
 # Constants
 GB = 1024 * 1024 * 1024
@@ -70,7 +63,6 @@ class SpaceInfo:
     total_bytes: int
     free_bytes: int
     used_bytes: int
-    min_free_threshold: int
 
     @property
     def total_gb(self) -> float:
@@ -84,60 +76,26 @@ class SpaceInfo:
     def used_gb(self) -> float:
         return self.used_bytes / GB
 
-    @property
-    def min_free_gb(self) -> float:
-        return self.min_free_threshold / GB
-
-    @property
-    def can_snapshot(self) -> bool:
-        """Whether there's enough free space for a new snapshot.
-
-        A snapshot can grow significantly in the worst case (if many blocks
-        change while archiving). We need at least min_free_threshold free to be safe.
-        A non-positive threshold indicates the system is not initialized
-        for snapshots, so this will return False in that case.
-        """
-        if self.min_free_threshold <= 0:
-            return False
-        return self.free_bytes >= self.min_free_threshold
-
     def __str__(self) -> str:
-        status = "OK" if self.can_snapshot else "LOW"
-        return (
-            f"Space: {self.free_gb:.1f} GiB free / {self.total_gb:.1f} GiB total "
-            f"(need {self.min_free_gb:.1f} GiB for snapshot) [{status}]"
-        )
+        return f"Space: {self.free_gb:.1f} GiB free / {self.total_gb:.1f} GiB total"
 
 
 class SpaceManager:
-    """Manages disk space and coordinates cleanup.
-
-    The key invariant: always maintain min_free_threshold free space so the next
-    snapshot is guaranteed to succeed (worst case = full COW copy).
-    """
+    """Monitors disk space on the backingfiles volume."""
 
     def __init__(
         self,
         fs: Filesystem,
-        snapshot_manager: SnapshotManager,
         backingfiles_path: Path,
-        min_free_threshold: int,
     ):
         """Initialize SpaceManager.
 
         Args:
             fs: Filesystem abstraction
-            snapshot_manager: SnapshotManager instance
             backingfiles_path: Path to backingfiles directory
-            min_free_threshold: Minimum free space required before creating a snapshot
         """
         self.fs = fs
-        self.snapshot_manager = snapshot_manager
         self.backingfiles_path = backingfiles_path
-        self.min_free_threshold = min_free_threshold
-
-        if min_free_threshold <= 0:
-            logger.warning("SpaceManager created with min_free_threshold=%d (system may not be initialized)", min_free_threshold)
 
     def get_space_info(self) -> SpaceInfo:
         """Get current space information."""
@@ -151,45 +109,4 @@ class SpaceManager:
             total_bytes=total,
             free_bytes=free,
             used_bytes=used,
-            min_free_threshold=self.min_free_threshold,
         )
-
-    def cleanup_if_needed(self) -> bool:
-        """Clean up old snapshots if space is low.
-
-        Deletes oldest deletable snapshots until free_space >= min_free_threshold.
-
-        Returns:
-            True if space is now sufficient (can_snapshot), False if still low
-        """
-        info = self.get_space_info()
-
-        while not info.can_snapshot:
-            logger.warning(f"Low space: {info}")
-
-            deletable = self.snapshot_manager.get_deletable_snapshots()
-            if not deletable:
-                logger.error("Cannot free space: no deletable snapshots")
-                return False
-
-            oldest = deletable[0]
-            logger.info(f"Deleting snapshot {oldest.id} to free space")
-
-            if not self.snapshot_manager.delete_snapshot(oldest.id):
-                logger.error(f"Failed to delete snapshot {oldest.id}")
-                return False
-
-            info = self.get_space_info()
-            logger.info(f"After deletion: {info}")
-
-        return True
-
-    def ensure_space_for_snapshot(self) -> bool:
-        """Ensure there's space for a new snapshot.
-
-        Cleans up old snapshots until free_space >= min_free_threshold.
-
-        Returns:
-            True if space is available, False if not
-        """
-        return self.cleanup_if_needed()

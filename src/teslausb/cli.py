@@ -7,8 +7,7 @@ Usage:
     teslausb archive       # Run a single archive cycle
     teslausb status        # Show status (space, snapshots, config)
     teslausb snapshots     # List snapshots
-    teslausb clean         # Clean up old snapshots (until space threshold met)
-    teslausb clean --all   # Delete all deletable snapshots
+    teslausb clean         # Delete all deletable snapshots
     teslausb gadget        # Manage USB mass storage gadget
     teslausb service       # Manage systemd service
 """
@@ -102,28 +101,6 @@ def load_config(args: argparse.Namespace) -> Config:
         return load_from_env()
 
 
-def get_min_free_for_snapshot(config: Config) -> int:
-    """Calculate minimum free space required for a snapshot.
-
-    Formula: cam_size * snapshot_space_proportion
-
-    This is configurable because worst-case (100% COW copy) is unrealistic.
-    Default 50% provides safety margin while not being overly conservative.
-
-    Returns:
-        Minimum free space in bytes, or 0 if backingfiles not mounted
-    """
-    if not config.backingfiles_path.exists():
-        return 0
-    try:
-        statvfs = os.statvfs(config.backingfiles_path)
-        backingfiles_size = statvfs.f_blocks * statvfs.f_frsize
-        cam_size = calculate_cam_size(backingfiles_size)
-        return int(cam_size * config.snapshot_space_proportion)
-    except OSError:
-        return 0
-
-
 def create_components(config: Config) -> tuple[
     RealFilesystem, SnapshotManager, SpaceManager, ArchiveManager, MockArchiveBackend | RcloneBackend
 ]:
@@ -136,12 +113,9 @@ def create_components(config: Config) -> tuple[
         snapshots_path=config.snapshots_path,
     )
 
-    min_free_threshold = get_min_free_for_snapshot(config)
     space_manager = SpaceManager(
         fs=fs,
-        snapshot_manager=snapshot_manager,
         backingfiles_path=config.backingfiles_path,
-        min_free_threshold=min_free_threshold,
     )
 
     # Create backend based on archive system
@@ -579,22 +553,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     # Get space info if mounted
     space_data = None
-    min_free_threshold = get_min_free_for_snapshot(config)
     if backingfiles_mounted:
         try:
             space_manager = SpaceManager(
                 fs=fs,
-                snapshot_manager=snapshot_manager,
                 backingfiles_path=config.backingfiles_path,
-                min_free_threshold=min_free_threshold,
             )
             space_info = space_manager.get_space_info()
             space_data = {
                 "total_gb": round(space_info.total_gb, 2),
                 "free_gb": round(space_info.free_gb, 2),
                 "used_gb": round(space_info.used_gb, 2),
-                "min_free_gb": round(space_info.min_free_gb, 2),
-                "can_snapshot": space_info.can_snapshot,
             }
         except Exception as e:
             warnings.append(f"Could not get space info: {e}")
@@ -608,6 +577,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         try:
             snapshots = snapshot_manager.get_snapshots()
             deletable_count = len(snapshot_manager.get_deletable_snapshots())
+            if deletable_count > 0:
+                warnings.append(
+                    f"{deletable_count} stale snapshot(s) found "
+                    f"(run 'teslausb clean' or wait for next archive cycle)"
+                )
         except Exception:
             pass
 
@@ -635,9 +609,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             "system": config.archive.system,
             "reachable": archive_reachable,
         },
-        "config": {
-            "min_free_gb": round(min_free_threshold / GB, 2) if min_free_threshold else None,
-        },
     }
 
     if args.json:
@@ -655,14 +626,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if space_data:
             print(f"  Total: {space_data['total_gb']} GiB")
             print(f"  Free: {space_data['free_gb']} GiB")
-            print(f"  Min free: {space_data['min_free_gb']} GiB")
-            if space_data["can_snapshot"]:
-                can_snapshot_str = "Yes"
-            elif not space_data["min_free_gb"]:
-                can_snapshot_str = "Not initialized (run 'teslausb init' first)"
-            else:
-                can_snapshot_str = "NO (need more free space)"
-            print(f"  Can snapshot: {can_snapshot_str}")
+            print(f"  Used: {space_data['used_gb']} GiB")
         else:
             print("  (not available)")
         print()
@@ -722,7 +686,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if not _ensure_mounted(config):
         return 1
 
-    fs, snapshot_manager, space_manager, _, _ = create_components(config)
+    fs, snapshot_manager, _, _, _ = create_components(config)
 
     deletable = snapshot_manager.get_deletable_snapshots()
 
@@ -732,52 +696,29 @@ def cmd_clean(args: argparse.Namespace) -> int:
             return 0
 
         n = len(deletable)
-        if args.all:
-            print(f"Would delete {n} snapshot{'s' if n != 1 else ''}:")
-        else:
-            print(f"Deletable snapshots: {n}")
-
+        print(f"Would delete {n} snapshot{'s' if n != 1 else ''}:")
         for snap in deletable:
             print(f"  {snap.id}: {snap.path}")
-
-        if not args.all:
-            space_info = space_manager.get_space_info()
-            if space_info.can_snapshot:
-                print("\nSpace is sufficient, no cleanup needed.")
-            else:
-                print("\nSpace is low, would delete oldest snapshots until sufficient.")
         return 0
 
-    if args.all:
-        if not deletable:
-            print("No deletable snapshots")
-            return 0
-
-        deleted = 0
-        for snap in deletable:
-            try:
-                if snapshot_manager.delete_snapshot(snap.id):
-                    deleted += 1
-                    print(f"Deleted snapshot {snap.id}")
-            except SnapshotInUseError as e:
-                # Race condition - snapshot was acquired between check and delete
-                logger.warning(f"Snapshot {snap.id} is in use, skipping: {e}")
-
-        if deleted == len(deletable):
-            print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
-        else:
-            print(f"Deleted {deleted} of {len(deletable)} snapshots (some could not be deleted)")
+    if not deletable:
+        print("No deletable snapshots")
         return 0
 
-    # Default: only clean up until space threshold is met
-    success = space_manager.cleanup_if_needed()
+    deleted = 0
+    for snap in deletable:
+        try:
+            if snapshot_manager.delete_snapshot(snap.id):
+                deleted += 1
+                print(f"Deleted snapshot {snap.id}")
+        except SnapshotInUseError as e:
+            logger.warning(f"Snapshot {snap.id} is in use, skipping: {e}")
 
-    if success:
-        print("Cleanup complete, space is sufficient")
-        return 0
+    if deleted == len(deletable):
+        print(f"Deleted {deleted} snapshot{'s' if deleted != 1 else ''}")
     else:
-        print("Cleanup complete, but space is still low")
-        return 1
+        print(f"Deleted {deleted} of {len(deletable)} snapshots (some could not be deleted)")
+    return 0
 
 
 def cmd_mount(args: argparse.Namespace) -> int:
@@ -1012,9 +953,6 @@ def main() -> int:
     clean_parser = subparsers.add_parser("clean", help="Clean up old snapshots")
     clean_parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be deleted"
-    )
-    clean_parser.add_argument(
-        "--all", action="store_true", help="Delete all deletable snapshots (ignore space threshold)"
     )
 
     # gadget command with subcommands
