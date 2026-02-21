@@ -74,11 +74,12 @@ with snapshot_manager.acquire(snap_id) as handle:
 ```python
 while running:
     wait_for_archive_reachable()
-    wait_for_idle()
 
     # Delete all stale snapshots from previous runs
     while snapshot_manager.delete_oldest_if_deletable():
         pass
+
+    wait_for_idle()
 
     with snapshot_manager.snapshot_session() as handle:
         archive_manager.archive_snapshot(handle, mount_path)
