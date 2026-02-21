@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from .conftest import IntegrationTestEnv, create_test_footage, mount_cam_disk
+from .conftest import IntegrationTestEnv, create_test_footage
 
 pytestmark = pytest.mark.integration
 

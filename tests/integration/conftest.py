@@ -12,7 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, Tuple
+from typing import Generator
 
 import pytest
 
