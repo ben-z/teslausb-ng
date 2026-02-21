@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import subprocess
 
 import pytest
 
-from .conftest import IntegrationTestEnv, create_test_footage
+from .conftest import IntegrationTestEnv
 
 pytestmark = pytest.mark.integration
 
@@ -114,42 +113,32 @@ class TestCleanCommand:
         assert result.returncode == 0
 
     def test_clean_with_deletable_snapshot(
-        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
+        self, initialized_env: IntegrationTestEnv, cli_runner
     ):
         """Clean should delete all deletable snapshots."""
-        # Create a snapshot via archive
-        create_test_footage(cam_mount, "event1")
-        subprocess.run(["umount", str(cam_mount)], check=True)
-        cli_runner("archive", check=False)
-
-        # With eager deletion, at most 1 snapshot survives each archive cycle
-        snapshots_before = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots_before:
-            pytest.skip("No snapshot survived archive (post-archive deletion succeeded)")
+        # Create a snapshot directly on disk (deterministic, no archive needed)
+        snap_dir = initialized_env.snapshots_path / "snap-000001"
+        snap_dir.mkdir()
+        (snap_dir / "snap.toc").write_text("")
+        (snap_dir / "snap.bin").write_bytes(b"fake")
 
         # Run clean
         result = cli_runner("clean")
 
-        # Verify snapshots were deleted
+        # Verify snapshot was deleted
         assert "Deleted" in result.stdout
         snapshots_after = list(initialized_env.snapshots_path.glob("snap-*"))
-        assert len(snapshots_after) == 0, f"Expected 0 snapshots after clean, got {len(snapshots_after)}"
+        assert len(snapshots_after) == 0
 
     def test_clean_dry_run_with_deletable_snapshot(
-        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount
+        self, initialized_env: IntegrationTestEnv, cli_runner
     ):
         """Clean --dry-run should show what would be deleted without deleting."""
-        # Create a snapshot via archive
-        create_test_footage(cam_mount, "event1")
-        subprocess.run(["umount", str(cam_mount)], check=True)
-        cli_runner("archive", check=False)
-
-        # With eager deletion, at most 1 snapshot survives
-        snapshots_before = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots_before:
-            pytest.skip("No snapshot survived archive (post-archive deletion succeeded)")
-
-        n = len(snapshots_before)
+        # Create a snapshot directly on disk
+        snap_dir = initialized_env.snapshots_path / "snap-000001"
+        snap_dir.mkdir()
+        (snap_dir / "snap.toc").write_text("")
+        (snap_dir / "snap.bin").write_bytes(b"fake")
 
         # Run clean --dry-run
         result = cli_runner("clean", "--dry-run")
@@ -158,8 +147,6 @@ class TestCleanCommand:
         assert "Would delete" in result.stdout
         assert "snap-" in result.stdout
 
-        # Verify snapshots were NOT actually deleted
+        # Verify snapshot was NOT actually deleted
         snapshots_after = list(initialized_env.snapshots_path.glob("snap-*"))
-        assert len(snapshots_after) == n, (
-            f"Expected {n} snapshots after dry-run, got {len(snapshots_after)}"
-        )
+        assert len(snapshots_after) == 1

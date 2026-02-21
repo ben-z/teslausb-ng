@@ -40,81 +40,61 @@ class TestArchiveCycle:
     def test_archive_snapshot_has_toc(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """Archive snapshot should have .toc file (completion marker)."""
+        """Surviving archive snapshots should have .toc file (completion marker)."""
         create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
 
         snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots:
-            pytest.skip("Snapshot already deleted by post-archive cleanup")
-
-        toc_file = snapshots[0] / "snap.toc"
-        assert toc_file.exists(), "Snapshot should have .toc file"
+        assert len(snapshots) <= 1
+        for snap in snapshots:
+            assert (snap / "snap.toc").exists(), f"{snap.name} missing .toc file"
 
     def test_archive_snapshot_has_metadata(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """Archive snapshot should have metadata.json."""
+        """Surviving archive snapshots should have metadata.json."""
         create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
 
         snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots:
-            pytest.skip("Snapshot already deleted by post-archive cleanup")
+        assert len(snapshots) <= 1
+        for snap in snapshots:
+            metadata_file = snap / "metadata.json"
+            assert metadata_file.exists(), f"{snap.name} missing metadata.json"
 
-        metadata_file = snapshots[0] / "metadata.json"
-        assert metadata_file.exists(), "Snapshot should have metadata.json"
+            metadata = json.loads(metadata_file.read_text())
+            assert "id" in metadata
+            assert "path" in metadata
+            assert "created_at" in metadata
 
-        metadata = json.loads(metadata_file.read_text())
-        assert "id" in metadata
-        assert "path" in metadata
-        assert "created_at" in metadata
-
-    def test_snapshots_command_shows_snapshot(
+    def test_snapshots_command_after_archive(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """After archive, snapshots command should list the snapshot (if it survived)."""
+        """After archive, snapshots command output should match disk state."""
         create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
         cli_runner("archive", check=False)
-
-        snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots:
-            pytest.skip("Snapshot already deleted by post-archive cleanup")
-
-        result = cli_runner("snapshots")
-        assert "snap-" in result.stdout
-
-    def test_snapshots_json_has_snapshot(
-        self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
-    ):
-        """After archive, snapshots --json should include snapshot data (if it survived)."""
-        create_test_footage(cam_mount)
-        subprocess.run(["umount", str(cam_mount)], check=True)
-
-        cli_runner("archive", check=False)
-
-        snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
-        if not snapshots:
-            pytest.skip("Snapshot already deleted by post-archive cleanup")
 
         result = cli_runner("snapshots", "--json")
         data = json.loads(result.stdout)
 
-        assert len(data) == 1
-        assert "id" in data[0]
-        assert "path" in data[0]
-        assert "created_at" in data[0]
+        # CLI output should match what's on disk
+        snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert len(data) == len(snapshots)
+        for entry in data:
+            assert "id" in entry
+            assert "path" in entry
+            assert "created_at" in entry
 
     def test_status_shows_snapshot_count(
         self, initialized_env: IntegrationTestEnv, cli_runner, cam_mount: Path
     ):
-        """After archive, status should show snapshot count."""
+        """After archive, status snapshot count should match disk state."""
         create_test_footage(cam_mount)
         subprocess.run(["umount", str(cam_mount)], check=True)
 
@@ -123,8 +103,8 @@ class TestArchiveCycle:
         result = cli_runner("status", "--json")
         data = json.loads(result.stdout)
 
-        # Post-archive deletion may have already cleaned up
-        assert data["snapshots"]["count"] <= 1
+        snapshots = list(initialized_env.snapshots_path.glob("snap-*"))
+        assert data["snapshots"]["count"] == len(snapshots)
 
 
 class TestMultipleArchiveCycles:
