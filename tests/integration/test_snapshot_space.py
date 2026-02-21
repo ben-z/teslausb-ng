@@ -193,9 +193,6 @@ class TestSnapshotSpaceInvariant:
             f"Full COW divergence exhausted space: {free_after_cow} bytes free"
         )
 
-        # Clean up snapshot (the primary assertion above is what matters —
-        # XFS may defer block-free accounting beyond what syncfs can flush,
-        # so we don't assert on recovered space here).
         snap_path.unlink()
 
     def test_stale_snapshots_cause_enospc_without_cleanup(self, xfs_volume):
