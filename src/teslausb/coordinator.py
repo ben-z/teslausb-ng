@@ -2,15 +2,11 @@
 
 This module provides the Coordinator class that orchestrates:
 - Waiting for archive connectivity
-- Taking snapshots
+- Idle detection (optional)
+- Snapshot lifecycle (create, archive, eager delete)
 - Archiving footage
-- Managing disk space
-- Cleanup
 - LED status indication
 - Temperature monitoring
-- Idle detection
-
-This replaces the bash archiveloop script with a cleaner implementation.
 """
 
 from __future__ import annotations
@@ -91,16 +87,16 @@ class Coordinator:
 
     The main loop:
     1. Wait for archive to become reachable (WiFi connected, server up)
-    2. Wait for car to stop writing (idle detection)
-    3. Take snapshot and archive
-    4. Disable gadget, delete archived files from cam_disk, re-enable gadget
-    5. Clean up old snapshots if needed
-    6. Repeat
+    2. Delete all stale snapshots (eager cleanup)
+    3. Wait for car to stop writing (idle detection, if configured)
+    4. Take snapshot and archive
+    5. Disable gadget, delete archived files from cam_disk, re-enable gadget
+    6. Delete the snapshot
+    7. Repeat
 
     This design ensures:
+    - At most one snapshot exists at any time (eager deletion)
     - Snapshots are only taken when we're about to archive
-    - Snapshots are locked during archiving (can't be deleted)
-    - Space cleanup only deletes unreferenced snapshots
     - cam_disk.bin is never mounted while the gadget is active
     - Clean shutdown on SIGTERM/SIGINT
     """

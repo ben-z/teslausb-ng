@@ -23,7 +23,7 @@ pytestmark = pytest.mark.integration
 MB = 1024 * 1024
 
 
-def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+def _sh(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
@@ -41,11 +41,11 @@ def xfs_volume(tmp_path: Path):
     # 200 MB — large enough for meaningful COW testing, small enough to be fast
     total_bytes = 200 * MB
 
-    _run(["truncate", "-s", str(total_bytes), str(img)])
-    result = _run(["mkfs.xfs", "-f", str(img)])
+    _sh(["truncate", "-s", str(total_bytes), str(img)])
+    result = _sh(["mkfs.xfs", "-f", str(img)])
     assert result.returncode == 0, f"mkfs.xfs failed: {result.stderr}"
 
-    result = _run(["mount", "-o", "loop", str(img), str(mount_path)])
+    result = _sh(["mount", "-o", "loop", str(img), str(mount_path)])
     assert result.returncode == 0, f"mount failed: {result.stderr}"
 
     try:
@@ -60,7 +60,7 @@ def xfs_volume(tmp_path: Path):
 
         # Create fully-allocated cam_disk using fallocate
         cam_disk = mount_path / "cam_disk.bin"
-        result = _run(["fallocate", "-l", str(cam_size), str(cam_disk)])
+        result = _sh(["fallocate", "-l", str(cam_size), str(cam_disk)])
         assert result.returncode == 0, f"fallocate failed: {result.stderr}"
 
         snapshots_dir = mount_path / "snapshots"
@@ -68,7 +68,7 @@ def xfs_volume(tmp_path: Path):
 
         yield mount_path, cam_disk, cam_size
     finally:
-        _run(["umount", "-l", str(mount_path)])
+        _sh(["umount", "-l", str(mount_path)])
 
 
 def _df_free_bytes(path: Path) -> int:
@@ -139,7 +139,7 @@ class TestSnapshotSpaceInvariant:
 
             # 2. Take reflink snapshot
             snap_path = snapshots_dir / f"snap-{cycle:06d}.bin"
-            result = _run(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
+            result = _sh(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
             assert result.returncode == 0, (
                 f"Cycle {cycle}: reflink failed: {result.stderr}"
             )
@@ -192,7 +192,7 @@ class TestSnapshotSpaceInvariant:
 
         # Take snapshot
         snap_path = snapshots_dir / "snap.bin"
-        result = _run(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
+        result = _sh(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
         assert result.returncode == 0, f"reflink failed: {result.stderr}"
 
         # Overwrite 100% of cam_disk — worst-case COW, every block diverges
@@ -238,7 +238,7 @@ class TestSnapshotSpaceInvariant:
 
         for cycle in range(5):
             snap_path = snapshots_dir / f"snap-{cycle:06d}.bin"
-            result = _run(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
+            result = _sh(["cp", "--reflink=always", str(cam_disk), str(snap_path)])
             if result.returncode != 0:
                 hit_pressure = True
                 break
