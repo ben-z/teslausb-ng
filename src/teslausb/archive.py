@@ -572,7 +572,8 @@ class ArchiveManager:
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
             delete_after_archive: If True and cam_disk_path is set, delete archived
-                files from cam_disk after successful archive.
+                files from cam_disk. Only successfully-copied directories are deleted,
+                even if other directories failed.
 
         Returns:
             ArchiveResult with details of the operation
@@ -586,11 +587,12 @@ class ArchiveManager:
             with mount_fn(snapshot.image_path) as mount_path:
                 result = self.archive_snapshot(handle, mount_path)
 
-            # Delete archived files from cam_disk if configured and archive succeeded
+            # Delete archived files from successfully-copied directories,
+            # even if some directories failed. archived_files only contains
+            # directories where rclone succeeded, so this is safe.
             if (
                 delete_after_archive
                 and self.cam_disk_path
-                and result.success
                 and result.archived_files
             ):
                 logger.info("Deleting archived files from cam_disk...")
