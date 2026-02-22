@@ -261,13 +261,15 @@ class Coordinator:
                     f"Archive cycle {self._archive_count} complete: "
                     f"{result.files_transferred} files transferred"
                 )
-                # Delete archived files with gadget disabled to prevent
-                # FAT corruption from concurrent access to cam_disk.bin
-                if result.archived_files and self.archive_manager.cam_disk_path:
-                    self._delete_archived_files(result)
             else:
                 logger.warning(f"Archive cycle {self._archive_count} had issues: {result.error}")
                 self._error_count += 1
+
+            # Delete archived files from successfully-copied directories,
+            # even if some directories failed. archived_files only contains
+            # directories where rclone succeeded, so this is safe.
+            if result.archived_files and self.archive_manager.cam_disk_path:
+                self._delete_archived_files(result)
 
             # Delete the snapshot now that archiving and cam_disk cleanup are done.
             # If this fails, start-of-cycle cleanup will handle it next time.

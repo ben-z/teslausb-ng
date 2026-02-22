@@ -268,6 +268,87 @@ class TestPostArchiveSnapshotDeletion:
         coordinator.snapshot_manager.delete_snapshot.assert_called_with(1)
 
 
+class TestPartialArchiveFailure:
+    """Tests for deletion when some directories fail but others succeed."""
+
+    def test_deletion_runs_for_partial_failure(
+        self, coordinator_with_gadget: Coordinator, mock_gadget: MockGadget
+    ):
+        """Test that successfully-archived files are deleted even when some dirs fail."""
+        # RecentClips timed out, but SavedClips and SentryClips succeeded
+        partial_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.FAILED,
+            error="RecentClips: Timeout",
+            files_transferred=0,
+            archived_files={
+                "SavedClips": [ArchivedFile("event1/front.mp4", 1000)],
+                "SentryClips": [ArchivedFile("event2/front.mp4", 2000)],
+            },
+        )
+        coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=partial_result
+        )
+
+        delete_called = False
+
+        @contextmanager
+        def tracking_mount(path, readonly=True):
+            nonlocal delete_called
+            delete_called = True
+            yield Path("/mnt/cam")
+
+        with patch("teslausb.mount.mount_image", tracking_mount), \
+             patch("teslausb.mount.fsck_image", return_value=True):
+            coordinator_with_gadget._do_archive_cycle()
+
+        assert delete_called, \
+            "Should delete files from successful dirs even when overall result is FAILED"
+
+    def test_no_deletion_when_all_dirs_fail(
+        self, coordinator_with_gadget: Coordinator, mock_gadget: MockGadget
+    ):
+        """Test that no deletion is attempted when all directories failed."""
+        all_failed_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.FAILED,
+            error="SavedClips: Timeout; SentryClips: Timeout",
+            files_transferred=0,
+            archived_files={},  # no successful directories
+        )
+        coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=all_failed_result
+        )
+
+        delete_mock = MagicMock()
+        coordinator_with_gadget._delete_archived_files = delete_mock
+
+        coordinator_with_gadget._do_archive_cycle()
+
+        delete_mock.assert_not_called()
+
+    def test_error_count_incremented_on_partial_failure(
+        self, coordinator_with_gadget: Coordinator
+    ):
+        """Test that error count is incremented even when deletion runs."""
+        partial_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.FAILED,
+            error="RecentClips: Timeout",
+            archived_files={
+                "SavedClips": [ArchivedFile("event1/front.mp4", 1000)],
+            },
+        )
+        coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=partial_result
+        )
+        coordinator_with_gadget._delete_archived_files = MagicMock()
+
+        coordinator_with_gadget._do_archive_cycle()
+
+        assert coordinator_with_gadget._error_count == 1
+
+
 class TestArchiveCycleFailure:
     """Tests for archive cycle failure handling."""
 
