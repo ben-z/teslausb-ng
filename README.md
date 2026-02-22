@@ -429,6 +429,10 @@ sudo teslausb gadget on
 
 ---
 
+## Related Projects
+
+- [teslacam-replay](https://github.com/ben-z/teslacam-replay) — Web viewer for archived footage with synchronized multi-camera playback
+
 ## Documentation
 
 - [DESIGN.md](DESIGN.md) - Architecture and design decisions
