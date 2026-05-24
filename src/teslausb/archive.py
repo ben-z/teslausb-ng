@@ -9,15 +9,16 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Callable, Iterator
 
 from .filesystem import Filesystem, FilesystemError, RealFilesystem
 from .snapshot import SnapshotHandle, SnapshotManager
@@ -234,6 +235,28 @@ class RcloneBackend(ArchiveBackend):
             logger.warning(f"Could not scan directory {src}: {e}")
         return files
 
+    def _decode_output(self, output: bytes | None) -> str:
+        """Decode subprocess output."""
+        if not output:
+            return ""
+        return output.decode(errors="replace")
+
+    def _parse_copied_path(self, line: str) -> str | None:
+        """Parse the relative path from an rclone copied-file log line."""
+        marker = ": Copied ("
+        if marker not in line:
+            return None
+
+        prefix, _, _ = line.partition(marker)
+        match = re.search(r"INFO\s+:\s*(?P<path>.+)$", prefix)
+        rel_path = match.group("path").strip() if match else prefix.strip()
+        return rel_path.lstrip("/") if rel_path else None
+
+    def _sum_file_sizes(self, files: list[ArchivedFile], relative_paths: set[str]) -> int:
+        """Sum sizes for scanned files whose relative paths match rclone output."""
+        by_path = {file.relative_path: file for file in files}
+        return sum(by_path[path].size for path in relative_paths if path in by_path)
+
     def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
         """Copy a directory using rclone copy.
 
@@ -258,23 +281,29 @@ class RcloneBackend(ArchiveBackend):
         try:
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=self.timeout,
                 check=False,
             )
 
             # Parse output for stats
             files_transferred = 0
-            bytes_transferred = 0
-            output = result.stderr.decode() if result.stderr else ""
+            copied_paths: set[str] = set()
+            output = "\n".join(
+                text for stream in (result.stdout, result.stderr)
+                if (text := self._decode_output(stream))
+            )
 
             for line in output.splitlines():
                 logger.debug(f"rclone: {line}")
                 # Count individual file copies (most reliable across rclone versions)
                 # Lines look like: "<6>INFO  : filename.mp4: Copied (new)"
-                if ": Copied (" in line:
+                copied_path = self._parse_copied_path(line)
+                if copied_path:
                     files_transferred += 1
+                    copied_paths.add(copied_path)
+
+            bytes_transferred = self._sum_file_sizes(archived_files, copied_paths)
 
             if result.returncode != 0:
                 error_msg = output.strip().split("\n")[-1] if output else "Unknown error"
@@ -544,7 +573,7 @@ class ArchiveManager:
         # Collect all directories, then sort by depth (deepest first)
         dirs_to_check: list[Path] = []
         try:
-            for dirpath, dirnames, filenames in self.fs.walk(base_path):
+            for dirpath, dirnames, _filenames in self.fs.walk(base_path):
                 for dirname in dirnames:
                     dirs_to_check.append(Path(dirpath) / dirname)
         except (OSError, FilesystemError):

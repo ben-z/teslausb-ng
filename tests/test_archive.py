@@ -1,12 +1,11 @@
 """Tests for archive management."""
 
+import subprocess
 from pathlib import Path
 
-import pytest
-
 from teslausb.archive import (
-    ArchiveManager,
     ArchivedFile,
+    ArchiveManager,
     ArchiveResult,
     ArchiveState,
     CopyResult,
@@ -80,7 +79,8 @@ class TestArchiveManager:
         snapshot_mount = Path("/backingfiles/snapshots/snap-000000/mnt")
         dirs = manager._get_dirs_to_archive(snapshot_mount)
 
-        # Should find SavedClips, SentryClips, and Photobooth (RecentClips exists but not enabled by default)
+        # Should find SavedClips, SentryClips, and Photobooth.
+        # RecentClips exists but is not enabled by default.
         assert len(dirs) == 3
         dir_names = [d[1] for d in dirs]
         assert "SavedClips" in dir_names
@@ -380,6 +380,35 @@ class TestRcloneBackend:
         assert by_path["event1/front.mp4"].size == 1000
         assert by_path["event1/back.mp4"].size == 2000
 
+    def test_copy_directory_counts_copied_bytes(self, monkeypatch):
+        """Test copied-byte accounting uses rclone copied-file output."""
+        fs = MockFilesystem()
+        fs.mkdir(Path("/test/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/test/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/SavedClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/SavedClips/event1/left.mp4"), "x" * 3000)
+
+        def run_success(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=0,
+                stderr=(
+                    b"<6>INFO  : event1/front.mp4: Copied (new)\n"
+                    b"<6>INFO  : event1/back.mp4: Unchanged skipping\n"
+                    b"<6>INFO  : event1/left.mp4: Copied (new)\n"
+                ),
+            )
+
+        monkeypatch.setattr(subprocess, "run", run_success)
+
+        backend = RcloneBackend(remote="gdrive", fs=fs)
+        result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
+
+        assert result.success
+        assert result.files_transferred == 2
+        assert result.bytes_transferred == 4000
+        assert len(result.archived_files) == 3
+
 
 class TestDeleteArchivedFiles:
     """Tests for deleting archived files from cam_disk."""
@@ -432,7 +461,10 @@ class TestDeleteArchivedFiles:
 
         # Set up cam_disk structure - file has different size than archived
         fs.mkdir(Path("/cam_mount/TeslaCam/SavedClips/event1"), parents=True)
-        fs.write_text(Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"), "x" * 1500)  # Different!
+        fs.write_text(
+            Path("/cam_mount/TeslaCam/SavedClips/event1/front.mp4"),
+            "x" * 1500,
+        )
 
         fs.mkdir(Path("/backingfiles/snapshots"), parents=True)
         snapshot_manager = SnapshotManager(
@@ -453,7 +485,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),  # Archived size was 1000
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
                 ],
             },
         )
