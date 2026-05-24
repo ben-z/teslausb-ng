@@ -89,7 +89,8 @@ class CopyResult:
     files_transferred: int = 0
     bytes_transferred: int = 0
     error: str | None = None
-    # Files that were archived (with sizes for verification before deletion)
+    # Files confirmed present in the archive and safe to consider for deletion.
+    # On failed copies this may be a partial list parsed from rclone output.
     archived_files: list[ArchivedFile] = field(default_factory=list)
 
 
@@ -235,27 +236,62 @@ class RcloneBackend(ArchiveBackend):
             logger.warning(f"Could not scan directory {src}: {e}")
         return files
 
-    def _decode_output(self, output: bytes | None) -> str:
+    def _decode_output(self, output: bytes | str | None) -> str:
         """Decode subprocess output."""
-        if not output:
+        if output is None:
             return ""
+        if isinstance(output, str):
+            return output
         return output.decode(errors="replace")
 
-    def _parse_copied_path(self, line: str) -> str | None:
-        """Parse the relative path from an rclone copied-file log line."""
-        marker = ": Copied ("
-        if marker not in line:
-            return None
+    def _combined_output(self, *outputs: bytes | str | None) -> str:
+        """Combine subprocess output streams into one log string."""
+        return "\n".join(text for output in outputs if (text := self._decode_output(output)))
 
-        prefix, _, _ = line.partition(marker)
-        match = re.search(r"INFO\s+:\s*(?P<path>.+)$", prefix)
-        rel_path = match.group("path").strip() if match else prefix.strip()
-        return rel_path.lstrip("/") if rel_path else None
+    def _parse_rclone_paths(self, output: str, markers: tuple[str, ...]) -> set[str]:
+        """Parse relative file paths from rclone log lines.
 
-    def _sum_file_sizes(self, files: list[ArchivedFile], relative_paths: set[str]) -> int:
-        """Sum sizes for scanned files whose relative paths match rclone output."""
+        Rclone emits lines like:
+            <6>INFO  : event/front.mp4: Copied (new)
+            <6>INFO  : event/front.mp4: Unchanged skipping
+
+        Only paths followed by one of the supplied markers are returned.
+        """
+        paths: set[str] = set()
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            for marker in markers:
+                if marker not in line:
+                    continue
+
+                prefix, _, _ = line.partition(marker)
+                match = re.search(r"INFO\s+:\s*(?P<path>.+)$", prefix)
+                rel_path = match.group("path").strip() if match else prefix.strip()
+                if rel_path:
+                    paths.add(rel_path.lstrip("/"))
+                break
+
+        return paths
+
+    def _select_archived_files(
+        self,
+        files: list[ArchivedFile],
+        relative_paths: set[str],
+    ) -> list[ArchivedFile]:
+        """Select scanned files whose relative paths were confirmed by rclone."""
+        if not relative_paths:
+            return []
+
         by_path = {file.relative_path: file for file in files}
-        return sum(by_path[path].size for path in relative_paths if path in by_path)
+        selected: list[ArchivedFile] = []
+        for rel_path in sorted(relative_paths):
+            archived_file = by_path.get(rel_path)
+            if archived_file:
+                selected.append(archived_file)
+            else:
+                logger.debug(f"rclone reported unknown archived file: {rel_path}")
+        return selected
 
     def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
         """Copy a directory using rclone copy.
@@ -287,28 +323,31 @@ class RcloneBackend(ArchiveBackend):
             )
 
             # Parse output for stats
-            files_transferred = 0
-            copied_paths: set[str] = set()
-            output = "\n".join(
-                text for stream in (result.stdout, result.stderr)
-                if (text := self._decode_output(stream))
-            )
+            output = self._combined_output(result.stdout, result.stderr)
 
             for line in output.splitlines():
                 logger.debug(f"rclone: {line}")
-                # Count individual file copies (most reliable across rclone versions)
-                # Lines look like: "<6>INFO  : filename.mp4: Copied (new)"
-                copied_path = self._parse_copied_path(line)
-                if copied_path:
-                    files_transferred += 1
-                    copied_paths.add(copied_path)
 
-            bytes_transferred = self._sum_file_sizes(archived_files, copied_paths)
+            copied_paths = self._parse_rclone_paths(output, (": Copied (",))
+            copied_files = self._select_archived_files(archived_files, copied_paths)
+            files_transferred = len(copied_paths)
+            bytes_transferred = sum(file.size for file in copied_files)
 
             if result.returncode != 0:
                 error_msg = output.strip().split("\n")[-1] if output else "Unknown error"
+                confirmed_paths = self._parse_rclone_paths(
+                    output,
+                    (": Copied (", ": Unchanged skipping"),
+                )
+                confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
                 logger.error(f"rclone copy failed: {error_msg}")
-                return CopyResult(success=False, error=error_msg)
+                return CopyResult(
+                    success=False,
+                    files_transferred=len(confirmed_files),
+                    bytes_transferred=sum(file.size for file in confirmed_files),
+                    error=error_msg,
+                    archived_files=confirmed_files,
+                )
 
             return CopyResult(
                 success=True,
@@ -317,9 +356,21 @@ class RcloneBackend(ArchiveBackend):
                 archived_files=archived_files,
             )
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            output = self._combined_output(e.stdout, e.stderr)
+            confirmed_paths = self._parse_rclone_paths(
+                output,
+                (": Copied (", ": Unchanged skipping"),
+            )
+            confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
             logger.error(f"rclone timeout copying {src}")
-            return CopyResult(success=False, error="Timeout")
+            return CopyResult(
+                success=False,
+                files_transferred=len(confirmed_files),
+                bytes_transferred=sum(file.size for file in confirmed_files),
+                error="Timeout",
+                archived_files=confirmed_files,
+            )
         except (OSError, FileNotFoundError) as e:
             logger.error(f"rclone error: {e}")
             return CopyResult(success=False, error=str(e))
@@ -467,7 +518,7 @@ class ArchiveManager:
             if copy_result.success:
                 total_files += copy_result.files_transferred
                 total_bytes += copy_result.bytes_transferred
-                # Track archived files for deletion (only for successful directories)
+                # Track all files in successful directories for deletion.
                 if copy_result.archived_files:
                     result.archived_files[dst_name] = copy_result.archived_files
                 logger.info(
@@ -475,6 +526,14 @@ class ArchiveManager:
                     f" ({format_size(copy_result.bytes_transferred)})"
                 )
             else:
+                total_files += copy_result.files_transferred
+                total_bytes += copy_result.bytes_transferred
+                if copy_result.archived_files:
+                    result.archived_files[dst_name] = copy_result.archived_files
+                    logger.info(
+                        f"  {dst_name}: confirmed {len(copy_result.archived_files)} "
+                        "files before failure"
+                    )
                 errors.append(f"{dst_name}: {copy_result.error}")
                 logger.error(f"  {dst_name}: failed - {copy_result.error}")
 
@@ -616,9 +675,9 @@ class ArchiveManager:
             with mount_fn(snapshot.image_path) as mount_path:
                 result = self.archive_snapshot(handle, mount_path)
 
-            # Delete archived files from successfully-copied directories,
-            # even if some directories failed. archived_files only contains
-            # directories where rclone succeeded, so this is safe.
+            # Delete files confirmed present in the archive, even if some
+            # directories failed. delete_archived_files still verifies sizes
+            # before removing anything from the live cam_disk.
             if (
                 delete_after_archive
                 and self.cam_disk_path
