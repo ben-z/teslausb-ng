@@ -16,6 +16,25 @@ from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
 
 
+class PartialFailureBackend(MockArchiveBackend):
+    """Backend that reports confirmed archived files but still fails."""
+
+    def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
+        self.copied_dirs.append((src, dst_name))
+        return CopyResult(
+            success=False,
+            files_transferred=1,
+            bytes_transferred=500_000,
+            error="Timeout",
+            archived_files=[
+                ArchivedFile(
+                    relative_path="2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4",
+                    size=500_000,
+                ),
+            ],
+        )
+
+
 class TestMockArchiveBackend:
     """Tests for MockArchiveBackend."""
 
@@ -217,6 +236,52 @@ class TestArchiveManager:
         finally:
             handle.release()
 
+    def test_archive_snapshot_keeps_partial_archived_files(
+        self,
+        mock_fs_with_teslacam: MockFilesystem,
+    ):
+        """Test failed copies can still return files safe to clean up."""
+        snapshot_manager = SnapshotManager(
+            fs=mock_fs_with_teslacam,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        backend = PartialFailureBackend(reachable=True)
+
+        manager = ArchiveManager(
+            fs=mock_fs_with_teslacam,
+            snapshot_manager=snapshot_manager,
+            backend=backend,
+            archive_saved=True,
+            archive_sentry=False,
+            archive_recent=False,
+            archive_track=False,
+            archive_photobooth=False,
+        )
+
+        snapshots = snapshot_manager.get_snapshots()
+        handle = snapshot_manager.acquire(snapshots[0].id)
+
+        try:
+            mount_path = Path("/backingfiles/snapshots/snap-000000/mnt")
+            result = manager.archive_snapshot(handle, mount_path)
+
+            assert result.state == ArchiveState.FAILED
+            assert result.error == "SavedClips: Timeout"
+            assert result.files_transferred == 1
+            assert result.bytes_transferred == 500_000
+            assert result.archived_files == {
+                "SavedClips": [
+                    ArchivedFile(
+                        relative_path="2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4",
+                        size=500_000,
+                    ),
+                ],
+            }
+        finally:
+            handle.release()
+
     def test_archive_when_unreachable(self, mock_fs_with_teslacam: MockFilesystem):
         """Test archive fails gracefully when backend unreachable."""
         snapshot_manager = SnapshotManager(
@@ -408,6 +473,39 @@ class TestRcloneBackend:
         assert result.files_transferred == 2
         assert result.bytes_transferred == 4000
         assert len(result.archived_files) == 3
+
+    def test_copy_directory_timeout_returns_confirmed_archived_files(self, monkeypatch):
+        """Test timeout returns files rclone confirmed as copied or unchanged."""
+        fs = MockFilesystem()
+        fs.mkdir(Path("/test/RecentClips/event1"), parents=True)
+        fs.write_text(Path("/test/RecentClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/RecentClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/RecentClips/event1/left.mp4"), "x" * 3000)
+
+        def timeout_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(
+                cmd=args[0],
+                timeout=kwargs["timeout"],
+                stderr=(
+                    b"<6>INFO  : event1/front.mp4: Copied (new)\n"
+                    b"<6>INFO  : event1/back.mp4: Unchanged skipping\n"
+                    b"<6>INFO  : event1/right.mp4: Copied (new)\n"
+                ),
+            )
+
+        monkeypatch.setattr(subprocess, "run", timeout_run)
+
+        backend = RcloneBackend(remote="gdrive", fs=fs, timeout=1)
+        result = backend.copy_directory(Path("/test/RecentClips"), "RecentClips")
+
+        assert not result.success
+        assert result.error == "Timeout"
+        assert result.files_transferred == 2
+        assert result.bytes_transferred == 3000
+        assert result.archived_files == [
+            ArchivedFile(relative_path="event1/back.mp4", size=2000),
+            ArchivedFile(relative_path="event1/front.mp4", size=1000),
+        ]
 
 
 class TestDeleteArchivedFiles:
