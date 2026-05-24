@@ -10,22 +10,26 @@ Design principles:
 - If .toc exists, the snapshot is complete and valid
 - If .toc doesn't exist, the snapshot is incomplete and should be deleted
 - State (READY vs ARCHIVING) is derived from refcount, not stored
+- Cross-process use is detected with a kernel lock on snap.lock
 - Only immutable facts (id, path, created_at) are persisted to metadata.json
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import TextIO
 
-from .filesystem import Filesystem
+from .filesystem import Filesystem, RealFilesystem
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +77,7 @@ class Snapshot:
     path: Path
     created_at: datetime
     refcount: int = 0
+    externally_locked: bool = False
 
     @property
     def image_path(self) -> Path:
@@ -90,9 +95,16 @@ class Snapshot:
         return self.path / "metadata.json"
 
     @property
+    def lock_path(self) -> Path:
+        """Path to the cross-process lock file."""
+        return self.path / "snap.lock"
+
+    @property
     def state(self) -> SnapshotState:
         """Current state, derived from refcount."""
-        return SnapshotState.ARCHIVING if self.refcount > 0 else SnapshotState.READY
+        if self.refcount > 0 or self.externally_locked:
+            return SnapshotState.ARCHIVING
+        return SnapshotState.READY
 
     @property
     def is_complete(self) -> bool:
@@ -106,7 +118,7 @@ class Snapshot:
     @property
     def is_deletable(self) -> bool:
         """Whether the snapshot can be deleted."""
-        return self.refcount == 0
+        return self.refcount == 0 and not self.externally_locked
 
     def to_dict(self) -> dict:
         """Serialize to dictionary.
@@ -197,10 +209,12 @@ class SnapshotManager:
     _next_id: int = 0
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _creating: bool = False
+    _process_lock_files: dict[int, TextIO] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Initialize manager and load existing snapshots."""
         self._lock = threading.RLock()
+        self._process_lock_files = {}
         self._load_snapshots()
 
     def _load_snapshots(self) -> None:
@@ -290,6 +304,71 @@ class SnapshotManager:
         except Exception as e:
             logger.warning(f"Failed to save snapshot metadata: {e}")
 
+    def _process_locks_enabled(self) -> bool:
+        """Whether OS-level snapshot locks are available."""
+        return isinstance(self.fs, RealFilesystem)
+
+    def _acquire_process_lock(self, snapshot: Snapshot) -> None:
+        """Acquire the cross-process lock for a snapshot."""
+        if not self._process_locks_enabled() or snapshot.id in self._process_lock_files:
+            return
+
+        lock_file = snapshot.lock_path.open("a+")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(f"{os.getpid()}\n")
+            lock_file.flush()
+        except BlockingIOError as e:
+            lock_file.close()
+            raise SnapshotInUseError(
+                f"Snapshot {snapshot.id} is locked by another process"
+            ) from e
+
+        self._process_lock_files[snapshot.id] = lock_file
+
+    def _release_process_lock(self, snapshot: Snapshot) -> None:
+        """Release the cross-process lock for a snapshot."""
+        lock_file = self._process_lock_files.pop(snapshot.id, None)
+        if lock_file is None:
+            return
+
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+    def _is_locked_by_other_process(self, snapshot: Snapshot) -> bool:
+        """Return whether another process currently holds a snapshot lock."""
+        if not self._process_locks_enabled() or snapshot.id in self._process_lock_files:
+            return False
+        if not snapshot.lock_path.exists():
+            return False
+
+        try:
+            lock_file = snapshot.lock_path.open("r")
+        except FileNotFoundError:
+            return False
+
+        with lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return False
+
+    def _refresh_external_lock(self, snapshot: Snapshot) -> None:
+        """Refresh cross-process lock state for one snapshot."""
+        snapshot.externally_locked = self._is_locked_by_other_process(snapshot)
+
+    def _refresh_external_locks(self) -> None:
+        """Refresh cross-process lock state for loaded snapshots."""
+        for snapshot in self._snapshots.values():
+            self._refresh_external_lock(snapshot)
+
     def _snap_dir_name(self, snap_id: int) -> str:
         """Generate snapshot directory name."""
         return f"snap-{snap_id:06d}"
@@ -372,7 +451,15 @@ class SnapshotManager:
                 raise SnapshotNotFoundError(f"Snapshot {snapshot_id} not found")
 
             snapshot = self._snapshots[snapshot_id]
+            if snapshot.refcount == 0:
+                self._refresh_external_lock(snapshot)
+                if snapshot.externally_locked:
+                    raise SnapshotInUseError(
+                        f"Snapshot {snapshot_id} is locked by another process"
+                    )
+                self._acquire_process_lock(snapshot)
             snapshot.refcount += 1
+            snapshot.externally_locked = False
 
             logger.debug(f"Acquired snapshot {snapshot_id}, refcount={snapshot.refcount}")
             return SnapshotHandle(snapshot, self)
@@ -387,6 +474,8 @@ class SnapshotManager:
                 return
 
             snapshot.refcount = max(0, snapshot.refcount - 1)
+            if snapshot.refcount == 0:
+                self._release_process_lock(snapshot)
             logger.debug(f"Released snapshot {snapshot.id}, refcount={snapshot.refcount}")
 
     def get_snapshot(self, snapshot_id: int) -> Snapshot | None:
@@ -397,6 +486,7 @@ class SnapshotManager:
     def get_snapshots(self) -> list[Snapshot]:
         """Get all snapshots, ordered by creation time (oldest first)."""
         with self._lock:
+            self._refresh_external_locks()
             return sorted(self._snapshots.values(), key=lambda s: s.created_at)
 
     def get_deletable_snapshots(self) -> list[Snapshot]:
@@ -426,10 +516,11 @@ class SnapshotManager:
                 return False
 
             snapshot = self._snapshots[snapshot_id]
+            self._refresh_external_lock(snapshot)
 
-            if snapshot.refcount > 0:
+            if not snapshot.is_deletable:
                 raise SnapshotInUseError(
-                    f"Snapshot {snapshot_id} has {snapshot.refcount} active references"
+                    f"Snapshot {snapshot_id} is in use"
                 )
 
             # Remove from tracking first
