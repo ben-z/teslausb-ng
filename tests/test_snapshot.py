@@ -1,22 +1,21 @@
 """Tests for snapshot management."""
 
-from pathlib import Path
-from datetime import datetime
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import (
     Snapshot,
-    SnapshotHandle,
-    SnapshotManager,
-    SnapshotState,
+    SnapshotCreationError,
     SnapshotError,
     SnapshotInUseError,
+    SnapshotManager,
     SnapshotNotFoundError,
-    SnapshotCreationError,
+    SnapshotState,
 )
 
 
@@ -57,6 +56,18 @@ class TestSnapshot:
             path=Path("/snap"),
             created_at=datetime.now(),
             refcount=1,
+        )
+
+        assert snap.state == SnapshotState.ARCHIVING
+        assert not snap.is_deletable
+
+    def test_snapshot_not_deletable_when_locked_by_another_process(self):
+        """Test that externally locked snapshots are not deletable."""
+        snap = Snapshot(
+            id=1,
+            path=Path("/snap"),
+            created_at=datetime.now(),
+            externally_locked=True,
         )
 
         assert snap.state == SnapshotState.ARCHIVING
@@ -268,6 +279,73 @@ class TestSnapshotManager:
 
         handle.release()
 
+    def test_get_deletable_snapshots_excludes_external_locks(
+        self,
+        mock_fs: MockFilesystem,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test externally locked snapshots are not reported as deletable."""
+        manager = SnapshotManager(
+            fs=mock_fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        snap1 = manager.create_snapshot()
+        snap2 = manager.create_snapshot()
+
+        monkeypatch.setattr(
+            manager,
+            "_is_locked_by_other_process",
+            lambda snapshot: snapshot.id == snap2.id,
+        )
+
+        snapshots = manager.get_snapshots()
+        by_id = {snapshot.id: snapshot for snapshot in snapshots}
+        assert by_id[snap1.id].state == SnapshotState.READY
+        assert by_id[snap2.id].state == SnapshotState.ARCHIVING
+
+        deletable = manager.get_deletable_snapshots()
+        assert [snapshot.id for snapshot in deletable] == [snap1.id]
+
+    def test_delete_snapshot_excludes_external_locks(
+        self,
+        mock_fs: MockFilesystem,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test externally locked snapshots cannot be deleted."""
+        manager = SnapshotManager(
+            fs=mock_fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        snapshot = manager.create_snapshot()
+        monkeypatch.setattr(manager, "_is_locked_by_other_process", lambda snap: True)
+
+        with pytest.raises(SnapshotInUseError):
+            manager.delete_snapshot(snapshot.id)
+
+        assert manager.get_snapshot(snapshot.id) is not None
+
+    def test_acquire_snapshot_excludes_external_locks(
+        self,
+        mock_fs: MockFilesystem,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test externally locked snapshots cannot be acquired."""
+        manager = SnapshotManager(
+            fs=mock_fs,
+            cam_disk_path=Path("/backingfiles/cam_disk.bin"),
+            snapshots_path=Path("/backingfiles/snapshots"),
+        )
+
+        snapshot = manager.create_snapshot()
+        monkeypatch.setattr(manager, "_is_locked_by_other_process", lambda snap: True)
+
+        with pytest.raises(SnapshotInUseError):
+            manager.acquire(snapshot.id)
+
     def test_snapshot_session(self, mock_fs: MockFilesystem):
         """Test snapshot_session context manager."""
         manager = SnapshotManager(
@@ -417,7 +495,11 @@ class TestPowerCutRecovery:
     is incomplete and will be cleaned up on restart.
     """
 
-    def test_incomplete_snapshot_without_toc_is_cleaned_up(self, mock_fs: MockFilesystem, tmp_path: Path):
+    def test_incomplete_snapshot_without_toc_is_cleaned_up(
+        self,
+        mock_fs: MockFilesystem,
+        tmp_path: Path,
+    ):
         """Test that snapshots without .toc file are cleaned up on restart."""
         snapshots_path = tmp_path / "snapshots"
         cam_disk = tmp_path / "cam.bin"
@@ -465,7 +547,9 @@ class TestPowerCutRecovery:
         mock_fs.mkdir(partial_delete_snap)
         mock_fs.write_text(
             partial_delete_snap / "metadata.json",
-            '{"id": 2, "path": "' + str(partial_delete_snap) + '", "created_at": "2024-01-01T00:00:00"}'
+            '{"id": 2, "path": "'
+            + str(partial_delete_snap)
+            + '", "created_at": "2024-01-01T00:00:00"}'
         )
         mock_fs.write_bytes(partial_delete_snap / "snap.bin", b"data")
         # Note: NO .toc file (was deleted during deletion process)
@@ -512,7 +596,11 @@ class TestPowerCutRecovery:
         assert snapshots[0].state == SnapshotState.READY
         assert snapshots[0].refcount == 0
 
-    def test_legacy_snapshot_without_metadata_is_reconstructed(self, mock_fs: MockFilesystem, tmp_path: Path):
+    def test_legacy_snapshot_without_metadata_is_reconstructed(
+        self,
+        mock_fs: MockFilesystem,
+        tmp_path: Path,
+    ):
         """Test that legacy snapshots without metadata.json are reconstructed."""
         snapshots_path = tmp_path / "snapshots"
         cam_disk = tmp_path / "cam.bin"
