@@ -1,20 +1,26 @@
 # Agent Guidelines
 
-teslausb-ng is a Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb). See [DESIGN.md](DESIGN.md) for architecture and design decisions.
+teslausb-ng is a Rust implementation of TeslaUSB-style dashcam archiving. See
+[DESIGN.md](DESIGN.md) for architecture and safety invariants.
 
 ## Code Style
 
-- Python 3.9+, type hints everywhere
-- Dataclasses for data, protocols for abstractions
-- Each module has one clear purpose
-- Tests use `MockFilesystem`, not real filesystem
+- Rust 2021
+- Prefer standard library APIs and small local helpers
+- Keep modules focused on one purpose
+- Use `Result<T>` with contextual errors instead of panics in production paths
+- Use RAII guards for resources that must be cleaned up
+- Tests that touch snapshot/archive behavior should use `MockFileSystem`, not the
+  real filesystem
 
 ## Grammar
 
-In prose (comments, docstrings, error messages, documentation), use the verb form (two words). In identifiers (function names, command names, variables), the noun form (one word) is fine.
+In prose (comments, error messages, documentation), use the verb form (two words).
+In identifiers (function names, command names, variables), the noun form (one word)
+is fine.
 
 | Noun (one word) | Verb (two words) |
-|-----------------|------------------|
+| --- | --- |
 | setup | set up |
 | teardown | tear down |
 | cleanup | clean up |
@@ -25,49 +31,62 @@ In prose (comments, docstrings, error messages, documentation), use the verb for
 | logout | log out |
 
 Examples:
-- `backup_path` - variable name (noun form OK)
-- `"Failed to set up gadget"` - error message (use verb form)
-- `teslausb clean` - command uses verb form
-- `"Clean up old snapshots"` - help text (use verb form)
 
-CLI commands use verb forms: `init`, `run`, `clean`, `validate`, `enable`, `disable`, `remove`.
+- `cleanup_empty_dirs` - function name (noun form OK)
+- `"failed to set up loop device"` - error message (use verb form)
+- `teslausb clean` - command name
+- `"Clean up old snapshots"` - help text
 
 ## Modules
 
 | Module | Purpose |
-|--------|---------|
-| `coordinator.py` | Main orchestration loop |
-| `snapshot.py` | Snapshot lifecycle with refcounting |
-| `archive.py` | Archive via rclone |
-| `space.py` | Disk space management |
-| `filesystem.py` | Filesystem abstraction (protocol + real + mock) |
-| `config.py` | Configuration from env/file |
-| `gadget.py` | USB mass storage gadget |
-| `mount.py` | Loop device mounting |
-| `idle.py` | Detect when car stops writing |
-| `led.py` | Status LED control |
-| `temperature.py` | CPU temperature monitoring |
-| `cli.py` | Command-line interface |
+| --- | --- |
+| `cli.rs` | Command-line interface and systemd service management |
+| `command.rs` | Subprocess execution with timeout handling |
+| `config.rs` | Configuration from env/file |
+| `dependencies.rs` | Dependency and version preflight checks |
+| `filesystem.rs` | Filesystem abstraction and mock |
+| `snapshot.rs` | Snapshot lifecycle with refcounting |
+| `archive.rs` | Archive via rclone and verified deletion |
+| `mount.rs` | Loop device and mount guards |
+| `gadget.rs` | USB mass storage gadget |
+| `idle.rs` | USB write-idle detection |
+| `led.rs` | Sysfs status LED control |
+| `temperature.rs` | Sysfs CPU temperature monitoring |
+| `coordinator.rs` | Main archive loop |
+| `space.rs` | Disk space management |
 
 ## Testing
 
 ```bash
-pytest tests/ -v
+cargo fmt
+cargo test
+cargo llvm-cov --locked --summary-only --fail-under-lines 85
+scripts/run-linux-integration.sh
 ```
+
+`cargo test` includes offline CLI integration tests with fake Unix tools. Keep
+those tests current when changing deployment, service, mount, `run`, or archive
+flows. `scripts/run-linux-integration.sh` runs ignored Linux tests that use real
+loop devices, XFS, FAT32, and mounts; use a privileged Linux host, VM, or QEMU
+guest.
 
 ## Common Tasks
 
 **Adding a new archive backend:**
-1. Implement `ArchiveBackend` in `archive.py`
-2. Add creation logic in `cli.py:create_components()`
-3. Add tests in `test_archive.py`
+
+1. Extend `ArchiveBackend` in `archive.rs`
+2. Add construction logic in `cli.rs:create_components`
+3. Add focused unit tests with `MockFileSystem`
 
 **Modifying snapshot behavior:**
-1. Core logic in `snapshot.py`
-2. `.toc` handling is critical for crash safety
-3. Test with `MockFilesystem`
+
+1. Update `snapshot.rs`
+2. Preserve `.toc` ordering; it is critical for crash safety
+3. Test with `MockFileSystem`
 
 **Changing space management:**
-1. Logic in `space.py`
-2. Reserve is fixed at 10GB
+
+1. Update `space.rs`
+2. Preserve 512-byte sector alignment
 3. Formula: `cam_size = (backingfiles_size - 3% overhead) / 2`

@@ -9,23 +9,42 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest
-          pip install -e .
+      - name: Check formatting
+        run: cargo fmt --check
 
-      - name: Run unit tests
-        run: pytest tests/ --ignore=tests/integration -v
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run clippy
+        run: cargo clippy --locked -- -D warnings
+
+      - name: Install coverage tool
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Check coverage
+        run: cargo llvm-cov --locked --summary-only --fail-under-lines 85
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  linux-integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux integration dependencies
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs dosfstools kpartx parted util-linux
+
+      - name: Run Linux integration tests
+        run: scripts/run-linux-integration.sh
