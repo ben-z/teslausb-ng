@@ -8,12 +8,13 @@ This module provides:
 
 from __future__ import annotations
 
+import json
 import logging
-import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -90,7 +91,7 @@ class CopyResult:
     bytes_transferred: int = 0
     error: str | None = None
     # Files confirmed present in the archive and safe to consider for deletion.
-    # On failed copies this may be a partial list parsed from rclone output.
+    # On failed copies this may be a partial list parsed from rclone's structured output.
     archived_files: list[ArchivedFile] = field(default_factory=list)
 
 
@@ -248,31 +249,63 @@ class RcloneBackend(ArchiveBackend):
         """Combine subprocess output streams into one log string."""
         return "\n".join(text for output in outputs if (text := self._decode_output(output)))
 
-    def _parse_rclone_paths(self, output: str, markers: tuple[str, ...]) -> set[str]:
-        """Parse relative file paths from rclone log lines.
+    def _rclone_json_records(self, output: str) -> Iterator[dict[str, object]]:
+        """Yield structured rclone log records from line-delimited JSON output."""
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug(f"Ignoring non-JSON rclone log line: {line}")
+                continue
+            if isinstance(record, dict):
+                yield record
 
-        Rclone emits lines like:
-            <6>INFO  : event/front.mp4: Copied (new)
-            <6>INFO  : event/front.mp4: Unchanged skipping
+    def _parse_rclone_paths(self, output: str, message_prefixes: tuple[str, ...]) -> set[str]:
+        """Parse relative file paths from structured rclone log records.
 
-        Only paths followed by one of the supplied markers are returned.
+        With --use-json-log, rclone emits one JSON record per line. File-level
+        records include fields like:
+            {"object": "event/front.mp4", "msg": "Copied (new)"}
+            {"object": "event/front.mp4", "msg": "Unchanged skipping"}
+
+        Only objects whose message starts with one of the supplied prefixes are
+        returned.
         """
         paths: set[str] = set()
 
-        for raw_line in output.splitlines():
-            line = raw_line.strip()
-            for marker in markers:
-                if marker not in line:
-                    continue
-
-                prefix, _, _ = line.partition(marker)
-                match = re.search(r"INFO\s+:\s*(?P<path>.+)$", prefix)
-                rel_path = match.group("path").strip() if match else prefix.strip()
-                if rel_path:
-                    paths.add(rel_path.lstrip("/"))
-                break
+        for record in self._rclone_json_records(output):
+            message = record.get("msg")
+            rel_path = record.get("object")
+            if not isinstance(message, str) or not isinstance(rel_path, str):
+                continue
+            if not any(message.startswith(prefix) for prefix in message_prefixes):
+                continue
+            rel_path = rel_path.strip().lstrip("/")
+            if rel_path:
+                paths.add(rel_path)
 
         return paths
+
+    def _rclone_error_message(self, output: str) -> str:
+        """Extract a useful error message from rclone JSON logs."""
+        fallback = output.strip().splitlines()[-1] if output.strip() else "Unknown error"
+        last_message: str | None = None
+        last_error: str | None = None
+
+        for record in self._rclone_json_records(output):
+            message = record.get("msg")
+            if not isinstance(message, str) or not message.strip():
+                continue
+            clean_message = " ".join(message.split())
+            last_message = clean_message
+            level = record.get("level")
+            if isinstance(level, str) and level.lower() in {"error", "fatal"}:
+                last_error = clean_message
+
+        return last_error or last_message or fallback
 
     def _select_archived_files(
         self,
@@ -304,11 +337,13 @@ class RcloneBackend(ArchiveBackend):
         logger.debug(f"Scanned {len(archived_files)} files in {src}")
 
         dest = self._dest(dst_name)
+        json_log_flags = [] if "--use-json-log" in self.flags else ["--use-json-log"]
         cmd = [
             "rclone", "copy",
             str(src),
             dest,
             "--stats-one-line",
+            *json_log_flags,
             "-v",
         ] + self.flags
 
@@ -328,16 +363,16 @@ class RcloneBackend(ArchiveBackend):
             for line in output.splitlines():
                 logger.debug(f"rclone: {line}")
 
-            copied_paths = self._parse_rclone_paths(output, (": Copied (",))
+            copied_paths = self._parse_rclone_paths(output, ("Copied",))
             copied_files = self._select_archived_files(archived_files, copied_paths)
-            files_transferred = len(copied_paths)
+            files_transferred = len(copied_files)
             bytes_transferred = sum(file.size for file in copied_files)
 
             if result.returncode != 0:
-                error_msg = output.strip().split("\n")[-1] if output else "Unknown error"
+                error_msg = self._rclone_error_message(output)
                 confirmed_paths = self._parse_rclone_paths(
                     output,
-                    (": Copied (", ": Unchanged skipping"),
+                    ("Copied", "Unchanged skipping"),
                 )
                 confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
                 logger.error(f"rclone copy failed: {error_msg}")
@@ -360,7 +395,7 @@ class RcloneBackend(ArchiveBackend):
             output = self._combined_output(e.stdout, e.stderr)
             confirmed_paths = self._parse_rclone_paths(
                 output,
-                (": Copied (", ": Unchanged skipping"),
+                ("Copied", "Unchanged skipping"),
             )
             confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
             logger.error(f"rclone timeout copying {src}")
@@ -652,16 +687,15 @@ class ArchiveManager:
 
     def archive_new_snapshot(
         self,
-        mount_fn: Callable[[Path], Iterator[Path]],
+        mount_fn: Callable[[Path], AbstractContextManager[Path]],
         delete_after_archive: bool = True,
     ) -> ArchiveResult:
         """Create a new snapshot, mount it, archive, and optionally delete archived files.
 
         Args:
             mount_fn: Context manager function that mounts an image and yields mount path.
-            delete_after_archive: If True and cam_disk_path is set, delete archived
-                files from cam_disk. Only successfully-copied directories are deleted,
-                even if other directories failed.
+            delete_after_archive: If True and cam_disk_path is set, delete files
+                confirmed present in the archive from cam_disk.
 
         Returns:
             ArchiveResult with details of the operation
