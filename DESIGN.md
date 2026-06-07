@@ -1,131 +1,127 @@
 # Design
 
-## Why Rewrite?
+## Goal
 
-The [original TeslaUSB](https://github.com/marcone/teslausb) bash implementation had:
+teslausb-ng is an appliance-style command-line tool for Tesla dashcam archiving.
+It should be simple to deploy, predictable after power loss, and conservative
+around mounted filesystems and USB gadget state.
 
-1. **Race conditions**: `freespacemanager` deletes snapshots while `archiveloop` reads them
-2. **No reference counting**: Snapshots have no concept of "in use"
-3. **Unbounded snapshots**: Timer-based snapshots accumulate, causing disk-full errors
-4. **Complex state**: Spread across filesystem markers with no clear model
+The implementation is Rust, but the design remains Unix-oriented: specialized
+system tools do filesystem, partition, USB, and cloud-storage work. The binary
+coordinates them and owns the safety invariants.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Coordinator                             │
-│  (Orchestrates snapshot creation, archiving, space management)  │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-        ┌─────────────┼─────────────┬─────────────┐
-        ▼             ▼             ▼             ▼
-   Snapshot      Archive       Space         Gadget
-   Manager       Manager       Manager      (USB MSC)
-        │             │             │
-        └─────────────┴─────────────┘
-                      │
-                      ▼
-             Filesystem Protocol
-                      │
-           ┌──────────┴──────────┐
-           ▼                     ▼
-     RealFilesystem       MockFilesystem
+```text
+CLI
+ ├── Config
+ ├── SnapshotManager
+ ├── ArchiveManager
+ ├── Coordinator
+ ├── UsbGadget
+ ├── MountedImage / LoopDevice guards
+ └── CommandRunner
 ```
 
-Optional: IdleDetector, LedController, TemperatureMonitor
+| Module | Purpose |
+| --- | --- |
+| `cli.rs` | Command-line interface and systemd installation |
+| `command.rs` | Subprocess execution with captured output and timeouts |
+| `config.rs` | Environment and config-file loading |
+| `filesystem.rs` | Filesystem abstraction and test mock |
+| `snapshot.rs` | Snapshot lifecycle and refcounting |
+| `archive.rs` | rclone archiving and post-archive deletion checks |
+| `mount.rs` | Loop device and mount RAII guards |
+| `dependencies.rs` | Startup and doctor checks for external commands and versions |
+| `gadget.rs` | Linux USB gadget configfs management |
+| `idle.rs` | USB mass-storage write-idle detection |
+| `led.rs` | Sysfs status LED patterns |
+| `temperature.rs` | Sysfs CPU temperature monitoring |
+| `coordinator.rs` | Main archive loop |
+| `space.rs` | Disk sizing and space reporting |
 
-## Snapshot Design
+## Crash Safety
 
-### State Model
+The snapshot completion marker is the source of truth.
 
-State is **derived from refcount**, not stored:
+| Operation | Order | Recovery |
+| --- | --- | --- |
+| Create | reflink `snap.bin`, write metadata, atomically write `snap.toc` | no `snap.toc` means delete on load |
+| Delete | remove `snap.toc`, sync directory, remove snapshot directory | no `snap.toc` means delete on load |
+| Load | scan `snap-*` directories and require `snap.toc` | incomplete directories are removed |
 
-```python
-class SnapshotState(Enum):
-    READY = "ready"        # refcount == 0
-    ARCHIVING = "archiving"  # refcount > 0
+Metadata is useful but not trusted. If metadata is missing or stale, the snapshot
+can be reconstructed from the directory name and `snap.bin` mtime.
 
-@property
-def state(self) -> SnapshotState:
-    return SnapshotState.ARCHIVING if self.refcount > 0 else SnapshotState.READY
+## Resource Safety
+
+Rust destructors are used for resources that must be unwound:
+
+- `LoopDevice` detaches `losetup` and removes `kpartx` mappings
+- `MountedImage` unmounts and removes the temporary mount directory
+- `GadgetDisableGuard` re-enables the gadget if it was disabled to clean up files
+- `SnapshotHandle` decrements snapshot refcounts on drop
+- `TemperatureMonitorGuard` stops the background temperature thread on drop
+
+This does not make `SIGKILL` or power loss graceful, so the `.toc` recovery model
+still matters.
+
+## Archive Cycle
+
+```text
+wait until archive is reachable
+set status LED to slow blink
+set status LED to fast blink while the archive cycle runs
+delete all stale/deletable snapshots
+wait for USB writes to become idle; proceed on timeout
+create reflink snapshot
+mount snapshot read-only
+copy enabled clip directories with rclone
+disable USB gadget if it is enabled
+fsck cam disk
+mount cam disk read-write
+delete only files whose sizes still match the archived scan
+unmount cam disk
+re-enable USB gadget
+delete snapshot
+set status LED to heartbeat after a successful cycle
+repeat
 ```
 
-### Crash Safety
+The live camera disk is never mounted read-write while it is exposed to the car
+through the USB gadget.
 
-The `.toc` file is the single source of truth:
+## Storage Model
 
-| Operation | Order | Crash Recovery |
-|-----------|-------|----------------|
-| Create | Write data, then `.toc` | No `.toc` = incomplete = auto-delete |
-| Delete | Delete `.toc`, then data | No `.toc` = incomplete = auto-delete |
-| Load | Check `.toc` exists | Missing `.toc` = delete directory |
-
-### Reference Counting
-
-```python
-with snapshot_manager.acquire(snap_id) as handle:
-    # refcount=1, cannot be deleted
-    archive_files(handle.snapshot)
-# refcount=0, can be deleted
+```text
+/mutable/backingfiles.img  (XFS, reflink-capable)
+  mounted at /backingfiles
+    cam_disk.bin           (FAT32 disk image exposed to Tesla)
+    snapshots/
+      snap-000000/
+        snap.bin           (reflink copy of cam_disk.bin)
+        metadata.json
+        snap.toc
 ```
 
-## Main Loop
+The camera disk size is calculated as:
 
-```python
-while running:
-    wait_for_archive_reachable()
-
-    # Delete all stale snapshots from previous runs
-    while snapshot_manager.delete_oldest_if_deletable():
-        pass
-
-    wait_for_idle()
-
-    with snapshot_manager.snapshot_session() as handle:
-        archive_manager.archive_snapshot(handle, mount_path)
-
-    # Delete snapshot immediately after archiving
-    snapshot_manager.delete_snapshot(handle.snapshot.id)
+```text
+cam_size = (backingfiles_size - 3% XFS overhead) / 2
 ```
 
-Archives continuously while WiFi is available. Idle detection gates each cycle.
+This reserves half the XFS volume for the worst case where every camera-disk block
+diverges while a snapshot exists.
 
-## Storage Architecture
+## Deployment
 
-```
-/mutable/backingfiles.img (XFS, sparse)
-    └── mounted at /backingfiles
-        ├── cam_disk.bin (FAT32, sparse, CAM_SIZE)
-        │   └── TeslaCam/
-        └── snapshots/
-            └── <id>/
-                ├── image.bin (reflink copy of cam_disk.bin)
-                └── .toc
+Deployment is a binary copy:
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/teslausb /usr/local/bin/teslausb
 ```
 
-**Why XFS?** Reflinks (copy-on-write) enable instant, space-efficient snapshots. A 40 GiB cam disk can be "copied" in milliseconds, using no extra space until Tesla writes new data.
-
-**Why a disk image?** The backingfiles.img allows teslausb to work on any root filesystem (ext4, etc.) while still getting XFS benefits for the snapshot directory.
-
-## Space Management
-
-**Simple model**: User sets `RESERVE` (space for OS), everything else is automatic.
-
-```
-available_disk - RESERVE = backingfiles.img size
-backingfiles.img - 3% XFS overhead = usable space
-usable space / 2 = cam_size (half for cam_disk, half for snapshot)
-```
-
-Example with 128 GiB SD card:
-- RESERVE = 10 GiB (for OS)
-- backingfiles.img = 118 GiB
-- XFS overhead = 3.5 GiB (3%)
-- cam_size = 57 GiB
-
-**Key invariant**: Since `cam_size` is at most half the XFS volume, eagerly deleting all stale snapshots before creating a new one guarantees enough space — even under worst-case COW divergence where every block changes.
-
-- Snapshots use XFS reflinks (copy-on-write), so they start small
-- Worst case: snapshot grows to full `cam_size` if all blocks change during archiving
-- Eager deletion strategy: delete all stale snapshots before each archive cycle, and delete the current snapshot immediately after archiving
-- No threshold checks needed — the half-volume sizing guarantee is sufficient
+The systemd unit is generated by `teslausb service install` using the actual
+`current_exe()` path, avoiding `pip`, virtual environments, and `sudo PATH`
+ambiguity.
