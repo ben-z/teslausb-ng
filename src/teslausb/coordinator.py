@@ -238,7 +238,8 @@ class Coordinator:
         if self.config.idle_detector:
             logger.info("Waiting for car to become idle...")
             if not self.config.idle_detector.wait_for_idle(self.config.idle_timeout):
-                logger.warning("Timeout waiting for idle, proceeding anyway")
+                logger.warning("Timeout waiting for idle, skipping archive cycle")
+                return False
 
         # Notify archive start
         if self.config.on_archive_start:
