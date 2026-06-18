@@ -17,6 +17,7 @@ from teslausb.archive import (
 from teslausb.coordinator import Coordinator, CoordinatorConfig, _backoff_intervals
 from teslausb.filesystem import MockFilesystem
 from teslausb.gadget import LunConfig, MockGadget
+from teslausb.idle import MockIdleDetector
 from teslausb.snapshot import SnapshotManager
 from teslausb.space import SpaceManager
 
@@ -174,6 +175,37 @@ class TestStaleSnapshotCleanup:
             coordinator._do_archive_cycle()
 
         assert not any("stale snapshot" in r.message.lower() for r in caplog.records)
+
+
+class TestIdleGate:
+    """Tests for waiting until the car is idle before archiving."""
+
+    def test_archive_skipped_when_idle_timeout(self, coordinator: Coordinator):
+        """Archive is not started when idle detection times out."""
+        coordinator.config.idle_detector = MockIdleDetector(always_idle=False)
+        coordinator.archive_manager.archive_new_snapshot = MagicMock()
+
+        result = coordinator._do_archive_cycle()
+
+        assert result is False
+        coordinator.archive_manager.archive_new_snapshot.assert_not_called()
+
+    def test_archive_runs_when_idle_detected(self, coordinator: Coordinator):
+        """Archive starts normally when idle detection succeeds."""
+        coordinator.config.idle_detector = MockIdleDetector(always_idle=True)
+        success_result = ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            files_transferred=0,
+        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(
+            return_value=success_result
+        )
+
+        result = coordinator._do_archive_cycle()
+
+        assert result is True
+        coordinator.archive_manager.archive_new_snapshot.assert_called_once()
 
 
 class TestPostArchiveSnapshotDeletion:

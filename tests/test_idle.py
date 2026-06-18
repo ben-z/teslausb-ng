@@ -88,6 +88,7 @@ class TestProcIdleDetector:
 
         assert detector.proc_path == tmp_path
         assert detector.process_name == "file-storage"
+        assert detector.write_threshold == 500000
 
     def test_find_process_pid_not_found(self, tmp_path):
         """Test finding PID when process doesn't exist."""
@@ -142,6 +143,23 @@ class TestProcIdleDetector:
         result = detector.wait_for_idle(timeout=2)
 
         assert result is True  # No process = idle
+
+    def test_wait_for_idle_when_process_is_quiet(self, tmp_path):
+        """Test active mass storage process is idle when write count is stable."""
+        proc_dir = tmp_path / "1234"
+        proc_dir.mkdir()
+        (proc_dir / "comm").write_text("file-storage\n")
+        (proc_dir / "io").write_text("write_bytes: 2000\n")
+        detector = ProcIdleDetector(
+            proc_path=tmp_path,
+            idle_confirm_seconds=2,
+            poll_interval=0.0,
+        )
+
+        result = detector.wait_for_idle(timeout=2)
+
+        assert result is True
+        assert detector.get_status().state == IdleState.IDLE
 
     def test_get_status_initial(self, tmp_path):
         """Test initial status."""
