@@ -19,7 +19,7 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 ## Quick Start
 
-1. [Connect to WiFi](#wifi-setup)
+1. [Connect to WiFi](#set-up-wifi)
 2. [Install teslausb-ng](#installation)
 3. [Configure rclone](#rclone-configuration)
 4. [Create config file](#configuration)
@@ -27,7 +27,7 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 ---
 
-## WiFi Setup
+## Set Up WiFi
 
 Configure WiFi using NetworkManager:
 
@@ -180,7 +180,7 @@ Configure [rclone](https://rclone.org/) with your cloud provider:
 rclone config
 ```
 
-For headless setup, rclone provides a URL to authorize on another device.
+When running headless, rclone provides a URL you can open on another device to authorize.
 
 ---
 
