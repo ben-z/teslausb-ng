@@ -64,13 +64,17 @@ impl Harness {
         self.run_with_env(args, &[])
     }
 
-    fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let mut path = OsString::from(&self.fake_bin);
         path.push(":");
         path.push(&self.old_path);
-
         let mut command = Command::new(env!("CARGO_BIN_EXE_teslausb"));
         command.args(args).env("PATH", path).stdin(Stdio::null());
+        command
+    }
+
+    fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
+        let mut command = self.command(args);
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -78,17 +82,8 @@ impl Harness {
     }
 
     fn spawn_with_env(&self, args: &[&str], extra_env: &[(&str, &Path)]) -> Child {
-        let mut path = OsString::from(&self.fake_bin);
-        path.push(":");
-        path.push(&self.old_path);
-
-        let mut command = Command::new(env!("CARGO_BIN_EXE_teslausb"));
-        command
-            .args(args)
-            .env("PATH", path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = self.command(args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -199,7 +194,7 @@ fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
     assert!(stderr(&archive).contains("archive complete"));
     assert!(stderr(&archive).contains("clean up complete"));
 
-    assert_archive_contains_fixture(&archive_root);
+    assert_archive_contains_fixture(&archive_root.join("fake:TeslaArchive"));
     assert!(!archive_root
         .join("fake:TeslaArchive/RecentClips/recent/skip.mp4")
         .exists());
@@ -213,6 +208,155 @@ fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
     let snapshots = harness.run(&["--config", &config, "snapshots", "--json"]);
     assert_success(&snapshots);
     assert_eq!(stdout(&snapshots).trim(), "[]");
+}
+
+#[test]
+#[ignore = "requires root, real rclone, Linux loop devices, XFS reflinks, and FAT32 mounts"]
+fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let real_rclone = run_shell("command -v rclone");
+    assert_success(&real_rclone);
+    let rclone_binary = stdout(&real_rclone);
+    fs::remove_file(harness.fake_bin.join("rclone")).unwrap();
+    std::os::unix::fs::symlink(rclone_binary.trim(), harness.fake_bin.join("rclone")).unwrap();
+    let version = run(rclone_binary.trim(), ["version"]);
+    assert_success(&version);
+    eprintln!("real rclone integration version:\n{}", stdout(&version));
+
+    let archive_root = harness.root.join("archive-real");
+    fs::create_dir_all(&archive_root).unwrap();
+    let config_home = harness.root.join("config");
+    fs::create_dir_all(config_home.join("rclone")).unwrap();
+    fs::write(
+        config_home.join("rclone/rclone.conf"),
+        format!(
+            "[fake]\ntype = alias\nremote = {}\n",
+            archive_root.display()
+        ),
+    )
+    .unwrap();
+    let archive_destination = archive_root.join("TeslaArchive");
+    let config_template = fs::read_to_string(&harness.config).unwrap();
+    let set_flags = |flags: &str| {
+        fs::write(
+            &harness.config,
+            config_template.replace("RCLONE_FLAGS=--fast-list", &format!("RCLONE_FLAGS={flags}")),
+        )
+        .unwrap();
+    };
+    let archive = || {
+        harness
+            .command(&["--config", &config, "archive"])
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("RCLONE_CONFIG")
+            .env("HOME", "/root")
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap()
+    };
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "rw");
+        for path in [
+            "TeslaCam/SavedClips",
+            "TeslaCam/SentryClips",
+            "TeslaCam/Photobooth",
+            "TeslaTrackMode",
+        ] {
+            fs::create_dir_all(cam.path().join(path)).unwrap();
+        }
+    }
+    let empty = archive();
+    assert_success(&empty);
+    assert!(
+        stderr(&empty).contains("archive complete: 0 files"),
+        "{}",
+        describe(&empty)
+    );
+
+    for copied in [true, false] {
+        {
+            let cam =
+                PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "rw");
+            write_cam_fixture(cam.path());
+        }
+        set_flags("--checksum");
+        let output = archive();
+        assert_success(&output);
+        let expected = if copied {
+            "archive complete: 4 files"
+        } else {
+            "archive complete: 0 files"
+        };
+        assert!(stderr(&output).contains(expected), "{}", describe(&output));
+        assert_archive_contains_fixture(&archive_destination);
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
+        assert_archived_files_removed_from_cam(cam.path());
+    }
+
+    let unconfirmed = "TeslaCam/SavedClips/unconfirmed";
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "rw");
+        write_file(
+            cam.path().join(unconfirmed).join("front.mp4"),
+            "unconfirmed-video",
+        );
+        write_file(
+            cam.path().join(unconfirmed).join("event.json"),
+            "event-metadata",
+        );
+    }
+    set_flags("--dry-run");
+    let dry_run = archive();
+    assert_success(&dry_run);
+    assert!(
+        stderr(&dry_run).contains("archive complete: 0 files"),
+        "{}",
+        describe(&dry_run)
+    );
+    assert!(!archive_destination
+        .join("SavedClips/unconfirmed/front.mp4")
+        .exists());
+    assert!(!archive_destination
+        .join("SavedClips/unconfirmed/event.json")
+        .exists());
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
+        assert_eq!(
+            fs::read_to_string(cam.path().join(unconfirmed).join("front.mp4")).unwrap(),
+            "unconfirmed-video"
+        );
+        assert_eq!(
+            fs::read_to_string(cam.path().join(unconfirmed).join("event.json")).unwrap(),
+            "event-metadata"
+        );
+    }
+
+    set_flags("--exclude *.json");
+    let excluded = archive();
+    assert_success(&excluded);
+    assert!(
+        stderr(&excluded).contains("archive complete: 1 files"),
+        "{}",
+        describe(&excluded)
+    );
+    assert_eq!(
+        fs::read_to_string(archive_destination.join("SavedClips/unconfirmed/front.mp4")).unwrap(),
+        "unconfirmed-video"
+    );
+    assert!(!archive_destination
+        .join("SavedClips/unconfirmed/event.json")
+        .exists());
+    let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
+    assert_eq!(
+        fs::read_to_string(cam.path().join(unconfirmed).join("front.mp4")).unwrap(),
+        "unconfirmed-video"
+    );
+    assert_eq!(
+        fs::read_to_string(cam.path().join(unconfirmed).join("event.json")).unwrap(),
+        "event-metadata"
+    );
 }
 
 #[test]
@@ -267,7 +411,7 @@ exec /usr/sbin/fsck "$@"
         !fsck_marker.exists(),
         "fsck must be rejected before its process starts"
     );
-    assert_archive_contains_fixture(&archive_root);
+    assert_archive_contains_fixture(&archive_root.join("fake:TeslaArchive"));
     assert_success(&run(
         "mountpoint",
         [OsStr::new("-q"), cam.path().as_os_str()],
@@ -308,7 +452,7 @@ fn linux_failed_archive_cleans_files_confirmed_before_rclone_error() {
     assert!(stderr(&archive).contains("SentryClips"));
     assert!(stderr(&archive).contains("clean up complete"));
 
-    assert_archive_contains_fixture(&archive_root);
+    assert_archive_contains_fixture(&archive_root.join("fake:TeslaArchive"));
     {
         let cam = PartitionMount::mount(
             &harness.cam_disk(),
@@ -389,7 +533,7 @@ fn linux_run_loop_uses_real_mounts_and_stops_cleanly_on_sigterm() {
     assert_success(&output);
     assert!(stderr(&output).contains("archive complete"));
 
-    assert_archive_contains_fixture(&archive_root);
+    assert_archive_contains_fixture(&archive_root.join("fake:TeslaArchive"));
     {
         let cam = PartitionMount::mount(
             &harness.cam_disk(),
@@ -558,6 +702,7 @@ fn require_linux_integration() {
         "mountpoint",
         "modprobe",
         "parted",
+        "rclone",
         "stat",
         "sync",
         "truncate",
@@ -645,21 +790,19 @@ fn write_cam_fixture(root: &Path) {
 
 fn assert_archive_contains_fixture(archive_root: &Path) {
     assert_eq!(
-        fs::read_to_string(archive_root.join("fake:TeslaArchive/SavedClips/event/front.mp4"))
-            .unwrap(),
+        fs::read_to_string(archive_root.join("SavedClips/event/front.mp4")).unwrap(),
         "saved-front"
     );
     assert_eq!(
-        fs::read_to_string(archive_root.join("fake:TeslaArchive/SentryClips/sentry/rear.mp4"))
-            .unwrap(),
+        fs::read_to_string(archive_root.join("SentryClips/sentry/rear.mp4")).unwrap(),
         "sentry-rear"
     );
     assert_eq!(
-        fs::read_to_string(archive_root.join("fake:TeslaArchive/TrackMode/lap/video.mp4")).unwrap(),
+        fs::read_to_string(archive_root.join("TrackMode/lap/video.mp4")).unwrap(),
         "track-video"
     );
     assert_eq!(
-        fs::read_to_string(archive_root.join("fake:TeslaArchive/Photobooth/photo.jpg")).unwrap(),
+        fs::read_to_string(archive_root.join("Photobooth/photo.jpg")).unwrap(),
         "photo"
     );
 }

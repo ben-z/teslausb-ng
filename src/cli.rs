@@ -827,6 +827,7 @@ Wants=local-fs.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
+User=root\n\
 ExecStartPre={exe} doctor --startup\n\
 ExecStartPre={exe} mount\n\
 ExecStartPre={exe} gadget on\n\

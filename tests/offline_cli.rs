@@ -603,6 +603,7 @@ fn offline_service_install_status_and_uninstall() {
     assert_success(&install);
     let service = fs::read_to_string(&harness.service_path).unwrap();
     assert!(service.contains("ExecStartPre="));
+    assert!(service.contains("User=root\n"));
     assert!(service.contains(" doctor --startup\n"));
     assert!(service.contains(" mount\n"));
     assert!(service.contains(" gadget on\n"));
