@@ -653,45 +653,15 @@ class ArchiveManager:
     def archive_new_snapshot(
         self,
         mount_fn: Callable[[Path], Iterator[Path]],
-        delete_after_archive: bool = True,
     ) -> ArchiveResult:
-        """Create a new snapshot, mount it, archive, and optionally delete archived files.
+        """Create a snapshot, archive its contents, and release it.
 
-        Args:
-            mount_fn: Context manager function that mounts an image and yields mount path.
-            delete_after_archive: If True and cam_disk_path is set, delete archived
-                files from cam_disk. Only successfully-copied directories are deleted,
-                even if other directories failed.
-
-        Returns:
-            ArchiveResult with details of the operation
+        The coordinator owns deletion from the live disk while the USB gadget
+        is disconnected.
         """
-        from .mount import mount_image
-
-        snapshot = self.snapshot_manager.create_snapshot()
-        handle = self.snapshot_manager.acquire(snapshot.id)
-
+        handle = self.snapshot_manager.create_snapshot()
         try:
-            with mount_fn(snapshot.image_path) as mount_path:
-                result = self.archive_snapshot(handle, mount_path)
-
-            # Delete files confirmed present in the archive, even if some
-            # directories failed. delete_archived_files still verifies sizes
-            # before removing anything from the live cam_disk.
-            if (
-                delete_after_archive
-                and self.cam_disk_path
-                and result.archived_files
-            ):
-                logger.info("Deleting archived files from cam_disk...")
-                try:
-                    with mount_image(self.cam_disk_path, readonly=False) as cam_mount:
-                        deleted, skipped = self.delete_archived_files(result, cam_mount)
-                        logger.info(f"Cleanup complete: {deleted} deleted, {skipped} skipped")
-                except Exception as e:
-                    # Don't fail the archive if cleanup fails - files will be re-archived next time
-                    logger.error(f"Failed to delete archived files: {e}")
-
-            return result
+            with mount_fn(handle.snapshot.image_path) as mount_path:
+                return self.archive_snapshot(handle, mount_path)
         finally:
             handle.release()

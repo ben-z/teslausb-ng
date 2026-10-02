@@ -121,7 +121,48 @@ class Config:
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
 
+        if not (0 < self.snapshot_space_proportion <= 1):
+            warnings.append(
+                f"snapshot_space_proportion must be between 0 and 1, "
+                f"got {self.snapshot_space_proportion}"
+            )
+
         return warnings
+
+
+def _load_from_dict(env: dict[str, str]) -> Config:
+    """Build a Config from a string dictionary (shared by load_from_env and load_from_file).
+
+    Args:
+        env: Dictionary mapping variable names to values
+
+    Returns:
+        Config instance
+    """
+    rclone_flags = env.get("RCLONE_FLAGS", "").split() if env.get("RCLONE_FLAGS") else []
+
+    archive = ArchiveConfig(
+        system=env.get("ARCHIVE_SYSTEM", "none").lower(),
+        rclone_drive=env.get("RCLONE_DRIVE", ""),
+        rclone_path=env.get("RCLONE_PATH", ""),
+        rclone_flags=rclone_flags,
+        archive_recent=env.get("ARCHIVE_RECENTCLIPS", "false").lower() == "true",
+        archive_saved=env.get("ARCHIVE_SAVEDCLIPS", "true").lower() != "false",
+        archive_sentry=env.get("ARCHIVE_SENTRYCLIPS", "true").lower() != "false",
+        archive_track=env.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false",
+        archive_photobooth=env.get("ARCHIVE_PHOTOBOOTH", "true").lower() != "false",
+    )
+
+    config = Config(
+        backingfiles_path=Path(env.get("BACKINGFILES_PATH", "/backingfiles")),
+        mutable_path=Path(env.get("MUTABLE_PATH", "/mutable")),
+        archive=archive,
+    )
+
+    if proportion := env.get("SNAPSHOT_SPACE_PROPORTION"):
+        config.snapshot_space_proportion = float(proportion)
+
+    return config
 
 
 def load_from_env() -> Config:
@@ -130,41 +171,12 @@ def load_from_env() -> Config:
     Reads environment variables:
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
-    - RCLONE_DRIVE, RCLONE_PATH
+    - RCLONE_DRIVE, RCLONE_PATH, RCLONE_FLAGS (space-separated)
 
     Returns:
         Config instance
     """
-    config = Config()
-    archive = ArchiveConfig()
-
-    # Optional path overrides
-    if path := os.environ.get("MUTABLE_PATH"):
-        config.mutable_path = Path(path)
-    if path := os.environ.get("BACKINGFILES_PATH"):
-        config.backingfiles_path = Path(path)
-
-    # Archive system
-    archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()
-
-    # rclone settings
-    archive.rclone_drive = os.environ.get("RCLONE_DRIVE", "")
-    archive.rclone_path = os.environ.get("RCLONE_PATH", "")
-
-    # What to archive
-    archive.archive_recent = os.environ.get("ARCHIVE_RECENTCLIPS", "false").lower() == "true"
-    archive.archive_saved = os.environ.get("ARCHIVE_SAVEDCLIPS", "true").lower() != "false"
-    archive.archive_sentry = os.environ.get("ARCHIVE_SENTRYCLIPS", "true").lower() != "false"
-    archive.archive_track = os.environ.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false"
-    archive.archive_photobooth = os.environ.get("ARCHIVE_PHOTOBOOTH", "true").lower() != "false"
-
-    config.archive = archive
-
-    # Space management
-    if proportion := os.environ.get("SNAPSHOT_SPACE_PROPORTION"):
-        config.snapshot_space_proportion = float(proportion)
-
-    return config
+    return _load_from_dict(dict(os.environ))
 
 
 def load_from_file(path: Path) -> Config:
@@ -172,6 +184,8 @@ def load_from_file(path: Path) -> Config:
 
     Parses files like teslausb_setup_variables.conf that use
     export VAR=value or VAR=value syntax.
+
+    File values are used directly without mutating os.environ.
 
     Args:
         path: Path to config file
@@ -182,7 +196,6 @@ def load_from_file(path: Path) -> Config:
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
 
-    # Parse the file and set environment variables
     env_vars: dict[str, str] = {}
 
     with open(path) as f:
@@ -203,18 +216,10 @@ def load_from_file(path: Path) -> Config:
                 key = key.strip()
                 value = value.strip()
 
-                # Remove quotes
-                if (value.startswith('"') and value.endswith('"')) or \
-                   (value.startswith("'") and value.endswith("'")):
+                # Remove surrounding quotes
+                if len(value) >= 2 and value[0] in ("'", '"') and value[0] == value[-1]:
                     value = value[1:-1]
 
                 env_vars[key] = value
 
-    # Temporarily set environment variables and load
-    old_env = dict(os.environ)
-    try:
-        os.environ.update(env_vars)
-        return load_from_env()
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    return _load_from_dict(env_vars)

@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -80,15 +81,19 @@ class ProcIdleDetector:
         self,
         proc_path: Path = Path("/proc"),
         process_name: str = "file-storage",
+        stop_event: Event | None = None,
     ):
         """Initialize the idle detector.
 
         Args:
             proc_path: Path to /proc filesystem
             process_name: Name of the mass storage process to monitor
+            stop_event: Optional threading event for interruptible waits.
+                        When set, wait_for_idle returns False immediately.
         """
         self.proc_path = proc_path
         self.process_name = process_name
+        self.stop_event = stop_event
         self._state = IdleState.UNDETERMINED
         self._prev_written = -1
         self._burst_size = 0
@@ -137,10 +142,14 @@ class ProcIdleDetector:
     def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
         """Wait for the car to become idle.
 
-        Uses a state machine to detect idle:
-        1. UNDETERMINED: Wait for first significant write
-        2. WRITING: Car is actively writing
-        3. IDLE: No writes for IDLE_CONFIRM_SECONDS
+        Uses a state machine with three states:
+        - UNDETERMINED: Initial, waiting for baseline sample
+        - WRITING: Active writes detected (>500KB/sec)
+        - IDLE: Below threshold; confirmed after IDLE_CONFIRM_SECONDS quiet samples
+
+        UNDETERMINED and IDLE share identical transition logic: accumulate
+        quiet samples toward the confirmation threshold, or enter WRITING
+        on a large delta.
 
         Args:
             timeout: Maximum seconds to wait
@@ -157,7 +166,12 @@ class ProcIdleDetector:
 
         start_time = time.monotonic()
         while (time.monotonic() - start_time) < timeout:
-            time.sleep(1)
+            if self.stop_event:
+                if self.stop_event.wait(timeout=1):
+                    logger.info("Stop requested, aborting idle wait")
+                    return False
+            else:
+                time.sleep(1)
 
             pid = self._find_process_pid()
             if pid is None:
@@ -176,13 +190,7 @@ class ProcIdleDetector:
             delta = written - self._prev_written
             self._prev_written = written
 
-            if self._state == IdleState.UNDETERMINED:
-                if delta > WRITE_THRESHOLD:
-                    logger.info("Write in progress")
-                    self._state = IdleState.WRITING
-                    self._burst_size = delta
-
-            elif self._state == IdleState.WRITING:
+            if self._state == IdleState.WRITING:
                 if delta < WRITE_THRESHOLD:
                     logger.info(f"No longer writing, wrote {self._burst_size} bytes")
                     self._state = IdleState.IDLE
@@ -191,9 +199,12 @@ class ProcIdleDetector:
                 else:
                     self._burst_size += delta
 
-            elif self._state == IdleState.IDLE:
+            else:
+                # UNDETERMINED and IDLE share the same transition logic:
+                # accumulate quiet samples, return on confirmation threshold,
+                # or enter WRITING on a big delta.
                 if delta > WRITE_THRESHOLD:
-                    logger.info("Going back to writing state")
+                    logger.info("Write in progress")
                     self._state = IdleState.WRITING
                     self._burst_size = delta
                     self._idle_count = 0
@@ -203,6 +214,7 @@ class ProcIdleDetector:
                         logger.info(
                             f"No writes seen in the last {IDLE_CONFIRM_SECONDS} seconds"
                         )
+                        self._state = IdleState.IDLE
                         return True
 
         logger.warning("Couldn't determine idle interval")
