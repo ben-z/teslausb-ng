@@ -289,6 +289,7 @@ struct MockState {
     tick: u64,
     locks: HashSet<PathBuf>,
     removal_failures: HashSet<PathBuf>,
+    fail_next_reflink: bool,
 }
 
 #[cfg(test)]
@@ -345,6 +346,10 @@ impl MockFileSystem {
             .unwrap()
             .removal_failures
             .insert(normalize(path));
+    }
+
+    pub fn fail_next_reflink(&self) {
+        self.inner.lock().unwrap().fail_next_reflink = true;
     }
 
     pub fn allow_removal(&self, path: &Path) {
@@ -494,6 +499,9 @@ impl FileSystem for MockFileSystem {
         let src = normalize(src);
         let dst = normalize(dst);
         let mut state = self.inner.lock().unwrap();
+        if std::mem::take(&mut state.fail_next_reflink) {
+            return Err(Error::new("injected reflink failure"));
+        }
         let content = state
             .files
             .get(&src)

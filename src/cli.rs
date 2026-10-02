@@ -17,7 +17,7 @@ use crate::gadget::{LunConfig, UsbGadget};
 use crate::idle::ProcIdleDetector;
 use crate::led::SysfsLedController;
 use crate::mount::setup_loop_device;
-use crate::snapshot::SnapshotManager;
+use crate::snapshot::{validate_camera_image, SnapshotManager};
 use crate::space::{calculate_cam_size, disk_space, DEFAULT_RESERVE, MIN_CAM_SIZE};
 use crate::temperature::{SysfsTemperatureMonitor, TemperatureConfig};
 
@@ -157,6 +157,7 @@ fn create_components(
     ArchiveManager<RealFileSystem>,
 )> {
     let fs = RealFileSystem;
+    validate_camera_image(&fs, &config.cam_disk_path())?;
     let snapshot_manager =
         SnapshotManager::new(fs, config.cam_disk_path(), config.snapshots_path())?;
     snapshot_manager.recover_incomplete()?;
@@ -321,6 +322,11 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
     let config = config(args)?;
     let mut warnings = config.warnings();
     let mounted = is_mounted(&config.backingfiles_path)?;
+    if mounted {
+        if let Err(error) = validate_camera_image(&RealFileSystem, &config.cam_disk_path()) {
+            warnings.push(error.to_string());
+        }
+    }
     let archive_reachable =
         ArchiveBackend::from_config(&config.archive, RealFileSystem).is_reachable();
     let snapshots = if mounted {
@@ -463,6 +469,7 @@ fn cmd_clean(args: &GlobalArgs) -> Result<i32> {
     let dry_run = has_flag(&args.args, "--dry-run");
     let config = config(args)?;
     ensure_mounted(&config)?;
+    validate_camera_image(&RealFileSystem, &config.cam_disk_path())?;
     let manager = SnapshotManager::new(
         RealFileSystem,
         config.cam_disk_path(),

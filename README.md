@@ -251,9 +251,9 @@ unreadable sensor is reported as an error. The default sensor is
 environment or systemd unit when the board exposes its CPU sensor elsewhere.
 
 The status LED blinks slowly while waiting, quickly while archiving, and uses
-the heartbeat trigger after a successful cycle. Set `TESLAUSB_LED_PATH` to the
-board's LED directory when its name is not recognized. Missing LED capabilities
-and failed writes are reported as errors.
+the heartbeat trigger during cleanup and after a successful cycle. Set
+`TESLAUSB_LED_PATH` to the board's LED directory when its name is not recognized.
+Missing LED capabilities and failed writes are reported as errors.
 
 ## Archive and Storage Behavior
 
