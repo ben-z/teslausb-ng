@@ -808,3 +808,20 @@ def test_unmount_failure_leaves_gadget_disconnected(coordinator_with_gadget, moc
         coordinator_with_gadget._delete_archived_files(result)
     assert not mock_gadget.is_enabled()
     assert coordinator_with_gadget._stop_event.is_set()
+
+
+def test_fatal_storage_failure_propagates_from_archive_cycle(coordinator_with_gadget):
+    from teslausb.mount import MountError
+
+    coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
+        return_value=ArchiveResult(
+            snapshot_id=1,
+            state=ArchiveState.COMPLETED,
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 5, 0)]},
+        )
+    )
+    with (
+        patch("teslausb.mount.fsck_image", return_value=False),
+        pytest.raises(MountError, match="Filesystem check failed"),
+    ):
+        coordinator_with_gadget._do_archive_cycle()

@@ -26,6 +26,7 @@ from .archive import ArchiveBackend, ArchiveManager, ArchiveResult, ArchiveState
 from .filesystem import Filesystem
 from .idle import IdleDetector
 from .led import LedController, LedPattern
+from .mount import MountError
 from .snapshot import SnapshotManager
 from .space import GB, SpaceManager
 from .temperature import TemperatureMonitor
@@ -303,6 +304,8 @@ class Coordinator:
             self._error_count += 1
             if self.config.on_error:
                 self.config.on_error(str(e))
+            if isinstance(e, MountError) or self._stop_event.is_set():
+                raise
             return False
 
         return True
