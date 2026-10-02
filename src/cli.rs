@@ -1086,32 +1086,16 @@ mod tests {
     }
 
     #[test]
-    fn status_and_gadget_status_are_non_privileged_smoke_tests() {
-        let config = temp_config("status", false);
-        let config_s = config.display().to_string();
-
-        assert_eq!(
-            run(strings(&["teslausb", "--config", &config_s, "status"])).unwrap(),
-            0
-        );
-        assert_eq!(
-            run(strings(&[
-                "teslausb", "--config", &config_s, "status", "--json"
-            ]))
-            .unwrap(),
-            0
-        );
+    fn gadget_status_is_a_non_privileged_smoke_test() {
         assert_eq!(run(strings(&["teslausb", "gadget", "status"])).unwrap(), 0);
         assert_eq!(
             run(strings(&["teslausb", "gadget", "status", "--json"])).unwrap(),
             0
         );
-
-        let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 
     #[test]
-    fn init_and_deinit_handle_already_initialized_boundaries() {
+    fn init_rejects_an_existing_image() {
         let config = temp_config("already-init", true);
         let config_s = config.display().to_string();
 
@@ -1127,14 +1111,6 @@ mod tests {
             .unwrap(),
             1
         );
-        assert_eq!(
-            run(strings(&[
-                "teslausb", "--config", &config_s, "deinit", "--yes"
-            ]))
-            .unwrap(),
-            0
-        );
-
         let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 

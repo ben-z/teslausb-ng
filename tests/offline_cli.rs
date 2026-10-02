@@ -231,6 +231,10 @@ fn offline_status_before_init_warns_when_not_mounted() {
 
     let status = harness.run(&["--config", &config, "status", "--json"]);
 
+    let text_status = harness.run(&["--config", &config, "status"]);
+    assert_success(&text_status);
+    assert!(stdout(&text_status).contains("Backingfiles not mounted"));
+
     assert_success(&status);
     let json = stdout(&status);
     assert!(json.contains("\"backingfiles_mounted\": false"), "{json}");
