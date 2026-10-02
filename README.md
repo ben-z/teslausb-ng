@@ -10,8 +10,9 @@ have been verified in the archive.
 - Linux board with a USB peripheral port and configfs gadget support
 - XFS with reflink support, plus the system tools listed below
 - Network access to an rclone archive destination
-- Readable `/proc` and a CPU temperature sensor in sysfs
-- Rust toolchain with Cargo to build the binary
+- Readable `/proc`, a CPU temperature sensor, and a status LED with timer and
+  heartbeat triggers in sysfs
+- Rust 1.89 or newer with Cargo to build the binary
 
 The installed program is one binary. It uses `serde_json` for JSON and external
 Linux tools for filesystems, USB devices, and transfers.
@@ -244,10 +245,15 @@ sudo teslausb gadget on
 sudo teslausb run
 ```
 
-CPU temperature warnings begin at 70°C and 80°C. A missing or unreadable sensor
-is reported as an error. The default sensor is
+CPU temperature logs a caution above 70°C and a warning above 80°C. A missing or
+unreadable sensor is reported as an error. The default sensor is
 `/sys/class/thermal/thermal_zone0/temp`; set `TESLAUSB_THERMAL_PATH` in the process
 environment or systemd unit when the board exposes its CPU sensor elsewhere.
+
+The status LED blinks slowly while waiting, quickly while archiving, and uses
+the heartbeat trigger after a successful cycle. Set `TESLAUSB_LED_PATH` to the
+board's LED directory when its name is not recognized. Missing LED capabilities
+and failed writes are reported as errors.
 
 ## Archive and Storage Behavior
 
