@@ -187,11 +187,15 @@ fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
     if let Some(value) = get_var(file_values, "ARCHIVE_SYSTEM") {
         archive.system = value.to_ascii_lowercase();
     }
-    archive.rclone_drive = get_var(file_values, "RCLONE_DRIVE").unwrap_or_default();
-    archive.rclone_path = get_var(file_values, "RCLONE_PATH").unwrap_or_default();
-    archive.rclone_flags = get_var(file_values, "RCLONE_FLAGS")
-        .map(|flags| flags.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default();
+    if let Some(value) = get_var(file_values, "RCLONE_DRIVE") {
+        archive.rclone_drive = value;
+    }
+    if let Some(value) = get_var(file_values, "RCLONE_PATH") {
+        archive.rclone_path = value;
+    }
+    if let Some(value) = get_var(file_values, "RCLONE_FLAGS") {
+        archive.rclone_flags = value.split_whitespace().map(str::to_string).collect();
+    }
 
     archive.archive_recent = get_bool(file_values, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
     archive.archive_saved = get_bool(file_values, "ARCHIVE_SAVEDCLIPS", archive.archive_saved)?;

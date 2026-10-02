@@ -349,7 +349,7 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
         ));
     }
     let space = if mounted {
-        disk_space(&config.backingfiles_path).ok()
+        Some(disk_space(&config.backingfiles_path)?)
     } else {
         None
     };

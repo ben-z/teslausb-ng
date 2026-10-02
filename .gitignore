@@ -1,10 +1,10 @@
 /target/
 
 # Local editor and OS files
-.DS_Store
-.idea/
-.vscode/
+**/.DS_Store
+/.idea/
+/.vscode/
 
 # Runtime configuration should live on the target device.
-.env
-*.log
+/.env
+/*.log
