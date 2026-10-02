@@ -9,8 +9,10 @@ This module provides:
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +87,7 @@ class ArchiveConfig:
     archive_sentry: bool = True
     archive_track: bool = True
     archive_photobooth: bool = True
+    event_stability_seconds: float = 600.0
 
 
 @dataclass
@@ -121,7 +124,66 @@ class Config:
         if self.archive.system not in ("rclone", "none"):
             warnings.append(f"Unknown archive system: {self.archive.system}")
 
+        if not (0 < self.snapshot_space_proportion <= 1):
+            warnings.append(
+                f"snapshot_space_proportion must be between 0 and 1, "
+                f"got {self.snapshot_space_proportion}"
+            )
+
         return warnings
+
+
+def _load_from_dict(env: dict[str, str]) -> Config:
+    """Build a Config from a string dictionary (shared by load_from_env and load_from_file).
+
+    Args:
+        env: Dictionary mapping variable names to values
+
+    Returns:
+        Config instance
+    """
+    config = Config()
+    archive = config.archive
+    for key, attribute in (
+        ("BACKINGFILES_PATH", "backingfiles_path"),
+        ("MUTABLE_PATH", "mutable_path"),
+    ):
+        if key in env:
+            setattr(config, attribute, Path(env[key]))
+    for key, attribute in (
+        ("ARCHIVE_SYSTEM", "system"),
+        ("RCLONE_DRIVE", "rclone_drive"),
+        ("RCLONE_PATH", "rclone_path"),
+    ):
+        if key in env:
+            setattr(archive, attribute, env[key])
+    archive.system = archive.system.lower()
+    if "RCLONE_FLAGS" in env:
+        archive.rclone_flags = shlex.split(env["RCLONE_FLAGS"])
+    for key, attribute in (
+        ("ARCHIVE_RECENTCLIPS", "archive_recent"),
+        ("ARCHIVE_SAVEDCLIPS", "archive_saved"),
+        ("ARCHIVE_SENTRYCLIPS", "archive_sentry"),
+        ("ARCHIVE_TRACKMODECLIPS", "archive_track"),
+        ("ARCHIVE_PHOTOBOOTH", "archive_photobooth"),
+    ):
+        if key in env:
+            if env[key].lower() not in {"true", "false"}:
+                raise ConfigError(f"{key} must be true or false")
+            setattr(archive, attribute, env[key].lower() == "true")
+
+    if "EVENT_STABILITY_SECONDS" in env:
+        config.archive.event_stability_seconds = float(env["EVENT_STABILITY_SECONDS"])
+        if (
+            not math.isfinite(config.archive.event_stability_seconds)
+            or config.archive.event_stability_seconds < 0
+        ):
+            raise ConfigError("EVENT_STABILITY_SECONDS must be nonnegative")
+
+    if proportion := env.get("SNAPSHOT_SPACE_PROPORTION"):
+        config.snapshot_space_proportion = float(proportion)
+
+    return config
 
 
 def load_from_env() -> Config:
@@ -130,41 +192,12 @@ def load_from_env() -> Config:
     Reads environment variables:
     - MUTABLE_PATH, BACKINGFILES_PATH (optional path overrides)
     - ARCHIVE_SYSTEM (rclone, none)
-    - RCLONE_DRIVE, RCLONE_PATH
+    - RCLONE_DRIVE, RCLONE_PATH, RCLONE_FLAGS (space-separated)
 
     Returns:
         Config instance
     """
-    config = Config()
-    archive = ArchiveConfig()
-
-    # Optional path overrides
-    if path := os.environ.get("MUTABLE_PATH"):
-        config.mutable_path = Path(path)
-    if path := os.environ.get("BACKINGFILES_PATH"):
-        config.backingfiles_path = Path(path)
-
-    # Archive system
-    archive.system = os.environ.get("ARCHIVE_SYSTEM", "none").lower()
-
-    # rclone settings
-    archive.rclone_drive = os.environ.get("RCLONE_DRIVE", "")
-    archive.rclone_path = os.environ.get("RCLONE_PATH", "")
-
-    # What to archive
-    archive.archive_recent = os.environ.get("ARCHIVE_RECENTCLIPS", "false").lower() == "true"
-    archive.archive_saved = os.environ.get("ARCHIVE_SAVEDCLIPS", "true").lower() != "false"
-    archive.archive_sentry = os.environ.get("ARCHIVE_SENTRYCLIPS", "true").lower() != "false"
-    archive.archive_track = os.environ.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false"
-    archive.archive_photobooth = os.environ.get("ARCHIVE_PHOTOBOOTH", "true").lower() != "false"
-
-    config.archive = archive
-
-    # Space management
-    if proportion := os.environ.get("SNAPSHOT_SPACE_PROPORTION"):
-        config.snapshot_space_proportion = float(proportion)
-
-    return config
+    return _load_from_dict(dict(os.environ))
 
 
 def load_from_file(path: Path) -> Config:
@@ -172,6 +205,8 @@ def load_from_file(path: Path) -> Config:
 
     Parses files like teslausb_setup_variables.conf that use
     export VAR=value or VAR=value syntax.
+
+    File values are used directly without mutating os.environ.
 
     Args:
         path: Path to config file
@@ -182,7 +217,6 @@ def load_from_file(path: Path) -> Config:
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
 
-    # Parse the file and set environment variables
     env_vars: dict[str, str] = {}
 
     with open(path) as f:
@@ -203,18 +237,10 @@ def load_from_file(path: Path) -> Config:
                 key = key.strip()
                 value = value.strip()
 
-                # Remove quotes
-                if (value.startswith('"') and value.endswith('"')) or \
-                   (value.startswith("'") and value.endswith("'")):
+                # Remove surrounding quotes
+                if len(value) >= 2 and value[0] in ("'", '"') and value[0] == value[-1]:
                     value = value[1:-1]
 
                 env_vars[key] = value
 
-    # Temporarily set environment variables and load
-    old_env = dict(os.environ)
-    try:
-        os.environ.update(env_vars)
-        return load_from_env()
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    return _load_from_dict(env_vars)

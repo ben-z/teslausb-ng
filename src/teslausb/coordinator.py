@@ -13,16 +13,20 @@ from __future__ import annotations
 
 import logging
 import signal
+from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Iterator
+from types import FrameType
+from typing import Any, Callable
 
 from .archive import ArchiveBackend, ArchiveManager, ArchiveResult, ArchiveState
 from .filesystem import Filesystem
 from .idle import IdleDetector
 from .led import LedController, LedPattern
+from .mount import MountError
 from .snapshot import SnapshotManager
 from .space import GB, SpaceManager
 from .temperature import TemperatureMonitor
@@ -60,7 +64,7 @@ class CoordinatorConfig:
     """Configuration for the Coordinator."""
 
     # Required - function to mount snapshot images
-    mount_fn: Callable[[Path], Iterator[Path]]
+    mount_fn: Callable[[Path], AbstractContextManager[Path]]
 
     # Timing
     poll_interval: float = 5.0  # Seconds between archive reachability checks
@@ -68,12 +72,18 @@ class CoordinatorConfig:
 
     # Optional components (None = disabled)
     led_controller: LedController | None = None
-    idle_detector: IdleDetector | None = None  # If set, waits for car to stop writing before snapshot
+    idle_detector: IdleDetector | None = (
+        None  # If set, waits for car to stop writing before snapshot
+    )
     temperature_monitor: TemperatureMonitor | None = None
-    gadget: Any | None = None  # USB gadget (enable/disable/is_enabled) - disabled during cam_disk cleanup
+    gadget: Any | None = (
+        None  # USB gadget (enable/disable/is_enabled) - disabled during cam_disk cleanup
+    )
 
     # Backoff
-    max_idle_interval: float = 300.0  # Cap for both idle-cycle backoff and archive reachability retry backoff
+    max_idle_interval: float = (
+        300.0  # Cap for both idle-cycle backoff and archive reachability retry backoff
+    )
 
     # Callbacks (optional)
     on_state_change: Callable[[CoordinatorState], None] | None = None
@@ -133,9 +143,11 @@ class Coordinator:
         self._archive_count = 0
         self._error_count = 0
 
-        # Share stop event with backend if it supports it (for interruptible operations)
-        if hasattr(self.backend, 'stop_event'):
+        # Share stop event with backend and idle detector for interruptible waits
+        if hasattr(self.backend, "stop_event"):
             self.backend.stop_event = self._stop_event
+        if self.config.idle_detector and hasattr(self.config.idle_detector, "stop_event"):
+            self.config.idle_detector.stop_event = self._stop_event
 
     @property
     def state(self) -> CoordinatorState:
@@ -188,7 +200,9 @@ class Coordinator:
         """
         self._set_state(CoordinatorState.WAITING_FOR_ARCHIVE)
 
-        for interval in _backoff_intervals(self.config.poll_interval, self.config.max_idle_interval):
+        for interval in _backoff_intervals(
+            self.config.poll_interval, self.config.max_idle_interval
+        ):
             if self.backend.is_reachable():
                 logger.info("Archive is reachable")
                 return True
@@ -222,9 +236,7 @@ class Coordinator:
         if stale == 1:
             # One stale snapshot is expected after an unclean shutdown —
             # the post-archive deletion didn't run.
-            logger.warning(
-                "Deleted 1 stale snapshot (likely unclean shutdown)"
-            )
+            logger.warning("Deleted 1 stale snapshot (likely unclean shutdown)")
         elif stale > 1:
             # With eager deletion, at most 1 snapshot should ever exist.
             # Multiple stale snapshots indicate a bug or first run after
@@ -238,7 +250,8 @@ class Coordinator:
         if self.config.idle_detector:
             logger.info("Waiting for car to become idle...")
             if not self.config.idle_detector.wait_for_idle(self.config.idle_timeout):
-                logger.warning("Timeout waiting for idle, proceeding anyway")
+                logger.warning("Timeout waiting for idle, skipping archive cycle")
+                return False
 
         # Notify archive start
         if self.config.on_archive_start:
@@ -249,10 +262,7 @@ class Coordinator:
 
         # Create snapshot and archive (deletion handled separately below)
         try:
-            result = self.archive_manager.archive_new_snapshot(
-                mount_fn=self.config.mount_fn,
-                delete_after_archive=False,
-            )
+            result = self.archive_manager.archive_new_snapshot(self.config.mount_fn)
             self._last_archive = result
             self._archive_count += 1
 
@@ -294,6 +304,8 @@ class Coordinator:
             self._error_count += 1
             if self.config.on_error:
                 self.config.on_error(str(e))
+            if isinstance(e, MountError) or self._stop_event.is_set():
+                raise
             return False
 
         return True
@@ -311,7 +323,17 @@ class Coordinator:
         After disabling the gadget, we run fsck to repair any FAT errors
         from the car's abrupt disconnection, then mount and delete files.
         """
-        from .mount import fsck_image, mount_image
+        from .mount import MountError, fsck_image, mount_image
+
+        if self._stop_event.is_set():
+            return
+        if self.config.idle_detector and not self.config.idle_detector.wait_for_idle(
+            self.config.idle_timeout
+        ):
+            logger.warning("No idle interval before cleanup; keeping archived files on disk")
+            return
+        if self._stop_event.is_set():
+            return
 
         gadget = self.config.gadget
         gadget_was_enabled = False
@@ -319,35 +341,29 @@ class Coordinator:
         # Disable gadget to prevent concurrent access to cam_disk.bin
         if gadget and gadget.is_enabled():
             logger.info("Disabling USB gadget for cam_disk cleanup")
-            try:
-                gadget.disable()
-            except Exception as e:
-                logger.error(f"Failed to disable gadget, skipping file deletion: {e}")
-                return
+            gadget.disable()
             # Verify disable succeeded - UsbGadget.disable() may silently fail
             if gadget.is_enabled():
-                logger.error("Gadget still enabled after disable, skipping file deletion")
-                return
+                raise MountError("Gadget still enabled after disable; refusing to mount cam_disk")
             gadget_was_enabled = True
 
+        cam_disk = self.archive_manager.cam_disk_path
+        if cam_disk is None:
+            raise MountError("Cannot clean up without a cam disk path")
         try:
-            # Repair any FAT errors from the car's abrupt disconnection
-            cam_disk = self.archive_manager.cam_disk_path
             if not fsck_image(cam_disk):
-                logger.warning("fsck failed, proceeding with mount anyway")
+                raise MountError("Filesystem check failed; USB gadget remains disconnected")
 
             with mount_image(cam_disk, readonly=False) as cam_mount:
                 deleted, skipped = self.archive_manager.delete_archived_files(result, cam_mount)
                 logger.info(f"Cleanup complete: {deleted} deleted, {skipped} skipped")
-        except Exception as e:
-            logger.error(f"Failed to delete archived files: {e}")
-        finally:
-            if gadget_was_enabled:
-                try:
-                    gadget.enable()
-                    logger.info("USB gadget re-enabled")
-                except Exception as e:
-                    logger.error(f"Failed to re-enable gadget: {e}")
+        except Exception:
+            self.stop()
+            logger.error("Disk cleanup failed; USB gadget remains disconnected")
+            raise
+        if gadget_was_enabled and gadget is not None:
+            gadget.enable()
+            logger.info("USB gadget re-enabled")
 
     def run_once(self) -> bool:
         """Run a single archive cycle.
@@ -372,7 +388,7 @@ class Coordinator:
         self._set_state(CoordinatorState.STARTING)
 
         # Set up signal handlers
-        def handle_signal(signum, frame):
+        def handle_signal(signum: int, frame: FrameType | None) -> None:
             logger.info(f"Received signal {signum}, stopping...")
             self.stop()
 
@@ -418,9 +434,11 @@ class Coordinator:
                 # Backoff when nothing to archive to avoid hot-looping.
                 # Only back off on successful cycles with zero transfers (truly idle).
                 # Failed cycles are handled by the error path above.
-                if (self._last_archive
-                        and self._last_archive.success
-                        and self._last_archive.files_transferred == 0):
+                if (
+                    self._last_archive
+                    and self._last_archive.success
+                    and self._last_archive.files_transferred == 0
+                ):
                     delay = next(idle_backoff)
                     logger.info(f"No files to archive, waiting {delay:.0f}s before next cycle")
                 else:
@@ -449,12 +467,12 @@ class Coordinator:
         logger.info("Stop requested")
         self._stop_event.set()
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
         """Get current status information."""
         space_info = self.space_manager.get_space_info()
         snapshots = self.snapshot_manager.get_snapshots()
 
-        status = {
+        status: dict[str, Any] = {
             "state": self._state.value,
             "archive_count": self._archive_count,
             "error_count": self._error_count,

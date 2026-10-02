@@ -8,6 +8,7 @@ Run with: docker compose -f docker-compose.test.yml up --build
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from dataclasses import dataclass
@@ -39,25 +40,19 @@ class IntegrationTestEnv:
         return self.backingfiles_path / "snapshots"
 
 
-def _cleanup_loop_devices(path_pattern: str | None = None) -> None:
-    """Clean up loop devices, optionally filtering by path pattern."""
-    # First, remove any kpartx mappings
-    result = subprocess.run(["losetup", "-a"], capture_output=True, text=True)
-    for line in result.stdout.splitlines():
-        if ":" not in line:
+def _cleanup_loop_devices(root: Path) -> None:
+    """Detach only loop devices whose backing files belong to this test."""
+    result = subprocess.run(
+        ["losetup", "--json", "--list", "--output", "NAME,BACK-FILE"],
+        capture_output=True, text=True, check=True,
+    )
+    for device in json.loads(result.stdout)["loopdevices"]:
+        if root not in Path(device["back-file"]).parents:
             continue
-        loop_dev = line.split(":")[0]
-        if path_pattern is None or path_pattern in line:
-            # Remove kpartx mappings first
-            subprocess.run(["kpartx", "-d", loop_dev], capture_output=True)
-            subprocess.run(["losetup", "-d", loop_dev], capture_output=True)
-
-    # Also clean up any stale device mapper entries
-    dm_path = Path("/dev/mapper")
-    if dm_path.exists():
-        for entry in dm_path.iterdir():
-            if entry.name.startswith("loop"):
-                subprocess.run(["dmsetup", "remove", str(entry)], capture_output=True)
+        loop_dev = device["name"]
+        if list(Path("/dev/mapper").glob(f"{Path(loop_dev).name}p*")):
+            subprocess.run(["kpartx", "-d", loop_dev], check=True)
+        subprocess.run(["losetup", "-d", loop_dev], check=True)
 
 
 def _is_mounted(path: Path) -> bool:
@@ -73,15 +68,15 @@ def _cleanup_mounts_and_devices(env: IntegrationTestEnv) -> None:
     """Full cleanup of mounts and loop devices for a test environment."""
     # Unmount backingfiles if mounted
     if _is_mounted(env.backingfiles_path):
-        subprocess.run(["umount", "-l", str(env.backingfiles_path)], check=False)
+        subprocess.run(["umount", str(env.backingfiles_path)], check=True)
 
     # Unmount temp mount point
     tmp_mount = Path("/tmp/teslausb-setup-mount")
     if tmp_mount.exists() and _is_mounted(tmp_mount):
-        subprocess.run(["umount", "-l", str(tmp_mount)], check=False)
+        subprocess.run(["umount", str(tmp_mount)], check=True)
 
     # Clean up loop devices for this test's files
-    _cleanup_loop_devices(str(env.root))
+    _cleanup_loop_devices(env.root)
 
     # Give system time to settle
     time.sleep(0.2)
@@ -178,9 +173,6 @@ def test_env(tmp_path: Path) -> Generator[IntegrationTestEnv, None, None]:
     - {tmp}/backingfiles/  - Mount point for backingfiles.img
     - {tmp}/config         - Config file
     """
-    # Clean up any leftover devices from previous test runs
-    _cleanup_loop_devices()
-
     mutable_path = tmp_path / "mutable"
     backingfiles_path = tmp_path / "backingfiles"
     config_path = tmp_path / "teslausb.conf"

@@ -9,9 +9,9 @@ import logging
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +20,13 @@ class MountError(Exception):
     """Error during mount operations."""
 
 
-def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[bytes]:
     """Run command and return result.
 
     Captures output and logs stderr for visibility.
     """
     logger.debug(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
-    )
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     if result.stderr:
         for line in result.stderr.decode().splitlines():
             logger.debug(f"{cmd[0]}: {line}")
@@ -44,6 +42,13 @@ def _setup_loop_device(image_path: Path) -> tuple[str, str] | None:
     Returns:
         Tuple of (loop_device, partition_device) on success, None on failure
     """
+    associated = _run(
+        ["losetup", "--associated", str(image_path), "--output", "NAME", "--noheadings"]
+    )
+    if associated.returncode != 0:
+        raise MountError(f"Cannot check existing loop devices for {image_path}")
+    if associated.stdout.strip():
+        raise MountError(f"Disk image already attached to a loop device: {image_path}")
     result = _run(["losetup", "-Pf", "--show", str(image_path)])
     if result.returncode != 0:
         return None
@@ -65,7 +70,7 @@ def _detach_loop_device(loop_dev: str) -> None:
     """Detach a loop device."""
     result = _run(["losetup", "-d", loop_dev])
     if result.returncode != 0:
-        logger.warning("losetup -d failed")
+        raise MountError(f"Failed to detach loop device {loop_dev}")
 
 
 def fsck_image(image_path: Path) -> bool:
@@ -92,6 +97,9 @@ def fsck_image(image_path: Path) -> bool:
     try:
         logger.info(f"Running fsck on {image_path}")
         result = _run(["fsck", "-p", partition], timeout=120)
+        for output in (result.stdout, result.stderr):
+            for line in output.decode(errors="replace").splitlines():
+                logger.info("fsck: %s", line)
 
         # fsck exit codes: 0 = clean, 1 = errors corrected, 2+ = errors remain
         if result.returncode == 0:
@@ -102,6 +110,15 @@ def fsck_image(image_path: Path) -> bool:
             logger.warning(f"fsck: exited with code {result.returncode}")
             return False
 
+        verification = _run(["fsck", "-n", partition], timeout=120)
+        for output in (verification.stdout, verification.stderr):
+            for line in output.decode(errors="replace").splitlines():
+                logger.info("fsck verification: %s", line)
+        if verification.returncode != 0:
+            logger.error(
+                "Filesystem remains inconsistent after repair: code %s", verification.returncode
+            )
+            return False
         return True
 
     finally:
@@ -140,6 +157,7 @@ def mount_image(image_path: Path, readonly: bool = True) -> Iterator[Path]:
 
     loop_dev, partition = devices
     mount_point: Path | None = None
+    mounted = False
 
     try:
         mount_point = Path(tempfile.mkdtemp(prefix="teslausb-mount-"))
@@ -148,22 +166,19 @@ def mount_image(image_path: Path, readonly: bool = True) -> Iterator[Path]:
         result = _run(["mount", "-o", mount_opts, partition, str(mount_point)])
         if result.returncode != 0:
             raise MountError("mount failed")
+        mounted = True
 
         mode = "read-only" if readonly else "read-write"
         logger.info(f"Mounted {image_path} at {mount_point} ({mode})")
         yield mount_point
 
     finally:
-        if mount_point and mount_point.exists():
-            if not readonly:
-                _run(["sync"])
+        if mounted:
             result = _run(["umount", str(mount_point)])
             if result.returncode != 0:
-                logger.warning("umount failed")
-            try:
-                mount_point.rmdir()
-            except OSError:
-                pass
+                raise MountError(f"Failed to unmount {mount_point}; leaving {loop_dev} attached")
 
         _detach_loop_device(loop_dev)
+        if mount_point is not None:
+            mount_point.rmdir()
         logger.debug(f"Cleaned up mount for {image_path}")
