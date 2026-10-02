@@ -248,8 +248,12 @@ fn offline_archive_snapshots_and_clean_with_fake_rclone() {
     let config = harness.config_arg();
 
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
-    let archive = harness.run(&["--config", &config, "archive"]);
+    let archive = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_STARTUP_NOTICE", "true")],
+    );
     assert_success(&archive);
+    assert!(stderr(&archive).contains("fake rclone startup diagnostic"));
     assert!(stderr(&archive).contains("archive complete"));
     assert!(stderr(&archive).contains("clean up complete"));
 
@@ -295,14 +299,22 @@ fn offline_archive_failure_returns_nonzero_without_privileged_tools() {
     let config = harness.config_arg();
 
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
-    let archive = harness.run_with_env(
-        &["--config", &config, "archive"],
-        &[("TESLAUSB_FAKE_RCLONE_FAIL", "SavedClips")],
-    );
-
-    assert!(!archive.status.success(), "{}", describe(&archive));
-    assert!(stderr(&archive).contains("warning: archive finished with issues"));
-    assert!(stderr(&archive).contains("SavedClips"));
+    for level in ["error", "fatal"] {
+        let archive = harness.run_with_env(
+            &["--config", &config, "archive"],
+            &[
+                ("TESLAUSB_FAKE_RCLONE_FAIL", "SavedClips"),
+                ("TESLAUSB_FAKE_RCLONE_FAILURE_LEVEL", level),
+            ],
+        );
+        assert!(!archive.status.success(), "{}", describe(&archive));
+        assert!(stderr(&archive).contains("warning: archive finished with issues"));
+        assert!(
+            stderr(&archive).contains("injected rclone failure for fake:TeslaArchive/SavedClips"),
+            "{}",
+            describe(&archive)
+        );
+    }
 }
 
 #[test]
@@ -571,7 +583,56 @@ fn offline_manual_archive_sigterm_reaps_copy_and_unmounts_snapshot() {
         .any(|line| line.starts_with("umount\t") && line.contains("teslausb-mount-")));
     assert!(!log.contains("fsck\t-p"));
     assert!(!log.contains("mount\t-o\trw"));
+    let log_paths: Vec<_> = log
+        .lines()
+        .filter(|line| line.starts_with("rclone\tcopy\t"))
+        .filter_map(|line| line.split_once("\t--log-file\t"))
+        .map(|(_, args)| Path::new(args.split('\t').next().unwrap()))
+        .collect();
+    assert!(
+        !log_paths.is_empty(),
+        "copy did not receive a dedicated JSON log file"
+    );
+    for path in log_paths {
+        assert!(
+            !path.exists(),
+            "cancelled copy retained its log at {}",
+            path.display()
+        );
+    }
     assert_success(&harness.run(&["--config", &config, "archive"]));
+}
+
+#[test]
+fn offline_malformed_rclone_log_prevents_live_cleanup() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    let output = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_MALFORMED_LOG", "true")],
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        stderr(&output).contains("invalid rclone JSON log record"),
+        "{}",
+        describe(&output)
+    );
+    assert!(harness.archive_path("SavedClips/event/front.mp4").is_file());
+    assert!(harness
+        .archive_path("SentryClips/sentry/rear.mp4")
+        .is_file());
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SavedClips/event/front.mp4")
+        .is_file());
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SentryClips/sentry/rear.mp4")
+        .is_file());
+    let log = harness.command_log();
+    assert!(!log.contains("fsck\t-p"));
+    assert!(!log.contains("mount\t-o\trw"));
 }
 
 #[test]
@@ -897,6 +958,17 @@ case "$tool" in
         if [ "${1:-}" = "copy" ]; then
             src="$2"
             dst="$3"
+            if [ "${TESLAUSB_FAKE_RCLONE_STARTUP_NOTICE:-}" = "true" ]; then
+                printf 'fake rclone startup diagnostic\n' >&2
+            fi
+            log_file=''
+            previous=''
+            for arg in "$@"; do
+                if [ "$previous" = "--log-file" ]; then log_file="$arg"; fi
+                previous="$arg"
+            done
+            : "${log_file:?rclone copy requires a JSON log file}"
+            exec 2>"$log_file"
             if [ "${TESLAUSB_FAKE_RCLONE_SLEEP:-}" = "true" ]; then
                 printf '%s\n' "$$" > "$state/rclone.pid"
                 sleep 30
@@ -905,7 +977,7 @@ case "$tool" in
             if [ -n "$fail" ]; then
                 case "$dst" in
                     *"$fail"*)
-                        printf '{"msg":"injected rclone failure for %s","level":"error"}\n' "$dst" >&2
+                        printf '{"msg":"injected rclone failure for %s","level":"%s"}\n' "$dst" "${TESLAUSB_FAKE_RCLONE_FAILURE_LEVEL:-error}" >&2
                         exit 9
                         ;;
                 esac
@@ -927,6 +999,9 @@ case "$tool" in
                 /bin/cp "$src/$relative" "$dest/$relative"
                 printf '{"object":"%s","msg":"Copied (new)"}\n' "$relative" >&2
             done < "$list"
+            if [ "${TESLAUSB_FAKE_RCLONE_MALFORMED_LOG:-}" = "true" ]; then
+                printf 'invalid JSON log record\n' >&2
+            fi
             exit 0
         fi
         exit 0

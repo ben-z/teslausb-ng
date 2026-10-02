@@ -245,16 +245,16 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
         )
         .unwrap();
     };
-    let archive = || {
-        harness
-            .command(&["--config", &config, "archive"])
+    let archive_command = || {
+        let mut command = harness.command(&["--config", &config, "archive"]);
+        command
             .env("XDG_CONFIG_HOME", &config_home)
             .env_remove("RCLONE_CONFIG")
             .env("HOME", "/root")
-            .env_remove("XDG_CACHE_HOME")
-            .output()
-            .unwrap()
+            .env_remove("XDG_CACHE_HOME");
+        command
     };
+    let archive = || archive_command().output().unwrap();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
     {
         let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "rw");
@@ -348,15 +348,35 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
     assert!(!archive_destination
         .join("SavedClips/unconfirmed/event.json")
         .exists());
-    let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
-    assert_eq!(
-        fs::read_to_string(cam.path().join(unconfirmed).join("front.mp4")).unwrap(),
-        "unconfirmed-video"
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
+        assert_eq!(
+            fs::read_to_string(cam.path().join(unconfirmed).join("front.mp4")).unwrap(),
+            "unconfirmed-video"
+        );
+        assert_eq!(
+            fs::read_to_string(cam.path().join(unconfirmed).join("event.json")).unwrap(),
+            "event-metadata"
+        );
+    }
+
+    set_flags("--checksum");
+    let configured = archive_command()
+        .env("RCLONE_CONFIG", config_home.join("rclone/rclone.conf"))
+        .output()
+        .unwrap();
+    assert_success(&configured);
+    assert!(
+        stderr(&configured).contains("archive complete: 1 files"),
+        "{}",
+        describe(&configured)
     );
     assert_eq!(
-        fs::read_to_string(cam.path().join(unconfirmed).join("event.json")).unwrap(),
+        fs::read_to_string(archive_destination.join("SavedClips/unconfirmed/event.json")).unwrap(),
         "event-metadata"
     );
+    let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
+    assert!(!cam.path().join(unconfirmed).exists());
 }
 
 #[test]
@@ -851,6 +871,14 @@ case "${1:-}" in
     copy)
         src="$2"
         dst="$3"
+        log_file=''
+        previous=''
+        for arg in "$@"; do
+            if [ "$previous" = "--log-file" ]; then log_file="$arg"; fi
+            previous="$arg"
+        done
+        : "${log_file:?rclone copy requires a JSON log file}"
+        exec 2>"$log_file"
         archive="${TESLAUSB_FAKE_RCLONE_ARCHIVE:?}"
         mkdir -p "$archive/$dst"
         /bin/cp -R "$src"/. "$archive/$dst"/
