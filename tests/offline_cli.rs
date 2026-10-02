@@ -192,6 +192,39 @@ fn offline_init_mount_status_doctor_and_deinit() {
 }
 
 #[test]
+fn offline_mount_probe_errors_preserve_the_disk_image() {
+    let harness = Harness::new("none");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    let image = harness.mutable.join("backingfiles.img");
+    let log_before = harness.command_log();
+
+    for (extra_env, expected_error) in [
+        (("TESLAUSB_FAKE_MOUNTPOINT_EXIT", "1"), "mountpoint failed"),
+        (("PATH", ""), "failed to run mountpoint"),
+    ] {
+        for args in [
+            vec!["--config", &config, "deinit", "--yes"],
+            vec!["--config", &config, "status", "--json"],
+        ] {
+            let output = harness.run_with_env(&args, &[extra_env]);
+            assert!(!output.status.success(), "{}", describe(&output));
+            assert!(
+                stderr(&output).contains(expected_error),
+                "{}",
+                describe(&output)
+            );
+            assert!(
+                image.is_file(),
+                "an unverified mount probe removed the disk image"
+            );
+        }
+    }
+    let log_after = harness.command_log();
+    assert!(!log_after[log_before.len()..].contains("umount"));
+}
+
+#[test]
 fn offline_status_before_init_warns_when_not_mounted() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
@@ -786,11 +819,14 @@ case "$tool" in
         exit 0
         ;;
     mountpoint)
+        if [ -n "${TESLAUSB_FAKE_MOUNTPOINT_EXIT:-}" ]; then
+            exit "$TESLAUSB_FAKE_MOUNTPOINT_EXIT"
+        fi
         target=$(last_arg "$@")
         if [ -f "$state/mounted/$(key_for "$target")" ]; then
             exit 0
         fi
-        exit 1
+        exit 32
         ;;
     mount)
         if [ "${1:-}" = "-o" ]; then

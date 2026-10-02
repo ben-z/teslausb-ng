@@ -250,7 +250,7 @@ fn cmd_deinit(args: &GlobalArgs) -> Result<i32> {
         println!("Aborted");
         return Ok(1);
     }
-    if is_mounted(&config.backingfiles_path) {
+    if is_mounted(&config.backingfiles_path)? {
         CommandRunner.check(
             "umount",
             [config.backingfiles_path.display().to_string().as_str()],
@@ -320,7 +320,7 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
     let json = has_flag(&args.args, "--json");
     let config = config(args)?;
     let mut warnings = config.warnings();
-    let mounted = is_mounted(&config.backingfiles_path);
+    let mounted = is_mounted(&config.backingfiles_path)?;
     let archive_reachable =
         ArchiveBackend::from_config(&config.archive, RealFileSystem).is_reachable();
     let snapshots = if mounted {
@@ -655,7 +655,7 @@ fn create_backingfiles_image(path: &Path, size: u64) -> Result<()> {
 
 fn mount_backingfiles(image_path: &Path, mount_path: &Path) -> Result<()> {
     fs::create_dir_all(mount_path)?;
-    if is_mounted(mount_path) {
+    if is_mounted(mount_path)? {
         return Ok(());
     }
     CommandRunner.check(
@@ -764,15 +764,27 @@ fn create_cam_disk(cam_disk_path: &Path, cam_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn is_mounted(path: &Path) -> bool {
-    CommandRunner
-        .run(
-            "mountpoint",
-            ["-q", &path.display().to_string()],
-            Some(Duration::from_secs(10)),
-        )
-        .map(|output| output.success())
-        .unwrap_or(false)
+fn is_mounted(path: &Path) -> Result<bool> {
+    let output = CommandRunner.run(
+        "mountpoint",
+        ["-q", &path.display().to_string()],
+        Some(Duration::from_secs(10)),
+    )?;
+    if output.timed_out {
+        return Err(Error::new(format!(
+            "mountpoint timed out while checking {}",
+            path.display()
+        )));
+    }
+    match output.code {
+        Some(0) => Ok(true),
+        Some(32) => Ok(false),
+        code => Err(Error::new(format!(
+            "mountpoint failed while checking {} (exit status {code:?}): {}",
+            path.display(),
+            output.last_error_line()
+        ))),
+    }
 }
 
 fn filesystem_type(path: &Path) -> Result<String> {
