@@ -153,8 +153,9 @@ impl Volume {
             }
             self.mounted = false;
         }
-        if let Some(device) = &self.device {
-            let output = try_run("losetup", &["-d", device])?;
+        // An interrupted detach may have freed the loop number for another owner.
+        if let Some(device) = self.device.take() {
+            let output = try_run("losetup", &["-d", &device])?;
             if !output.status.success() {
                 return Err(format!(
                     "detach {device}: {}",
@@ -178,7 +179,6 @@ impl Volume {
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            self.device = None;
         }
         Ok(())
     }

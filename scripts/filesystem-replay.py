@@ -132,12 +132,13 @@ class Experiment:
 
     def detach(self, device):
         image = next(image for owned, image in self.loops if owned == device)
+        # An interrupted detach may have freed this loop number for another owner.
+        self.loops.remove((device, image))
         self.checked(['losetup', '-d', device])
         deadline = time.monotonic() + self.settings.detach_timeout
         while self.checked(['losetup', '-j', image]):
             require(time.monotonic() < deadline, f'Owned image remains attached: {image}')
             time.sleep(self.settings.poll_seconds)
-        self.loops.remove((device, image))
 
     def clean_up(self):
         for mount in list(reversed(self.mounts)):
