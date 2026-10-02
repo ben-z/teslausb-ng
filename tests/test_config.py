@@ -114,8 +114,9 @@ class TestConfig:
         for bad_value in [0, -0.5, 1.5, 2.0]:
             config = Config(snapshot_space_proportion=bad_value)
             warnings = config.validate()
-            assert any("snapshot_space_proportion" in w for w in warnings), \
+            assert any("snapshot_space_proportion" in w for w in warnings), (
                 f"Expected warning for proportion={bad_value}"
+            )
 
     def test_validate_snapshot_space_proportion_valid(self):
         """Test validation accepts valid snapshot_space_proportion values."""
@@ -146,7 +147,8 @@ class TestLoadFromEnv:
         """Test loading with no environment variables set."""
         # Clear relevant env vars
         env_vars = [
-            "ARCHIVE_SYSTEM", "ARCHIVE_RECENTCLIPS",
+            "ARCHIVE_SYSTEM",
+            "ARCHIVE_RECENTCLIPS",
         ]
         old_values = {k: os.environ.pop(k, None) for k in env_vars}
 
@@ -306,3 +308,20 @@ ARCHIVE_PHOTOBOOTH=false
             assert config.archive.archive_photobooth is False
         finally:
             config_path.unlink()
+
+
+def test_event_stability_override(monkeypatch):
+    monkeypatch.setenv("EVENT_STABILITY_SECONDS", "0")
+    assert load_from_env().archive.event_stability_seconds == 0
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_invalid_event_stability_fails(monkeypatch, value):
+    monkeypatch.setenv("EVENT_STABILITY_SECONDS", value)
+    with pytest.raises(ConfigError, match="nonnegative"):
+        load_from_env()
+
+
+def test_rclone_flags_preserve_quoted_arguments(monkeypatch):
+    monkeypatch.setenv("RCLONE_FLAGS", '--exclude "event with spaces/**"')
+    assert load_from_env().archive.rclone_flags == ["--exclude", "event with spaces/**"]

@@ -29,9 +29,9 @@ from .config import Config, ConfigError, GB, load_from_env, load_from_file, pars
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
-from .idle import ProcIdleDetector
+from .idle import IdleConfig, ProcIdleDetector
 from .led import SysfsLedController
-from .mount import mount_image
+from .mount import MountError, fsck_image, mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
 from .space import DEFAULT_RESERVE, MIN_CAM_SIZE, SpaceManager, calculate_cam_size
 from .temperature import SysfsTemperatureMonitor, TemperatureConfig
@@ -107,6 +107,10 @@ def create_components(config: Config) -> tuple[
 ]:
     """Create all components from configuration."""
     fs = RealFilesystem()
+    if not fs.is_file(config.cam_disk_path):
+        raise ConfigError(f"Camera disk not found: {config.cam_disk_path}; run 'teslausb init'")
+    if fs.stat(config.cam_disk_path).size == 0:
+        raise ConfigError(f"Camera disk is empty: {config.cam_disk_path}; run 'teslausb init'")
 
     snapshot_manager = SnapshotManager(
         fs=fs,
@@ -134,6 +138,7 @@ def create_components(config: Config) -> tuple[
         fs=fs,
         snapshot_manager=snapshot_manager,
         backend=backend,
+        event_stability_seconds=config.archive.event_stability_seconds,
         cam_disk_path=config.cam_disk_path,
         archive_recent=config.archive.archive_recent,
         archive_saved=config.archive.archive_saved,
@@ -503,7 +508,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             mount_fn=mount_image,
             led_controller=led_controller,
             temperature_monitor=temp_monitor,
-            idle_detector=ProcIdleDetector(),
+            idle_detector=ProcIdleDetector(fs=fs, config=IdleConfig()),
             gadget=gadget,
         ),
     )
@@ -531,7 +536,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
         backend=backend,
         config=CoordinatorConfig(
             mount_fn=mount_image,
-            idle_detector=ProcIdleDetector(),
+            idle_detector=ProcIdleDetector(fs=fs, config=IdleConfig()),
             gadget=UsbGadget(),
         ),
     )
@@ -861,15 +866,20 @@ def cmd_gadget(args: argparse.Namespace) -> int:
     gadget = UsbGadget()
 
     if args.gadget_command == "on":
+        if gadget.is_enabled():
+            print("Gadget already enabled")
+            return 0
         config = load_config(args)
         luns = {0: LunConfig(disk_path=config.cam_disk_path)}
 
         try:
+            if not fsck_image(config.cam_disk_path):
+                raise MountError("Filesystem is not clean; refusing to enable USB gadget")
             gadget.initialize(luns)
             gadget.enable()
             print("Gadget enabled")
             return 0
-        except GadgetError as e:
+        except (GadgetError, MountError) as e:
             print(f"Failed to enable gadget: {e}")
             return 1
 

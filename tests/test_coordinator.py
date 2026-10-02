@@ -37,6 +37,7 @@ def coordinator(
 ) -> Coordinator:
     """Create a Coordinator with mock components."""
     archive_manager = ArchiveManager(
+        event_stability_seconds=0,
         fs=mock_fs,
         snapshot_manager=snapshot_manager,
         backend=mock_backend,
@@ -73,6 +74,7 @@ def coordinator_with_gadget(
 ) -> Coordinator:
     """Create a Coordinator with a mock gadget."""
     archive_manager = ArchiveManager(
+        event_stability_seconds=0,
         fs=mock_fs,
         snapshot_manager=snapshot_manager,
         backend=mock_backend,
@@ -106,9 +108,7 @@ class TestStaleSnapshotCleanup:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
 
         coordinator._do_archive_cycle()
 
@@ -126,9 +126,7 @@ class TestStaleSnapshotCleanup:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
 
         with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
@@ -148,9 +146,7 @@ class TestStaleSnapshotCleanup:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
 
         with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
@@ -167,9 +163,7 @@ class TestStaleSnapshotCleanup:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
 
         with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
@@ -198,9 +192,7 @@ class TestIdleGate:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
 
         result = coordinator._do_archive_cycle()
 
@@ -218,9 +210,7 @@ class TestPostArchiveSnapshotDeletion:
             state=ArchiveState.COMPLETED,
             files_transferred=5,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
         coordinator.snapshot_manager.delete_snapshot = MagicMock()
 
         coordinator._do_archive_cycle()
@@ -234,9 +224,7 @@ class TestPostArchiveSnapshotDeletion:
             state=ArchiveState.COMPLETED,
             files_transferred=5,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
         coordinator.snapshot_manager.delete_snapshot = MagicMock(
             side_effect=Exception("deletion failed")
         )
@@ -251,9 +239,7 @@ class TestPostArchiveSnapshotDeletion:
             state=ArchiveState.COMPLETED,
             files_transferred=5,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=success_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=success_result)
         coordinator.snapshot_manager.delete_snapshot = MagicMock(
             side_effect=Exception("permission denied")
         )
@@ -261,7 +247,9 @@ class TestPostArchiveSnapshotDeletion:
         with caplog.at_level(logging.WARNING, logger="teslausb.coordinator"):
             coordinator._do_archive_cycle()
 
-        warning_records = [r for r in caplog.records if "failed to delete snapshot" in r.message.lower()]
+        warning_records = [
+            r for r in caplog.records if "failed to delete snapshot" in r.message.lower()
+        ]
         assert len(warning_records) == 1
         assert "permission denied" in warning_records[0].message
         assert "will retry next cycle" in warning_records[0].message
@@ -273,9 +261,7 @@ class TestPostArchiveSnapshotDeletion:
             state=ArchiveState.COMPLETED,
             files_transferred=0,
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=result_no_snap
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=result_no_snap)
         coordinator.snapshot_manager.delete_snapshot = MagicMock()
 
         coordinator._do_archive_cycle()
@@ -290,9 +276,7 @@ class TestPostArchiveSnapshotDeletion:
             files_transferred=0,
             error="rclone connection error",
         )
-        coordinator.archive_manager.archive_new_snapshot = MagicMock(
-            return_value=failed_result
-        )
+        coordinator.archive_manager.archive_new_snapshot = MagicMock(return_value=failed_result)
         coordinator.snapshot_manager.delete_snapshot = MagicMock()
 
         coordinator._do_archive_cycle()
@@ -314,8 +298,8 @@ class TestPartialArchiveFailure:
             error="RecentClips: Timeout",
             files_transferred=0,
             archived_files={
-                "SavedClips": [ArchivedFile("event1/front.mp4", 1000)],
-                "SentryClips": [ArchivedFile("event2/front.mp4", 2000)],
+                "SavedClips": [ArchivedFile("event1/front.mp4", 1000, mtime=0)],
+                "SentryClips": [ArchivedFile("event2/front.mp4", 2000, mtime=0)],
             },
         )
         coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
@@ -330,12 +314,15 @@ class TestPartialArchiveFailure:
             delete_called = True
             yield Path("/mnt/cam")
 
-        with patch("teslausb.mount.mount_image", tracking_mount), \
-             patch("teslausb.mount.fsck_image", return_value=True):
+        with (
+            patch("teslausb.mount.mount_image", tracking_mount),
+            patch("teslausb.mount.fsck_image", return_value=True),
+        ):
             coordinator_with_gadget._do_archive_cycle()
 
-        assert delete_called, \
+        assert delete_called, (
             "Should delete files from successful dirs even when overall result is FAILED"
+        )
 
     def test_no_deletion_when_all_dirs_fail(
         self, coordinator_with_gadget: Coordinator, mock_gadget: MockGadget
@@ -359,16 +346,14 @@ class TestPartialArchiveFailure:
 
         delete_mock.assert_not_called()
 
-    def test_error_count_incremented_on_partial_failure(
-        self, coordinator_with_gadget: Coordinator
-    ):
+    def test_error_count_incremented_on_partial_failure(self, coordinator_with_gadget: Coordinator):
         """Test that error count is incremented even when deletion runs."""
         partial_result = ArchiveResult(
             snapshot_id=1,
             state=ArchiveState.FAILED,
             error="RecentClips: Timeout",
             archived_files={
-                "SavedClips": [ArchivedFile("event1/front.mp4", 1000)],
+                "SavedClips": [ArchivedFile("event1/front.mp4", 1000, mtime=0)],
             },
         )
         coordinator_with_gadget.archive_manager.archive_new_snapshot = MagicMock(
@@ -409,7 +394,7 @@ class TestGadgetCoordination:
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
             files_transferred=5,
-            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000)]},
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000, mtime=0)]},
         )
 
         # Track gadget state during mount_image call
@@ -421,23 +406,26 @@ class TestGadgetCoordination:
             gadget_enabled_during_mount = mock_gadget.is_enabled()
             yield Path("/mnt/cam")
 
-        with patch("teslausb.mount.mount_image", tracking_mount), \
-             patch("teslausb.mount.fsck_image", return_value=True):
+        with (
+            patch("teslausb.mount.mount_image", tracking_mount),
+            patch("teslausb.mount.fsck_image", return_value=True),
+        ):
             coordinator_with_gadget._delete_archived_files(result)
 
-        assert gadget_enabled_during_mount is False, \
+        assert gadget_enabled_during_mount is False, (
             "Gadget should be disabled during cam_disk mount"
+        )
         assert mock_gadget.is_enabled(), "Gadget should be re-enabled after cleanup"
 
-    def test_gadget_reenabled_after_deletion_failure(
+    def test_gadget_stays_disconnected_after_mount_failure(
         self, coordinator_with_gadget: Coordinator, mock_gadget: MockGadget
     ):
-        """Test that gadget is re-enabled even if deletion fails."""
+        """A mount failure stops cleanup and leaves the disk disconnected."""
         result = ArchiveResult(
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
             files_transferred=5,
-            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000)]},
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000, mtime=0)]},
         )
 
         @contextmanager
@@ -445,11 +433,15 @@ class TestGadgetCoordination:
             raise OSError("Mount failed")
             yield  # pragma: no cover
 
-        with patch("teslausb.mount.mount_image", failing_mount), \
-             patch("teslausb.mount.fsck_image", return_value=True):
+        with (
+            patch("teslausb.mount.mount_image", failing_mount),
+            patch("teslausb.mount.fsck_image", return_value=True),
+            pytest.raises(OSError, match="Mount failed"),
+        ):
             coordinator_with_gadget._delete_archived_files(result)
 
-        assert mock_gadget.is_enabled(), "Gadget must be re-enabled after mount failure"
+        assert not mock_gadget.is_enabled()
+        assert coordinator_with_gadget._stop_event.is_set()
 
     def test_deletion_skipped_if_gadget_disable_fails(
         self, coordinator_with_gadget: Coordinator, mock_gadget: MockGadget
@@ -459,7 +451,7 @@ class TestGadgetCoordination:
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
             files_transferred=5,
-            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000)]},
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000, mtime=0)]},
         )
 
         # Make gadget.disable() fail
@@ -473,7 +465,10 @@ class TestGadgetCoordination:
             mount_called = True
             yield Path("/mnt/cam")
 
-        with patch("teslausb.mount.mount_image", tracking_mount):
+        with (
+            patch("teslausb.mount.mount_image", tracking_mount),
+            pytest.raises(Exception, match="Cannot disable"),
+        ):
             coordinator_with_gadget._delete_archived_files(result)
 
         assert not mount_called, "Should not mount cam_disk if gadget disable fails"
@@ -490,7 +485,7 @@ class TestGadgetCoordination:
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
             files_transferred=5,
-            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000)]},
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000, mtime=0)]},
         )
 
         # Make disable() appear to succeed but leave gadget enabled
@@ -504,7 +499,10 @@ class TestGadgetCoordination:
             mount_called = True
             yield Path("/mnt/cam")
 
-        with patch("teslausb.mount.mount_image", tracking_mount):
+        with (
+            patch("teslausb.mount.mount_image", tracking_mount),
+            pytest.raises(Exception, match="Gadget still enabled"),
+        ):
             coordinator_with_gadget._delete_archived_files(result)
 
         assert not mount_called, "Should not mount cam_disk if gadget still enabled"
@@ -517,7 +515,7 @@ class TestGadgetCoordination:
             snapshot_id=1,
             state=ArchiveState.COMPLETED,
             files_transferred=5,
-            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000)]},
+            archived_files={"SavedClips": [ArchivedFile("event/front.mp4", 1000, mtime=0)]},
         )
 
         mount_called = False
@@ -528,8 +526,10 @@ class TestGadgetCoordination:
             mount_called = True
             yield Path("/mnt/cam")
 
-        with patch("teslausb.mount.mount_image", tracking_mount), \
-             patch("teslausb.mount.fsck_image", return_value=True):
+        with (
+            patch("teslausb.mount.mount_image", tracking_mount),
+            patch("teslausb.mount.fsck_image", return_value=True),
+        ):
             coordinator._delete_archived_files(result)
 
         assert mount_called, "Should proceed with deletion when no gadget configured"
@@ -608,9 +608,7 @@ class TestWaitForArchiveReachable:
         wait_intervals: list[float] = []
 
         # Unreachable 4 times, then reachable
-        coordinator.backend.is_reachable = MagicMock(
-            side_effect=[False, False, False, False, True]
-        )
+        coordinator.backend.is_reachable = MagicMock(side_effect=[False, False, False, False, True])
 
         original_wait = coordinator._wait_interruptible
 
@@ -712,8 +710,12 @@ class TestStartupCamDiskSizeCheck:
         coordinator.run()
 
     def test_logs_error_when_cam_disk_exceeds_half(
-        self, mock_fs: MockFilesystem, snapshot_manager, space_manager,
-        mock_backend, caplog,
+        self,
+        mock_fs: MockFilesystem,
+        snapshot_manager,
+        space_manager,
+        mock_backend,
+        caplog,
     ):
         """Test that run() logs error when cam_disk > 50% of backing store."""
         # cam_disk.bin is 21 bytes (from fixture), total space 256 GiB
@@ -721,6 +723,7 @@ class TestStartupCamDiskSizeCheck:
         mock_fs.set_total_space(20)  # 20 bytes total — cam_disk (21 bytes) > 50%
 
         archive_manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs,
             snapshot_manager=snapshot_manager,
             backend=mock_backend,
@@ -742,7 +745,9 @@ class TestStartupCamDiskSizeCheck:
         assert any("exceeds 50%" in r.message for r in caplog.records)
 
     def test_no_error_when_cam_disk_within_budget(
-        self, coordinator: Coordinator, caplog,
+        self,
+        coordinator: Coordinator,
+        caplog,
     ):
         """Test that no error is logged when cam_disk is within budget."""
         # Default fixture: cam_disk is 21 bytes, total space 256 GiB — well within 50%
@@ -760,3 +765,46 @@ class TestStartupCamDiskSizeCheck:
             self._run_startup_only(coordinator)
 
         assert not any("exceeds 50%" in r.message for r in caplog.records)
+
+
+def test_failed_fsck_never_mounts_or_reconnects(coordinator_with_gadget, mock_gadget):
+    from teslausb.mount import MountError
+
+    result = ArchiveResult(snapshot_id=1, state=ArchiveState.COMPLETED)
+    with (
+        patch("teslausb.mount.fsck_image", return_value=False),
+        patch("teslausb.mount.mount_image") as mount,
+        pytest.raises(MountError, match="Filesystem check failed"),
+    ):
+        coordinator_with_gadget._delete_archived_files(result)
+    mount.assert_not_called()
+    assert not mock_gadget.is_enabled()
+    assert coordinator_with_gadget._stop_event.is_set()
+
+
+def test_cleanup_rechecks_idle_after_archive(coordinator_with_gadget, mock_gadget):
+    coordinator_with_gadget.config.idle_detector = MockIdleDetector(always_idle=False)
+    result = ArchiveResult(snapshot_id=1, state=ArchiveState.COMPLETED)
+    with patch("teslausb.mount.fsck_image") as fsck:
+        coordinator_with_gadget._delete_archived_files(result)
+    fsck.assert_not_called()
+    assert mock_gadget.is_enabled()
+
+
+def test_unmount_failure_leaves_gadget_disconnected(coordinator_with_gadget, mock_gadget):
+    from teslausb.mount import MountError
+
+    @contextmanager
+    def failed_unmount(path, readonly=True):
+        yield Path("/mnt/cam")
+        raise MountError("Failed to unmount /mnt/cam")
+
+    result = ArchiveResult(snapshot_id=1, state=ArchiveState.COMPLETED)
+    with (
+        patch("teslausb.mount.fsck_image", return_value=True),
+        patch("teslausb.mount.mount_image", failed_unmount),
+        pytest.raises(MountError, match="Failed to unmount"),
+    ):
+        coordinator_with_gadget._delete_archived_files(result)
+    assert not mock_gadget.is_enabled()
+    assert coordinator_with_gadget._stop_event.is_set()

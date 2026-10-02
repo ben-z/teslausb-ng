@@ -9,8 +9,10 @@ This module provides:
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +87,7 @@ class ArchiveConfig:
     archive_sentry: bool = True
     archive_track: bool = True
     archive_photobooth: bool = True
+    event_stability_seconds: float = 600.0
 
 
 @dataclass
@@ -139,25 +142,43 @@ def _load_from_dict(env: dict[str, str]) -> Config:
     Returns:
         Config instance
     """
-    rclone_flags = env.get("RCLONE_FLAGS", "").split() if env.get("RCLONE_FLAGS") else []
+    config = Config()
+    archive = config.archive
+    for key, attribute in (
+        ("BACKINGFILES_PATH", "backingfiles_path"),
+        ("MUTABLE_PATH", "mutable_path"),
+    ):
+        if key in env:
+            setattr(config, attribute, Path(env[key]))
+    for key, attribute in (
+        ("ARCHIVE_SYSTEM", "system"),
+        ("RCLONE_DRIVE", "rclone_drive"),
+        ("RCLONE_PATH", "rclone_path"),
+    ):
+        if key in env:
+            setattr(archive, attribute, env[key])
+    archive.system = archive.system.lower()
+    if "RCLONE_FLAGS" in env:
+        archive.rclone_flags = shlex.split(env["RCLONE_FLAGS"])
+    for key, attribute in (
+        ("ARCHIVE_RECENTCLIPS", "archive_recent"),
+        ("ARCHIVE_SAVEDCLIPS", "archive_saved"),
+        ("ARCHIVE_SENTRYCLIPS", "archive_sentry"),
+        ("ARCHIVE_TRACKMODECLIPS", "archive_track"),
+        ("ARCHIVE_PHOTOBOOTH", "archive_photobooth"),
+    ):
+        if key in env:
+            if env[key].lower() not in {"true", "false"}:
+                raise ConfigError(f"{key} must be true or false")
+            setattr(archive, attribute, env[key].lower() == "true")
 
-    archive = ArchiveConfig(
-        system=env.get("ARCHIVE_SYSTEM", "none").lower(),
-        rclone_drive=env.get("RCLONE_DRIVE", ""),
-        rclone_path=env.get("RCLONE_PATH", ""),
-        rclone_flags=rclone_flags,
-        archive_recent=env.get("ARCHIVE_RECENTCLIPS", "false").lower() == "true",
-        archive_saved=env.get("ARCHIVE_SAVEDCLIPS", "true").lower() != "false",
-        archive_sentry=env.get("ARCHIVE_SENTRYCLIPS", "true").lower() != "false",
-        archive_track=env.get("ARCHIVE_TRACKMODECLIPS", "true").lower() != "false",
-        archive_photobooth=env.get("ARCHIVE_PHOTOBOOTH", "true").lower() != "false",
-    )
-
-    config = Config(
-        backingfiles_path=Path(env.get("BACKINGFILES_PATH", "/backingfiles")),
-        mutable_path=Path(env.get("MUTABLE_PATH", "/mutable")),
-        archive=archive,
-    )
+    if "EVENT_STABILITY_SECONDS" in env:
+        config.archive.event_stability_seconds = float(env["EVENT_STABILITY_SECONDS"])
+        if (
+            not math.isfinite(config.archive.event_stability_seconds)
+            or config.archive.event_stability_seconds < 0
+        ):
+            raise ConfigError("EVENT_STABILITY_SECONDS must be nonnegative")
 
     if proportion := env.get("SNAPSHOT_SPACE_PROPORTION"):
         config.snapshot_space_proportion = float(proportion)

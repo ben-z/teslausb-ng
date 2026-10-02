@@ -1,227 +1,122 @@
-"""Tests for idle detection."""
+"""Tests for elapsed-time idle detection without filesystem or wall-clock waits."""
 
+from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
 import pytest
 
-from teslausb.idle import (
-    IDLE_CONFIRM_SECONDS,
-    IdleState,
-    IdleStatus,
-    MockIdleDetector,
-    ProcIdleDetector,
-)
+from teslausb.filesystem import MockFilesystem
+from teslausb.idle import IdleConfig, IdleState, IdleStatus, MockIdleDetector, ProcIdleDetector
 
 
-class TestIdleStatus:
-    """Tests for IdleStatus dataclass."""
-
-    def test_default_values(self):
-        """Test default status values."""
-        status = IdleStatus(state=IdleState.UNDETERMINED)
-
-        assert status.state == IdleState.UNDETERMINED
-        assert status.bytes_written == 0
-        assert status.burst_size == 0
-        assert status.idle_seconds == 0
-
-    def test_custom_values(self):
-        """Test status with custom values."""
-        status = IdleStatus(
-            state=IdleState.WRITING,
-            bytes_written=1000000,
-            burst_size=500000,
-            idle_seconds=0,
-        )
-
-        assert status.state == IdleState.WRITING
-        assert status.bytes_written == 1000000
-        assert status.burst_size == 500000
+@pytest.fixture
+def detector():
+    fs = MockFilesystem()
+    fs.mkdir(Path("/proc/1234"), parents=True)
+    fs.write_text(Path("/proc/1234/comm"), "file-storage\n")
+    fs.write_text(Path("/proc/1234/io"), "wchar: 2000\n")
+    return ProcIdleDetector(fs, IdleConfig())
 
 
-class TestMockIdleDetector:
-    """Tests for MockIdleDetector."""
+class Clock:
+    def __init__(self):
+        self.now = 0.0
 
-    def test_default_always_idle(self):
-        """Test mock detector defaults to always idle."""
-        detector = MockIdleDetector()
+    def monotonic(self):
+        return self.now
 
-        result = detector.wait_for_idle(timeout=1)
-
-        assert result is True
-        assert detector.wait_count == 1
-
-    def test_always_idle_true(self):
-        """Test mock detector with always_idle=True."""
-        detector = MockIdleDetector(always_idle=True)
-
-        result = detector.wait_for_idle()
-        status = detector.get_status()
-
-        assert result is True
-        assert status.state == IdleState.IDLE
-
-    def test_always_idle_false(self):
-        """Test mock detector with always_idle=False (timeout)."""
-        detector = MockIdleDetector(always_idle=False)
-
-        result = detector.wait_for_idle(timeout=1)
-        status = detector.get_status()
-
-        assert result is False
-        assert status.state == IdleState.WRITING
-
-    def test_wait_count_increments(self):
-        """Test that wait_count increments on each call."""
-        detector = MockIdleDetector()
-
-        detector.wait_for_idle()
-        detector.wait_for_idle()
-        detector.wait_for_idle()
-
-        assert detector.wait_count == 3
+    def sleep(self, seconds):
+        self.now += seconds
 
 
-class TestProcIdleDetector:
-    """Tests for ProcIdleDetector."""
+@pytest.fixture
+def clock():
+    clock = Clock()
+    with (
+        patch("teslausb.idle.time.monotonic", clock.monotonic),
+        patch("teslausb.idle.time.sleep", clock.sleep),
+    ):
+        yield clock
 
-    def test_init(self, tmp_path):
-        """Test detector initialization."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
 
-        assert detector.proc_path == tmp_path
-        assert detector.process_name == "file-storage"
+def test_status_defaults():
+    status = IdleStatus(IdleState.UNDETERMINED)
+    assert status.bytes_written == status.burst_size == status.idle_seconds == 0
 
-    def test_find_process_pid_not_found(self, tmp_path):
-        """Test finding PID when process doesn't exist."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
 
-        pid = detector._find_process_pid()
+@pytest.mark.parametrize("always_idle", [True, False])
+def test_mock_idle(always_idle):
+    detector = MockIdleDetector(always_idle=always_idle)
+    assert detector.wait_for_idle(1) is always_idle
+    assert detector.wait_count == 1
+    assert detector.get_status().state == (IdleState.IDLE if always_idle else IdleState.WRITING)
 
-        assert pid is None
 
-    def test_find_process_pid_found(self, tmp_path):
-        """Test finding PID when process exists."""
-        # Create fake proc entry
-        proc_dir = tmp_path / "1234"
-        proc_dir.mkdir()
-        (proc_dir / "comm").write_text("file-storage\n")
+def test_process_discovery(detector):
+    assert detector._find_process_pid() == 1234
+    assert detector._get_write_bytes(1234) == 2000
 
-        detector = ProcIdleDetector(proc_path=tmp_path)
 
-        pid = detector._find_process_pid()
+def test_missing_process_is_idle(detector, clock):
+    detector.fs.remove(Path("/proc/1234/comm"))
+    assert detector.wait_for_idle(2)
 
-        assert pid == 1234
 
-    def test_get_write_bytes(self, tmp_path):
-        """Test reading write_bytes from proc."""
-        proc_dir = tmp_path / "1234"
-        proc_dir.mkdir()
-        (proc_dir / "io").write_text(
-            "read_chars: 12345\n"
-            "write_chars: 67890\n"
-            "read_bytes: 1000\n"
-            "write_bytes: 2000\n"
-        )
+def test_missing_counter_fails(detector):
+    detector.fs.write_text(Path("/proc/1234/io"), "read_bytes: 2000\n")
+    with pytest.raises(RuntimeError, match="Missing wchar"):
+        detector._get_write_bytes(1234)
 
-        detector = ProcIdleDetector(proc_path=tmp_path)
 
-        write_bytes = detector._get_write_bytes(1234)
+def test_quiet_process_requires_real_elapsed_time(detector, clock):
+    detector.config.poll_interval = 0.25
+    assert detector.wait_for_idle(6)
+    assert clock.now == 5.25
+    assert detector.get_status().state == IdleState.IDLE
+    assert detector.get_status().idle_seconds == 5
 
-        assert write_bytes == 2000
 
-    def test_get_write_bytes_not_found(self, tmp_path):
-        """Test reading write_bytes when file doesn't exist."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
+def test_even_small_metadata_writes_prevent_idle(detector, clock):
+    writes = iter(range(100))
+    with patch.object(detector, "_get_write_bytes", side_effect=lambda _: next(writes)):
+        assert not detector.wait_for_idle(10)
+    assert detector.get_status().state == IdleState.WRITING
 
-        write_bytes = detector._get_write_bytes(9999)
 
-        assert write_bytes is None
+def test_write_burst_resets_quiet_interval(detector, clock):
+    with patch.object(detector, "_get_write_bytes", side_effect=[0, 0, 1, 1, 1, 1, 1, 1]):
+        assert detector.wait_for_idle(9)
+    assert clock.now == 8
 
-    def test_wait_for_idle_no_process(self, tmp_path):
-        """Test wait_for_idle when no mass storage process."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
 
-        result = detector.wait_for_idle(timeout=2)
+def test_counter_reset_restarts_confirmation(detector, clock):
+    with patch.object(detector, "_get_write_bytes", side_effect=[10, 10, 0, 0, 0, 0, 0, 0]):
+        assert detector.wait_for_idle(9)
+    assert clock.now == 8
 
-        assert result is True  # No process = idle
 
-    def test_undetermined_transitions_to_idle_when_quiet(self, tmp_path):
-        """Test UNDETERMINED->IDLE when no significant writes are detected.
+def test_stop_event_interrupts_wait(detector):
+    detector.stop_event = Event()
+    detector.stop_event.set()
+    assert not detector.wait_for_idle(30)
 
-        Previously, UNDETERMINED only transitioned to WRITING (on high delta),
-        so a quiet car would waste the full 90s timeout every cycle.
-        """
-        proc_dir = tmp_path / "1234"
-        proc_dir.mkdir()
-        (proc_dir / "comm").write_text("file-storage\n")
 
-        # write_bytes barely changes (100 bytes/sec, well below 500KB threshold)
-        call_count = 0
+@pytest.mark.parametrize("field", ["poll_interval", "idle_confirm_seconds"])
+def test_invalid_timing_rejected(field):
+    with pytest.raises(ValueError, match="must be positive"):
+        IdleConfig(**{field: 0})
 
-        def fake_get_write_bytes(pid):
-            nonlocal call_count
-            call_count += 1
-            return call_count * 100
 
-        detector = ProcIdleDetector(proc_path=tmp_path)
+def test_buffered_writes_block_idle_even_when_dirty_page_counter_is_constant(detector, clock):
+    read_text = detector.fs.read_text
+    writes = iter(range(100))
 
-        with patch.object(detector, "_get_write_bytes", fake_get_write_bytes), \
-             patch("teslausb.idle.time.sleep"):
-            result = detector.wait_for_idle(timeout=30)
+    def proc_text(path):
+        if path.name == "io":
+            return f"wchar: {next(writes)}\nwrite_bytes: 4096\n"
+        return read_text(path)
 
-        assert result is True
-        assert detector._state == IdleState.IDLE
-        # First call establishes baseline, then IDLE_CONFIRM_SECONDS quiet samples needed
-        assert call_count == IDLE_CONFIRM_SECONDS + 1
-
-    def test_undetermined_transitions_to_writing_on_high_delta(self, tmp_path):
-        """Test UNDETERMINED->WRITING->IDLE: big write then quiet settles to idle."""
-        proc_dir = tmp_path / "1234"
-        proc_dir.mkdir()
-        (proc_dir / "comm").write_text("file-storage\n")
-
-        # Baseline, then quiet, then a big write (800KB jump), then quiet to settle
-        write_values = iter([0, 100, 200, 1_000_000, 1_000_100, 1_000_200,
-                            1_000_300, 1_000_400, 1_000_500, 1_000_600])
-
-        detector = ProcIdleDetector(proc_path=tmp_path)
-
-        with patch.object(detector, "_get_write_bytes", lambda pid: next(write_values)), \
-             patch("teslausb.idle.time.sleep"):
-            result = detector.wait_for_idle(timeout=30)
-
-        assert result is True
-        assert detector._state == IdleState.IDLE
-
-    def test_stop_event_interrupts_wait(self, tmp_path):
-        """Test that setting stop_event causes wait_for_idle to return False promptly."""
-        proc_dir = tmp_path / "1234"
-        proc_dir.mkdir()
-        (proc_dir / "comm").write_text("file-storage\n")
-
-        stop = Event()
-        stop.set()  # Already signaled — should return False on first iteration
-
-        detector = ProcIdleDetector(proc_path=tmp_path, stop_event=stop)
-        result = detector.wait_for_idle(timeout=30)
-
-        assert result is False
-
-    def test_no_stop_event_still_works(self, tmp_path):
-        """Test that ProcIdleDetector works without a stop_event (backwards compat)."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
-
-        # No process → immediate idle, even without stop_event
-        result = detector.wait_for_idle(timeout=2)
-        assert result is True
-
-    def test_get_status_initial(self, tmp_path):
-        """Test initial status."""
-        detector = ProcIdleDetector(proc_path=tmp_path)
-
-        status = detector.get_status()
-
-        assert status.state == IdleState.UNDETERMINED
-        assert status.bytes_written == 0
+    with patch.object(detector.fs, "read_text", side_effect=proc_text):
+        assert not detector.wait_for_idle(10)
+    assert detector.get_status().state == IdleState.WRITING

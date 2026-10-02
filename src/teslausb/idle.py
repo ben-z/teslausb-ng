@@ -1,14 +1,4 @@
-"""Idle detection for TeslaUSB.
-
-This module monitors USB mass storage I/O to detect when the car
-has stopped writing (is idle). This prevents taking snapshots
-while the car is actively recording.
-
-The detection uses a state machine:
-- UNDETERMINED: Initial state, waiting for first write
-- WRITING: Active writes detected (>500KB/sec)
-- IDLE: No significant writes for 5 seconds
-"""
+"""Detect a quiet interval in the USB mass storage process's write counter."""
 
 from __future__ import annotations
 
@@ -18,18 +8,26 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from threading import Event
 from typing import Protocol
+
+from .filesystem import FileNotFoundError_, Filesystem
 
 logger = logging.getLogger(__name__)
 
-# Threshold for "active writing" in bytes per second
-WRITE_THRESHOLD = 500_000  # 500KB
 
-# Seconds of idle before declaring idle
-IDLE_CONFIRM_SECONDS = 5
+@dataclass
+class IdleConfig:
+    """Timing and process identity for idle detection."""
 
-# Maximum wait time for idle
-DEFAULT_TIMEOUT = 90
+    proc_path: Path = Path("/proc")
+    process_name: str = "file-storage"
+    idle_confirm_seconds: float = 5.0
+    poll_interval: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.idle_confirm_seconds <= 0 or self.poll_interval <= 0:
+            raise ValueError("Idle confirmation and polling intervals must be positive")
 
 
 class IdleState(Enum):
@@ -47,21 +45,14 @@ class IdleStatus:
     state: IdleState
     bytes_written: int = 0
     burst_size: int = 0
-    idle_seconds: int = 0
+    idle_seconds: float = 0.0
 
 
 class IdleDetector(Protocol):
     """Protocol for idle detection."""
 
-    def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
-        """Wait for the car to become idle.
-
-        Args:
-            timeout: Maximum seconds to wait
-
-        Returns:
-            True if idle detected, False if timeout
-        """
+    def wait_for_idle(self, timeout: float) -> bool:
+        """Return True after a quiet interval, False on timeout or a stop request."""
         ...
 
     def get_status(self) -> IdleStatus:
@@ -70,180 +61,104 @@ class IdleDetector(Protocol):
 
 
 class ProcIdleDetector:
-    """Idle detector using /proc filesystem.
+    """Observe logical writes, including metadata rewritten in already-dirty pages.
 
-    Monitors /proc/{pid}/io for the file-storage process to detect
-    when the car has stopped writing to the USB mass storage device.
+    The /proc wchar counter counts writes even when write_bytes does not increase
+    because the same dirty filesystem page was updated again.
     """
 
-    def __init__(
-        self,
-        proc_path: Path = Path("/proc"),
-        process_name: str = "file-storage",
-        write_threshold: int = WRITE_THRESHOLD,
-        idle_confirm_seconds: int = IDLE_CONFIRM_SECONDS,
-        poll_interval: float = 1.0,
-    ):
-        """Initialize the idle detector.
-
-        Args:
-            proc_path: Path to /proc filesystem
-            process_name: Name of the mass storage process to monitor
-            write_threshold: Bytes per second considered active writing
-            idle_confirm_seconds: Seconds of quiet before declaring idle
-            poll_interval: Seconds between write counter samples
-        """
-        self.proc_path = proc_path
-        self.process_name = process_name
-        self.write_threshold = write_threshold
-        self.idle_confirm_seconds = idle_confirm_seconds
-        self.poll_interval = poll_interval
-        self._state = IdleState.UNDETERMINED
-        self._prev_written = -1
-        self._burst_size = 0
-        self._idle_count = 0
+    def __init__(self, fs: Filesystem, config: IdleConfig, stop_event: Event | None = None):
+        self.fs = fs
+        self.config = config
+        self.stop_event = stop_event
+        self._status = IdleStatus(IdleState.UNDETERMINED)
 
     def _find_process_pid(self) -> int | None:
-        """Find PID of the mass storage process.
-
-        Returns:
-            Process ID if found, None otherwise
-        """
-        for proc_dir in self.proc_path.iterdir():
-            if not proc_dir.name.isdigit():
+        for name in self.fs.listdir(self.config.proc_path):
+            if not name.isdigit():
                 continue
-
             try:
-                comm_file = proc_dir / "comm"
-                if comm_file.exists():
-                    comm = comm_file.read_text().strip()
-                    if comm == self.process_name:
-                        return int(proc_dir.name)
-            except (PermissionError, FileNotFoundError, ProcessLookupError):
-                continue
-
+                comm = self.fs.read_text(self.config.proc_path / name / "comm").strip()
+            except FileNotFoundError_:
+                continue  # Processes can exit between listing /proc and reading comm.
+            if comm == self.config.process_name:
+                return int(name)
         return None
 
-    def _get_write_bytes(self, pid: int) -> int | None:
-        """Get write_bytes from /proc/{pid}/io.
+    def _get_write_bytes(self, pid: int) -> int:
+        content = self.fs.read_text(self.config.proc_path / str(pid) / "io")
+        match = re.search(r"^wchar:\s*(\d+)$", content, re.MULTILINE)
+        if match is None:
+            raise RuntimeError(f"Missing wchar counter for mass storage process {pid}")
+        return int(match.group(1))
 
-        Args:
-            pid: Process ID
+    def wait_for_idle(self, timeout: float) -> bool:
+        self._status = IdleStatus(IdleState.UNDETERMINED)
+        deadline = time.monotonic() + timeout
+        previous_pid: int | None = None
+        previous_written: int | None = None
+        quiet_since = time.monotonic()
 
-        Returns:
-            Bytes written, or None if unavailable
-        """
-        io_path = self.proc_path / str(pid) / "io"
-        try:
-            content = io_path.read_text()
-            match = re.search(r"write_bytes:\s*(\d+)", content)
-            if match:
-                return int(match.group(1))
-        except (PermissionError, FileNotFoundError, ProcessLookupError):
-            pass
-        return None
-
-    def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
-        """Wait for the car to become idle.
-
-        Uses a state machine to detect idle:
-        1. UNDETERMINED: Wait for first significant write
-        2. WRITING: Car is actively writing
-        3. IDLE: No writes for IDLE_CONFIRM_SECONDS
-
-        Args:
-            timeout: Maximum seconds to wait
-
-        Returns:
-            True if idle detected, False if timeout
-        """
-        self._state = IdleState.UNDETERMINED
-        self._prev_written = -1
-        self._burst_size = 0
-        self._idle_count = 0
-
-        logger.info(f"Waiting up to {timeout:.0f} seconds for idle")
-
-        start_time = time.monotonic()
-        while (time.monotonic() - start_time) < timeout:
-            time.sleep(self.poll_interval)
+        while time.monotonic() < deadline:
+            delay = min(self.config.poll_interval, deadline - time.monotonic())
+            if self.stop_event is not None:
+                if self.stop_event.wait(max(0, delay)):
+                    return False
+            else:
+                time.sleep(max(0, delay))
 
             pid = self._find_process_pid()
             if pid is None:
-                logger.info("Mass storage process not active, OK to proceed")
-                self._state = IdleState.IDLE
+                self._status.state = IdleState.IDLE
                 return True
-
-            written = self._get_write_bytes(pid)
-            if written is None:
+            try:
+                written = self._get_write_bytes(pid)
+            except FileNotFoundError_:
+                previous_pid = None
+                previous_written = None
+                self._status = IdleStatus(IdleState.UNDETERMINED)
                 continue
 
-            if self._prev_written < 0:
-                self._prev_written = written
-                continue
-
-            delta = written - self._prev_written
-            self._prev_written = written
-
-            if delta > self.write_threshold:
-                if self._state != IdleState.WRITING:
-                    logger.info("Write in progress")
-                self._state = IdleState.WRITING
-                self._burst_size = delta
-                self._idle_count = 0
+            now = time.monotonic()
+            self._status.bytes_written = written
+            if pid != previous_pid or previous_written is None or written < previous_written:
+                quiet_since = now
+                self._status.state = IdleState.UNDETERMINED
+                self._status.idle_seconds = 0
+            elif written != previous_written:
+                quiet_since = now
+                self._status.state = IdleState.WRITING
+                self._status.burst_size += written - previous_written
+                self._status.idle_seconds = 0
             else:
-                if self._state == IdleState.WRITING:
-                    logger.info(f"No longer writing, wrote {self._burst_size} bytes")
-                    self._state = IdleState.IDLE
-                    self._burst_size = 0
-                    self._idle_count = 0
-                elif self._state == IdleState.UNDETERMINED:
-                    logger.info("No writes observed, checking idle interval")
-                    self._state = IdleState.IDLE
-
-                self._idle_count += 1
-                if self._idle_count >= self.idle_confirm_seconds:
-                    logger.info(
-                        f"No writes seen in the last {self.idle_confirm_seconds} seconds"
-                    )
+                self._status.idle_seconds = now - quiet_since
+                if self._status.idle_seconds >= self.config.idle_confirm_seconds:
+                    self._status.state = IdleState.IDLE
+                    logger.info("No disk writes for %.1f seconds", self._status.idle_seconds)
                     return True
+            previous_pid = pid
+            previous_written = written
 
-        logger.warning("Couldn't determine idle interval")
+        logger.warning("No confirmed idle interval within %.1f seconds", timeout)
         return False
 
     def get_status(self) -> IdleStatus:
-        """Get current idle status."""
-        return IdleStatus(
-            state=self._state,
-            bytes_written=self._prev_written if self._prev_written >= 0 else 0,
-            burst_size=self._burst_size,
-            idle_seconds=self._idle_count,
-        )
+        return self._status
 
 
 class MockIdleDetector:
     """Mock idle detector for testing."""
 
     def __init__(self, always_idle: bool = True, wait_seconds: float = 0):
-        """Initialize mock detector.
-
-        Args:
-            always_idle: If True, wait_for_idle always succeeds
-            wait_seconds: Simulated wait time before returning
-        """
         self.always_idle = always_idle
         self.wait_seconds = wait_seconds
-        self._state = IdleState.IDLE if always_idle else IdleState.WRITING
         self.wait_count = 0
 
-    def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
-        """Simulate waiting for idle."""
+    def wait_for_idle(self, timeout: float) -> bool:
         self.wait_count += 1
         if self.wait_seconds > 0:
             time.sleep(min(self.wait_seconds, timeout))
-        self._state = IdleState.IDLE if self.always_idle else IdleState.WRITING
         return self.always_idle
 
     def get_status(self) -> IdleStatus:
-        """Get mock status."""
-        return IdleStatus(state=self._state)
+        return IdleStatus(IdleState.IDLE if self.always_idle else IdleState.WRITING)

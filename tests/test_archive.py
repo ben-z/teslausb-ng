@@ -36,6 +36,7 @@ class PartialFailureBackend(MockArchiveBackend):
                 ArchivedFile(
                     relative_path="2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4",
                     size=500_000,
+                    mtime=0,
                 ),
             ],
         )
@@ -96,6 +97,7 @@ class TestArchiveManager:
         backend = MockArchiveBackend(reachable=True)
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -124,6 +126,7 @@ class TestArchiveManager:
 
         # Only archive SavedClips
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -151,13 +154,9 @@ class TestArchiveManager:
         # Create a snapshot that matches the pre-created structure
         mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
         mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.bin"),
-            "mock"
+            Path("/backingfiles/snapshots/snap-000000/snap.bin"), "mock"
         )
-        mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.toc"),
-            ""
-        )
+        mock_fs_with_teslacam.write_text(Path("/backingfiles/snapshots/snap-000000/snap.toc"), "")
 
         # Reload to pick up the snapshot
         snapshot_manager = SnapshotManager(
@@ -169,6 +168,7 @@ class TestArchiveManager:
         backend = MockArchiveBackend(reachable=True)
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -202,13 +202,9 @@ class TestArchiveManager:
         # Set up snapshot
         mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
         mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.bin"),
-            "mock"
+            Path("/backingfiles/snapshots/snap-000000/snap.bin"), "mock"
         )
-        mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.toc"),
-            ""
-        )
+        mock_fs_with_teslacam.write_text(Path("/backingfiles/snapshots/snap-000000/snap.toc"), "")
 
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
@@ -223,6 +219,7 @@ class TestArchiveManager:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -242,11 +239,11 @@ class TestArchiveManager:
         finally:
             handle.release()
 
-    def test_archive_snapshot_keeps_partial_archived_files(
+    def test_archive_snapshot_keeps_partial_event_on_disk(
         self,
         mock_fs_with_teslacam: MockFilesystem,
     ):
-        """Test failed copies can still return files safe to clean up."""
+        """Partial event copies must keep the complete event on the live disk."""
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
             cam_disk_path=Path("/backingfiles/cam_disk.bin"),
@@ -256,6 +253,7 @@ class TestArchiveManager:
         backend = PartialFailureBackend(reachable=True)
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -277,14 +275,7 @@ class TestArchiveManager:
             assert result.error == "SavedClips: Timeout"
             assert result.files_transferred == 1
             assert result.bytes_transferred == 500_000
-            assert result.archived_files == {
-                "SavedClips": [
-                    ArchivedFile(
-                        relative_path="2024-01-15_10-30-00/2024-01-15_10-30-00-front.mp4",
-                        size=500_000,
-                    ),
-                ],
-            }
+            assert result.archived_files == {}
         finally:
             handle.release()
 
@@ -298,13 +289,9 @@ class TestArchiveManager:
 
         mock_fs_with_teslacam.mkdir(Path("/backingfiles/snapshots/snap-000000"), exist_ok=True)
         mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.bin"),
-            "mock"
+            Path("/backingfiles/snapshots/snap-000000/snap.bin"), "mock"
         )
-        mock_fs_with_teslacam.write_text(
-            Path("/backingfiles/snapshots/snap-000000/snap.toc"),
-            ""
-        )
+        mock_fs_with_teslacam.write_text(Path("/backingfiles/snapshots/snap-000000/snap.toc"), "")
 
         snapshot_manager = SnapshotManager(
             fs=mock_fs_with_teslacam,
@@ -315,6 +302,7 @@ class TestArchiveManager:
         backend = MockArchiveBackend(reachable=False)
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=mock_fs_with_teslacam,
             snapshot_manager=snapshot_manager,
             backend=backend,
@@ -496,10 +484,10 @@ class TestRcloneBackend:
     def test_copy_directory_failure_returns_confirmed_archived_files(self, monkeypatch):
         """Test failed copies return files rclone confirmed as copied or unchanged."""
         fs = MockFilesystem()
-        fs.mkdir(Path("/test/RecentClips/event1"), parents=True)
-        fs.write_text(Path("/test/RecentClips/event1/front.mp4"), "x" * 1000)
-        fs.write_text(Path("/test/RecentClips/event1/back.mp4"), "x" * 2000)
-        fs.write_text(Path("/test/RecentClips/event1/left.mp4"), "x" * 3000)
+        fs.mkdir(Path("/test/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/test/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/SavedClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/SavedClips/event1/left.mp4"), "x" * 3000)
 
         def run_failure(*args, **kwargs):
             assert "--use-json-log" in args[0]
@@ -527,24 +515,24 @@ class TestRcloneBackend:
         monkeypatch.setattr(subprocess, "run", run_failure)
 
         backend = RcloneBackend(remote="gdrive", fs=fs)
-        result = backend.copy_directory(Path("/test/RecentClips"), "RecentClips")
+        result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
 
         assert not result.success
         assert result.error == "Failed to copy: network interrupted"
-        assert result.files_transferred == 2
-        assert result.bytes_transferred == 3000
+        assert result.files_transferred == 1
+        assert result.bytes_transferred == 1000
         assert result.archived_files == [
-            ArchivedFile(relative_path="event1/back.mp4", size=2000),
-            ArchivedFile(relative_path="event1/front.mp4", size=1000),
+            ArchivedFile(relative_path="event1/back.mp4", size=2000, mtime=0),
+            ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
         ]
 
     def test_copy_directory_timeout_returns_confirmed_archived_files(self, monkeypatch):
         """Test timeout returns files rclone confirmed as copied or unchanged."""
         fs = MockFilesystem()
-        fs.mkdir(Path("/test/RecentClips/event1"), parents=True)
-        fs.write_text(Path("/test/RecentClips/event1/front.mp4"), "x" * 1000)
-        fs.write_text(Path("/test/RecentClips/event1/back.mp4"), "x" * 2000)
-        fs.write_text(Path("/test/RecentClips/event1/left.mp4"), "x" * 3000)
+        fs.mkdir(Path("/test/SavedClips/event1"), parents=True)
+        fs.write_text(Path("/test/SavedClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/SavedClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/SavedClips/event1/left.mp4"), "x" * 3000)
 
         def timeout_run(*args, **kwargs):
             assert "--use-json-log" in args[0]
@@ -573,15 +561,15 @@ class TestRcloneBackend:
         monkeypatch.setattr(subprocess, "run", timeout_run)
 
         backend = RcloneBackend(remote="gdrive", fs=fs, timeout=1)
-        result = backend.copy_directory(Path("/test/RecentClips"), "RecentClips")
+        result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
 
         assert not result.success
         assert result.error == "Timeout"
-        assert result.files_transferred == 2
-        assert result.bytes_transferred == 3000
+        assert result.files_transferred == 1
+        assert result.bytes_transferred == 1000
         assert result.archived_files == [
-            ArchivedFile(relative_path="event1/back.mp4", size=2000),
-            ArchivedFile(relative_path="event1/front.mp4", size=1000),
+            ArchivedFile(relative_path="event1/back.mp4", size=2000, mtime=0),
+            ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
         ]
 
 
@@ -605,6 +593,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -617,8 +606,8 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
-                    ArchivedFile(relative_path="event1/back.mp4", size=2000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
+                    ArchivedFile(relative_path="event1/back.mp4", size=2000, mtime=0),
                 ],
             },
         )
@@ -649,6 +638,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -660,7 +650,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
             },
         )
@@ -687,6 +677,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -698,7 +689,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
             },
         )
@@ -725,6 +716,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -736,7 +728,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
             },
         )
@@ -766,6 +758,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -777,10 +770,10 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "SavedClips": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
                 "SentryClips": [
-                    ArchivedFile(relative_path="event2/front.mp4", size=2000),
+                    ArchivedFile(relative_path="event2/front.mp4", size=2000, mtime=0),
                 ],
             },
         )
@@ -808,6 +801,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -819,7 +813,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "TrackMode": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
             },
         )
@@ -846,6 +840,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -857,7 +852,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "Photobooth": [
-                    ArchivedFile(relative_path="selfie_2025-01-01.png", size=1000),
+                    ArchivedFile(relative_path="selfie_2025-01-01.png", size=1000, mtime=0),
                 ],
             },
         )
@@ -880,6 +875,7 @@ class TestDeleteArchivedFiles:
         )
 
         manager = ArchiveManager(
+            event_stability_seconds=0,
             fs=fs,
             snapshot_manager=snapshot_manager,
             backend=MockArchiveBackend(),
@@ -891,7 +887,7 @@ class TestDeleteArchivedFiles:
             state=ArchiveState.COMPLETED,
             archived_files={
                 "UnknownDir": [
-                    ArchivedFile(relative_path="event1/front.mp4", size=1000),
+                    ArchivedFile(relative_path="event1/front.mp4", size=1000, mtime=0),
                 ],
             },
         )

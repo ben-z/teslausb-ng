@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from threading import Event
@@ -55,6 +55,7 @@ class ArchivedFile:
 
     relative_path: str  # Path relative to clip directory (e.g., "2024-01-01_12-00-00/front.mp4")
     size: int  # File size in bytes at time of archive
+    mtime: float  # Modification time as reported by the mounted snapshot
 
 
 @dataclass
@@ -80,6 +81,14 @@ class ArchiveResult:
         if self.started_at and self.completed_at:
             return (self.completed_at - self.started_at).total_seconds()
         return None
+
+
+@dataclass
+class EventObservation:
+    """An event's immutable file signature and the time it was first observed."""
+
+    files: tuple[tuple[str, int, float], ...]
+    first_seen: float
 
 
 @dataclass
@@ -186,32 +195,33 @@ class RcloneBackend(ArchiveBackend):
         return remote
 
     def is_reachable(self) -> bool:
-        """Check if rclone remote is reachable."""
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                ["rclone", "lsf", self._remote_with_colon(), "--max-depth", "1"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            for _ in range(300):  # 30 seconds total
-                if self.stop_event and self.stop_event.is_set():
-                    return False
-                returncode = proc.poll()
-                if returncode is not None:
-                    stdout, stderr = proc.communicate()
-                    if stderr:
-                        for line in stderr.decode().splitlines():
-                            logger.debug(f"rclone: {line}")
-                    return returncode == 0
-                time.sleep(0.1)
-            return False
-        except (OSError, FileNotFoundError):
-            return False
-        finally:
-            if proc is not None:
-                proc.kill()
-                proc.wait()
+        """Check the archive root while draining output and honoring stop requests."""
+        with subprocess.Popen(
+            ["rclone", "lsf", self._remote_with_colon(), "--max-depth", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as proc:
+            deadline = time.monotonic() + 30
+            try:
+                while time.monotonic() < deadline:
+                    if self.stop_event and self.stop_event.is_set():
+                        return False
+                    try:
+                        _, stderr = proc.communicate(timeout=0.1)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    if proc.returncode != 0:
+                        logger.warning(
+                            "Archive reachability check failed: %s",
+                            stderr.decode(errors="replace").strip(),
+                        )
+                    return proc.returncode == 0
+                logger.warning("Archive reachability check timed out")
+                return False
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.communicate()
 
     def _scan_directory(self, src: Path) -> list[ArchivedFile]:
         """Scan a directory and collect file info for later deletion verification.
@@ -223,18 +233,12 @@ class RcloneBackend(ArchiveBackend):
             List of ArchivedFile with relative paths and sizes
         """
         files: list[ArchivedFile] = []
-        try:
-            for dirpath, _, filenames in self.fs.walk(src):
-                for filename in filenames:
-                    full_path = Path(dirpath) / filename
-                    try:
-                        size = self.fs.stat(full_path).size
-                        rel_path = str(full_path.relative_to(src))
-                        files.append(ArchivedFile(relative_path=rel_path, size=size))
-                    except (OSError, FilesystemError) as e:
-                        logger.warning(f"Could not stat {full_path}: {e}")
-        except (OSError, FilesystemError) as e:
-            logger.warning(f"Could not scan directory {src}: {e}")
+        for dirpath, _, filenames in self.fs.walk(src):
+            for filename in filenames:
+                full_path = Path(dirpath) / filename
+                stat = self.fs.stat(full_path)
+                rel_path = str(full_path.relative_to(src))
+                files.append(ArchivedFile(relative_path=rel_path, size=stat.size, mtime=stat.mtime))
         return files
 
     def _decode_output(self, output: bytes | str | None) -> str:
@@ -327,31 +331,69 @@ class RcloneBackend(ArchiveBackend):
         return selected
 
     def copy_directory(self, src: Path, dst_name: str) -> CopyResult:
-        """Copy a directory using rclone copy.
+        """Archive RecentClips by recording date and other directories as-is."""
+        files = self._scan_directory(src)
+        if dst_name != "RecentClips":
+            return self._copy_files(src, dst_name, files)
 
-        Scans the source directory first to collect file info for later
-        deletion verification.
-        """
-        # Scan files before copying (for deletion verification later)
-        archived_files = self._scan_directory(src)
-        logger.debug(f"Scanned {len(archived_files)} files in {src}")
+        batches: dict[str, list[ArchivedFile]] = {}
+        for file in files:
+            name = file.relative_path
+            if name in {"thumb.png", "event.json"}:
+                batches.setdefault("metadata", []).append(file)
+                continue
+            try:
+                recording_date = date.fromisoformat(name[:10])
+                if len(name) < 12 or name[10] != "_" or "/" in name:
+                    raise ValueError("expected YYYY-MM-DD_<clip name>")
+            except ValueError as error:
+                raise ValueError(f"Cannot date-partition RecentClips file {name!r}") from error
+            batches.setdefault(recording_date.isoformat(), []).append(file)
 
+        result = CopyResult(success=True)
+        errors: list[str] = []
+        for day, batch in sorted(batches.items()):
+            copied = self._copy_files(src, f"RecentClips/{day}", batch)
+            result.files_transferred += copied.files_transferred
+            result.bytes_transferred += copied.bytes_transferred
+            result.archived_files.extend(copied.archived_files)
+            if not copied.success:
+                errors.append(f"{day}: {copied.error}")
+        if errors:
+            result.success = False
+            result.error = "; ".join(errors)
+        return result
+
+    def _copy_files(
+        self, src: Path, dst_name: str, archived_files: list[ArchivedFile]
+    ) -> CopyResult:
+        """Copy the scanned files and retain only positive archive confirmations."""
+        if not archived_files:
+            return CopyResult(success=True)
+        if any("\n" in file.relative_path or "\r" in file.relative_path for file in archived_files):
+            raise ValueError(f"Cannot archive filenames containing line breaks in {src}")
         dest = self._dest(dst_name)
-        json_log_flags = [] if "--use-json-log" in self.flags else ["--use-json-log"]
         cmd = [
-            "rclone", "copy",
+            "rclone",
+            "copy",
             str(src),
             dest,
+            *self.flags,
             "--stats-one-line",
-            *json_log_flags,
-            "-v",
-        ] + self.flags
+            "--use-json-log",
+            "--log-level",
+            "DEBUG",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+        ]
 
         logger.info(f"Running: {' '.join(cmd)}")
 
         try:
             result = subprocess.run(
                 cmd,
+                input="\n".join(file.relative_path for file in archived_files).encode(),
                 capture_output=True,
                 timeout=self.timeout,
                 check=False,
@@ -367,6 +409,8 @@ class RcloneBackend(ArchiveBackend):
             copied_files = self._select_archived_files(archived_files, copied_paths)
             files_transferred = len(copied_files)
             bytes_transferred = sum(file.size for file in copied_files)
+            confirmed_paths = self._parse_rclone_paths(output, ("Copied", "Unchanged skipping"))
+            confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
 
             if result.returncode != 0:
                 error_msg = self._rclone_error_message(output)
@@ -378,8 +422,8 @@ class RcloneBackend(ArchiveBackend):
                 logger.error(f"rclone copy failed: {error_msg}")
                 return CopyResult(
                     success=False,
-                    files_transferred=len(confirmed_files),
-                    bytes_transferred=sum(file.size for file in confirmed_files),
+                    files_transferred=files_transferred,
+                    bytes_transferred=bytes_transferred,
                     error=error_msg,
                     archived_files=confirmed_files,
                 )
@@ -388,7 +432,7 @@ class RcloneBackend(ArchiveBackend):
                 success=True,
                 files_transferred=files_transferred,
                 bytes_transferred=bytes_transferred,
-                archived_files=archived_files,
+                archived_files=confirmed_files,
             )
 
         except subprocess.TimeoutExpired as e:
@@ -398,11 +442,14 @@ class RcloneBackend(ArchiveBackend):
                 ("Copied", "Unchanged skipping"),
             )
             confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
+            copied_files = self._select_archived_files(
+                archived_files, self._parse_rclone_paths(output, ("Copied",))
+            )
             logger.error(f"rclone timeout copying {src}")
             return CopyResult(
                 success=False,
-                files_transferred=len(confirmed_files),
-                bytes_transferred=sum(file.size for file in confirmed_files),
+                files_transferred=len(copied_files),
+                bytes_transferred=sum(file.size for file in copied_files),
                 error="Timeout",
                 archived_files=confirmed_files,
             )
@@ -435,6 +482,7 @@ class ArchiveManager:
         fs: Filesystem,
         snapshot_manager: SnapshotManager,
         backend: ArchiveBackend,
+        event_stability_seconds: float,
         cam_disk_path: Path | None = None,
         archive_recent: bool = False,
         archive_saved: bool = True,
@@ -458,6 +506,8 @@ class ArchiveManager:
         self.fs = fs
         self.snapshot_manager = snapshot_manager
         self.backend = backend
+        self.event_stability_seconds = event_stability_seconds
+        self._event_observations: dict[tuple[str, str], EventObservation] = {}
         self.cam_disk_path = cam_disk_path
         self.archive_recent = archive_recent
         self.archive_saved = archive_saved
@@ -549,22 +599,19 @@ class ArchiveManager:
         for src_path, dst_name in dirs_to_archive:
             logger.info(f"Archiving {dst_name}...")
             copy_result = self.backend.copy_directory(src_path, dst_name)
+            total_files += copy_result.files_transferred
+            total_bytes += copy_result.bytes_transferred
+            deletable = self._deletable_files(src_path, dst_name, copy_result.archived_files)
+            if deletable:
+                result.archived_files[dst_name] = deletable
 
             if copy_result.success:
-                total_files += copy_result.files_transferred
-                total_bytes += copy_result.bytes_transferred
-                # Track all files in successful directories for deletion.
-                if copy_result.archived_files:
-                    result.archived_files[dst_name] = copy_result.archived_files
                 logger.info(
                     f"  {dst_name}: transferred {copy_result.files_transferred} files"
                     f" ({format_size(copy_result.bytes_transferred)})"
                 )
             else:
-                total_files += copy_result.files_transferred
-                total_bytes += copy_result.bytes_transferred
                 if copy_result.archived_files:
-                    result.archived_files[dst_name] = copy_result.archived_files
                     logger.info(
                         f"  {dst_name}: confirmed {len(copy_result.archived_files)} "
                         "files before failure"
@@ -585,6 +632,53 @@ class ArchiveManager:
         logger.info(f"Archive complete: {total_files} files, {format_size(total_bytes)}")
 
         return result
+
+    def _deletable_files(
+        self, src: Path, directory: str, files: list[ArchivedFile]
+    ) -> list[ArchivedFile]:
+        """Remove only complete events observed unchanged across archive cycles.
+
+        FAT timestamps use the car's local time. Elapsed stability is measured
+        with the host's monotonic clock, independent of either clock's timezone.
+        """
+        if directory == "RecentClips":
+            return []
+        if directory not in {"SavedClips", "SentryClips"}:
+            return files
+
+        events: dict[str, list[tuple[str, int, float]]] = {}
+        for parent, _, names in self.fs.walk(src):
+            for name in names:
+                path = parent / name
+                relative = str(path.relative_to(src))
+                stat = self.fs.stat(path)
+                event = relative.split("/", 1)[0]
+                events.setdefault(event, []).append((relative, stat.size, stat.mtime))
+
+        for key in list(self._event_observations):
+            if key[0] == directory and key[1] not in events:
+                del self._event_observations[key]
+
+        confirmed = {file.relative_path: file for file in files}
+        deletable: list[ArchivedFile] = []
+        now = time.monotonic()
+        for event, entries in events.items():
+            signature = tuple(sorted(entries))
+            key = (directory, event)
+            observation = self._event_observations.get(key)
+            if observation is None or observation.files != signature:
+                observation = EventObservation(signature, now)
+                self._event_observations[key] = observation
+            if now - observation.first_seen < self.event_stability_seconds:
+                continue
+            if not any(
+                Path(path).suffix.lower() == ".mp4" and size > 0 for path, size, _ in entries
+            ):
+                logger.warning("Preserving %s/%s: event has no video", directory, event)
+                continue
+            if all(path in confirmed and confirmed[path].size == size for path, size, _ in entries):
+                deletable.extend(confirmed[path] for path, _, _ in entries)
+        return deletable
 
     def delete_archived_files(
         self,
@@ -608,6 +702,9 @@ class ArchiveManager:
         skipped = 0
 
         for dir_name, files in result.archived_files.items():
+            if dir_name == "RecentClips":
+                skipped += len(files)
+                continue
             # Map directory name to path on disk
             dir_path = self.DIR_TO_PATH.get(dir_name)
             if not dir_path:
@@ -615,6 +712,34 @@ class ArchiveManager:
                 continue
 
             base_path = cam_disk_mount / dir_path
+            if dir_name in {"SavedClips", "SentryClips"}:
+                events: dict[str, list[ArchivedFile]] = {}
+                for file in files:
+                    events.setdefault(file.relative_path.split("/", 1)[0], []).append(file)
+                files = []
+                for event, event_files in events.items():
+                    expected = sorted(
+                        (file.relative_path, file.size, file.mtime) for file in event_files
+                    )
+                    current = []
+                    for parent, _, names in self.fs.walk(base_path / event):
+                        for name in names:
+                            path = parent / name
+                            stat = self.fs.stat(path)
+                            current.append(
+                                (str(path.relative_to(base_path)), stat.size, stat.mtime)
+                            )
+                    has_video = any(
+                        Path(file.relative_path).suffix.lower() == ".mp4" and file.size > 0
+                        for file in event_files
+                    )
+                    if sorted(current) != expected or not has_video:
+                        logger.info(
+                            "Preserving %s/%s: event changed or has no video", dir_name, event
+                        )
+                        skipped += len(event_files)
+                        continue
+                    files.extend(event_files)
 
             for archived_file in files:
                 file_path = base_path / archived_file.relative_path
@@ -695,6 +820,8 @@ class ArchiveManager:
         is disconnected.
         """
         snapshot = self.snapshot_manager.create_snapshot()
-        with self.snapshot_manager.acquire(snapshot.id) as handle:
-            with mount_fn(snapshot.image_path) as mount_path:
-                return self.archive_snapshot(handle, mount_path)
+        with (
+            self.snapshot_manager.acquire(snapshot.id) as handle,
+            mount_fn(snapshot.image_path) as mount_path,
+        ):
+            return self.archive_snapshot(handle, mount_path)
