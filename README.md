@@ -1,147 +1,242 @@
 # teslausb-ng
 
-A Rust implementation of TeslaUSB-style dashcam archiving.
-
-The tool presents a FAT32 camera disk to a Tesla over Linux USB gadget mode, takes
-crash-safe XFS reflink snapshots, archives clips with `rclone`, then removes only
-files that were verified as copied.
-
-## Why Rust
-
-The original Python version was intentionally small, but deployment still depended
-on Python packaging and target-board `pip` behavior. The Rust path keeps the same
-Unix-tool design while producing a single CLI binary.
-
-Rust is used here for:
-
-- one deployable `teslausb` binary
-- RAII guards for mounts, loop devices, and USB gadget disable/enable scopes
-- atomic snapshot marker writes
-- central subprocess execution with timeouts
-- USB write-idle detection before taking snapshots
-- best-effort sysfs LED and CPU temperature monitoring during `run`
-- explicit state and error propagation
-
-External tools remain external: `rclone`, coreutils, `mount`, `losetup`, `fsck`,
-`mkfs.xfs`, `mkfs.vfat`, `parted`, `kpartx`, `modprobe`, and `systemctl`.
+A Rust implementation of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam
+archiving system. It presents a FAT32 camera disk over USB, copies XFS reflink
+snapshots to an rclone remote, and removes saved events only after their files
+have been verified in the archive.
 
 ## Requirements
 
-- Linux board with USB OTG/peripheral support
-- USB gadget support through configfs
-- XFS reflink support
-- `rclone` configured for the archive destination
-- Optional sysfs LED, `/proc`, and thermal-zone support for status, write-idle,
-  and temperature monitoring
+- Linux board with a USB peripheral port and configfs gadget support
+- XFS with reflink support, plus the system tools listed below
+- Network access to an rclone archive destination
+- Readable `/proc` and a CPU temperature sensor in sysfs
+- Rust toolchain with Cargo to build the binary
 
-Install system packages:
+The installed program is one binary. It uses `serde_json` for JSON and external
+Linux tools for filesystems, USB devices, and transfers.
+
+## Quick Start
+
+1. [Connect to WiFi](#set-up-wifi).
+2. [Build and install](#build-and-install).
+3. [Enable the board's USB peripheral mode](#board-configuration).
+4. [Configure the archive](#configure).
+5. [Initialize new disk images](#initialize) and [start the service](#run).
+
+## Set Up WiFi
+
+Use the network manager configured by your Linux image.
+
+### NetworkManager (nmcli)
+
+```bash
+# List available networks
+sudo nmcli device wifi list
+
+# Connect to a network
+sudo nmcli --ask device wifi connect "YourNetworkName"
+
+# Verify connection
+nmcli connection show --active
+```
+
+#### Multiple Networks
+
+You can save multiple WiFi networks (home, work, mobile hotspot):
+
+```bash
+sudo nmcli --ask device wifi connect "WorkWiFi"
+sudo nmcli --ask device wifi connect "iPhone"
+```
+
+The device will automatically connect to whichever saved network is available.
+
+### Netplan
+
+For images using Netplan with `systemd-networkd`, replace `wlan0` with your
+wireless interface name from `ip link`. Edit the existing WiFi configuration
+under `/etc/netplan/` with `sudoedit`, using this structure:
+
+```yaml
+network:
+  version: 2
+  renderer: networkd
+  wifis:
+    wlan0:
+      dhcp4: true
+      dhcp6: true
+      access-points:
+        "YourSSID":
+          password: "YourPassword"
+```
+
+Protect the file containing your password, validate it, and try the configuration:
+
+```sh
+sudo chmod 600 /etc/netplan/20-wifi.yaml  # Use the filename you edited
+sudo netplan generate
+sudo netplan try
+networkctl status wlan0
+```
+
+
+## Build and Install
+
+On a Debian or Ubuntu board, install the system dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y rclone xfsprogs parted dosfstools kpartx util-linux
+sudo apt install -y git rclone xfsprogs parted dosfstools kpartx util-linux kmod
 ```
 
-## Build And Install
-
-Build on the target board:
+With Rust and Cargo installed, build on the board:
 
 ```bash
-cargo build --release
+git clone https://github.com/ben-z/teslausb-ng.git
+cd teslausb-ng
+cargo build --release --locked
 sudo install -m 0755 target/release/teslausb /usr/local/bin/teslausb
 ```
 
-Or build elsewhere for the board target and install the resulting binary.
+A binary built elsewhere must target the board's Linux architecture.
 
-Check the target:
+### Update an Existing Installation
+
+The Python and Rust implementations use the same disk image paths and
+`/etc/teslausb.conf`. Keep those images and the root user's rclone configuration
+when updating. Existing snapshots with `snap.toc` remain readable.
+
+From the source checkout:
 
 ```bash
-sudo teslausb doctor
+git pull --ff-only
+cargo build --release --locked
+sudo systemctl stop teslausb
+sudo install -m 0755 target/release/teslausb /usr/local/bin/teslausb
+sudo teslausb service install --force
+sudo systemctl start teslausb
+sudo systemctl is-active teslausb
+sudo journalctl -u teslausb -n 100 --no-pager
 ```
 
-`doctor` checks required commands, reports versions, enforces minimum versions
-where TeslaUSB relies on specific behavior, and verifies that GNU `cp` advertises
-`--reflink` support. The generated systemd unit runs `teslausb doctor --startup`
-before it mounts images or enables the USB gadget.
+The forced service installation updates the executable path and lifecycle
+commands. Initialization is for new installations; `deinit` permanently deletes
+local recordings.
 
-Current minimum gates are `rclone >= 1.50.0`, `mkfs.xfs >= 4.9.0`, and
-GNU `cp >= 8.23.0`.
+## Board Configuration
+
+### Rock 5C
+
+For Armbian images providing the `rk3588-dwc3-peripheral` overlay, add its name to
+the `overlays` line in `/boot/armbianEnv.txt`, preserving other entries. If there
+is no `overlays` line, add:
+
+```text
+overlays=rk3588-dwc3-peripheral
+```
+
+Reboot and check that a USB Device Controller is listed:
+
+```bash
+ls /sys/class/udc/
+```
+
+The peripheral port connects to the car as a USB device. Use another port for
+USB host peripherals.
+
+### Raspberry Pi
+
+Enable `dtoverlay=dwc2` in the boot configuration used by your image, commonly
+`/boot/firmware/config.txt` or `/boot/config.txt`. Add `modules-load=dwc2` to the
+corresponding `cmdline.txt`, keeping its contents on one line. Reboot and verify
+`/sys/class/udc/` contains a controller.
 
 ## Configure
 
-Configure `rclone` as the same user that the service will run as. The systemd
-service runs as root, so root needs the `rclone` remote unless you customize the
-unit.
+The systemd service runs as root. Configure its rclone remote as root:
 
 ```bash
 sudo rclone config
 ```
 
-Create `/etc/teslausb.conf`:
+For browser authorization on a headless device, follow
+[rclone's headless instructions](https://rclone.org/remote_setup/). Answer `n`
+when asked to authenticate with a local browser, then run the displayed
+`rclone authorize` command on a computer with a browser.
 
-```bash
+Create `/etc/teslausb.conf` with `sudoedit`:
+
+```text
 ARCHIVE_SYSTEM=rclone
 RCLONE_DRIVE=gdrive
 RCLONE_PATH=/TeslaCam
 ```
 
-Supported variables:
+Use the remote name you created and verify access:
+
+```bash
+sudo rclone lsd gdrive:
+sudo teslausb doctor
+```
+
+`doctor` checks required commands, versions, and GNU `cp` reflink support.
+Required minimum versions are rclone 1.50.0, XFS tools 4.9.0, and GNU coreutils
+8.23.0.
 
 | Variable | Description | Default |
 | --- | --- | --- |
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
-| `RCLONE_PATH` | Path within remote | |
-| `RCLONE_FLAGS` | Extra rclone flags split on whitespace | |
+| `RCLONE_PATH` | Path within the remote | |
+| `RCLONE_FLAGS` | Extra rclone flags, separated by whitespace | |
 | `ARCHIVE_SAVEDCLIPS` | Archive SavedClips | `true` |
 | `ARCHIVE_SENTRYCLIPS` | Archive SentryClips | `true` |
-| `ARCHIVE_RECENTCLIPS` | Archive RecentClips | `false` |
+| `ARCHIVE_RECENTCLIPS` | Archive the car's rolling buffer | `false` |
 | `ARCHIVE_TRACKMODECLIPS` | Archive TrackMode clips | `true` |
 | `ARCHIVE_PHOTOBOOTH` | Archive Photobooth files | `true` |
-| `MUTABLE_PATH` | Path for `backingfiles.img` | `/mutable` |
-| `BACKINGFILES_PATH` | Mount point for backing files | `/backingfiles` |
+| `MUTABLE_PATH` | Directory containing `backingfiles.img` | `/mutable` |
+| `BACKINGFILES_PATH` | Mount point for the backing filesystem | `/backingfiles` |
+
+Boolean values must be `true` or `false`. File settings take precedence over
+environment variables. To install a service using another configuration file,
+use `sudo teslausb --config /absolute/path/teslausb.conf service install --force`.
 
 ## Initialize
 
-Create the XFS backing image and FAT32 camera disk:
+For a new installation, create the XFS backing image and FAT32 camera disk:
 
 ```bash
 sudo teslausb init --reserve 10G
 ```
 
-This creates:
-
-- `/mutable/backingfiles.img`
-- `/backingfiles/cam_disk.bin`
-- `/backingfiles/snapshots/`
-
-Sizing is automatic:
+This creates `/mutable/backingfiles.img`, `/backingfiles/cam_disk.bin`, and
+`/backingfiles/snapshots/`. Sizing uses the free space available when initialized:
 
 ```text
 backingfiles_size = available_disk - reserve
 cam_size = (backingfiles_size - 3% XFS overhead) / 2
 ```
 
-Half the XFS volume is reserved for worst-case snapshot COW growth.
+The remaining XFS space accommodates snapshot copy-on-write growth. Camera
+images are aligned to 512-byte sectors.
 
 ## Run
 
-Install and start the systemd service:
+Install the service, start it, and check the result:
 
 ```bash
 sudo teslausb service install
 sudo systemctl start teslausb
+sudo systemctl is-active teslausb
+sudo journalctl -u teslausb -n 100 --no-pager
 ```
 
-The generated service runs:
+The service starts at boot, checks dependencies, mounts the backing image, and
+enables the USB gadget. It archives when the destination is reachable and
+restarts after failures. Stopping the service turns off the USB gadget.
 
-```text
-teslausb mount
-teslausb gadget on
-teslausb run
-teslausb gadget off
-```
-
-Manual run:
+To run manually while the service is stopped:
 
 ```bash
 sudo teslausb mount
@@ -149,77 +244,107 @@ sudo teslausb gadget on
 sudo teslausb run
 ```
 
+CPU temperature warnings begin at 70°C and 80°C. A missing or unreadable sensor
+is reported as an error. The default sensor is
+`/sys/class/thermal/thermal_zone0/temp`; set `TESLAUSB_THERMAL_PATH` in the process
+environment or systemd unit when the board exposes its CPU sensor elsewhere.
+
+## Archive and Storage Behavior
+
+Saved and Sentry event directories must remain unchanged across snapshots for
+at least ten minutes before removal. Every file must have positive rclone
+confirmation, and live files must still match the archived sizes. Incomplete
+events and events containing only metadata stay on the camera disk.
+
+When enabled, RecentClips uploads go into `RecentClips/YYYY-MM-DD/`. The car
+manages the local RecentClips buffer. TeslaUSB retains those local files so
+saving a recent event can still use them.
+
+The FAT32 camera filesystem and XFS backing filesystem have separate space
+limits. Deleting snapshots frees XFS space. Removing confirmed saved events
+frees camera filesystem space.
+
 ## Commands
+
+Run device commands as root.
 
 | Command | Description |
 | --- | --- |
-| `teslausb init [--reserve SIZE]` | Initialize disk images |
-| `teslausb deinit [-y]` | Remove disk images and clean up |
+| `teslausb init [--reserve SIZE]` | Initialize new disk images |
+| `teslausb deinit [-y]` | Permanently delete disk images |
 | `teslausb mount` | Mount `backingfiles.img` |
 | `teslausb run` | Run the archive loop |
 | `teslausb archive` | Run one archive cycle |
-| `teslausb status [--json]` | Show status |
-| `teslausb snapshots [--json]` | List snapshots |
-| `teslausb clean [--dry-run]` | Delete deletable snapshots |
+| `teslausb status [--json]` | Show space, snapshots, and archive reachability |
+| `teslausb snapshots [--json]` | List complete snapshots |
+| `teslausb clean [--dry-run]` | Delete snapshots that are not in use |
 | `teslausb gadget on/off/status` | Manage USB gadget mode |
-| `teslausb service install/uninstall/status` | Manage systemd |
-| `teslausb doctor [--startup]` | Check external dependencies and versions |
+| `teslausb service install/uninstall/status` | Manage the systemd service |
+| `teslausb doctor [--startup]` | Check external dependencies |
 
-## Board Notes
+## Troubleshooting
 
-### Rock 5C
-
-Enable the USB peripheral overlay in `/boot/armbianEnv.txt`:
-
-```text
-overlays=rk3588-dwc3-peripheral
-```
-
-Then reboot and verify:
+Check service logs, kernel errors, and both storage layers:
 
 ```bash
-ls /sys/class/udc/
+sudo teslausb status
+sudo teslausb gadget status
+sudo journalctl -u teslausb -n 100 --no-pager
+sudo journalctl -k -n 100 --no-pager
+df -h /mutable /backingfiles
 ```
 
-### Raspberry Pi
+For archive failures, test the configured remote with the root user's rclone
+configuration. Cloud quota or directory limits must be resolved before those
+uploads can succeed.
 
-Ensure `/boot/config.txt` contains:
+For XFS space occupied by unused snapshots, inspect before deleting:
 
-```text
-dtoverlay=dwc2
+```bash
+sudo teslausb clean --dry-run
+sudo teslausb clean
 ```
 
-Ensure `/boot/cmdline.txt` includes `modules-load=dwc2` after `rootwait`.
+For FAT errors or missing Saved/Sentry recordings, preserve the disk image and
+inspect the logs before attempting repair. Keep the service stopped and the
+USB gadget disabled during manual filesystem repair. Mounting the live camera
+filesystem read-write while the car is connected can corrupt recordings.
+
+If the car cannot see the drive, check the gadget status and
+`/sys/class/udc/`, then verify the board's peripheral configuration.
 
 ## Development
 
 ```bash
-cargo fmt
-cargo test
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked -- -D warnings
 cargo llvm-cov --locked --summary-only --fail-under-lines 85
-cargo build --release
+cargo build --release --locked
 scripts/run-linux-integration.sh
 ```
 
-The Rust tests use `MockFileSystem` for snapshot and archive behavior.
-`tests/offline_cli.rs` runs the compiled binary against fake Unix tools so init,
-mount, `run`, archive, clean, status, doctor, and service flows are validated
-without root or Linux block devices. Tests that need real loop devices and
-filesystems live in `tests/linux_integration.rs` and are run by
-`scripts/run-linux-integration.sh` on a privileged Linux host, VM, or QEMU guest.
-The offline tests use `TESLAUSB_LED_PATH`, `TESLAUSB_THERMAL_PATH`,
-`TESLAUSB_PROC_PATH`, and `TESLAUSB_IDLE_TIMEOUT_SECS` to point runtime monitors
-at fixtures instead of host sysfs/proc paths.
-Install coverage locally with `cargo install cargo-llvm-cov --locked` if needed.
+Install the coverage tool with `cargo install cargo-llvm-cov --locked`.
+Snapshot and archive unit tests use `MockFileSystem`. Offline CLI tests use fake
+Unix tools. Linux integration tests exercise real loop devices, XFS, and FAT32
+on a privileged Linux host or VM; the integration script requires those
+capabilities. The test fixtures use `TESLAUSB_LED_PATH`, `TESLAUSB_THERMAL_PATH`,
+`TESLAUSB_PROC_PATH`, and `TESLAUSB_IDLE_TIMEOUT_SECS` for monitor inputs.
 
 ## Safety Model
 
-- A snapshot is complete only after `snap.toc` exists.
-- Snapshot creation writes data and metadata before atomically writing `snap.toc`.
-- Snapshot deletion removes `snap.toc` first, then removes data.
-- On start up, any snapshot directory without `snap.toc` is cleaned up.
-- Cleaning up the live camera disk disables the USB gadget before mounting read-write.
-- Each deletion checks that the current file size still matches the archived file.
+- A snapshot becomes complete when `snap.toc` is written after its data.
+- Snapshot creation, recovery, acquisition, and deletion share a catalog lock.
+- Snapshot handles keep an exclusive lock until their final release.
+- Deletion keeps both locks, removes `snap.toc` first, then removes the data.
+- Runtime recovery removes incomplete snapshots; status and dry-run inspection
+  preserve them.
+- Live camera cleanup disables the gadget, checks FAT, mounts the image,
+  removes verified files, and unmounts it before reconnecting.
+
+See [DESIGN.md](DESIGN.md) for architecture and [AGENTS.md](AGENTS.md) for coding
+guidelines. [teslacam-replay](https://github.com/ben-z/teslacam-replay) displays
+archived footage with synchronized camera views.
 
 ## License
 
