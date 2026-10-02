@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,19 +52,29 @@ impl Snapshot {
 }
 
 #[derive(Debug)]
-struct SnapshotInner {
+struct SnapshotInner<L> {
     snapshots: HashMap<u64, Snapshot>,
     next_id: u64,
-    creating: bool,
-    process_locks: HashMap<u64, File>,
+    process_locks: HashMap<u64, L>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SnapshotManager<F: FileSystem> {
     fs: F,
     cam_disk_path: PathBuf,
     snapshots_path: PathBuf,
-    inner: Arc<Mutex<SnapshotInner>>,
+    inner: Arc<Mutex<SnapshotInner<F::Lock>>>,
+}
+
+impl<F: FileSystem> Clone for SnapshotManager<F> {
+    fn clone(&self) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            cam_disk_path: self.cam_disk_path.clone(),
+            snapshots_path: self.snapshots_path.clone(),
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<F: FileSystem> SnapshotManager<F> {
@@ -79,23 +86,35 @@ impl<F: FileSystem> SnapshotManager<F> {
             inner: Arc::new(Mutex::new(SnapshotInner {
                 snapshots: HashMap::new(),
                 next_id: 0,
-                creating: false,
                 process_locks: HashMap::new(),
             })),
         };
-        manager.load_snapshots()?;
+        manager.fs.create_dir_all(&manager.snapshots_path)?;
+        let _catalog_lock = manager.lock_catalog()?;
+        manager.load_snapshots(&mut manager.inner.lock().unwrap())?;
         Ok(manager)
     }
 
-    fn load_snapshots(&self) -> Result<()> {
-        if !self.fs.exists(&self.snapshots_path) {
-            self.fs.create_dir_all(&self.snapshots_path)?;
-            return Ok(());
-        }
+    fn lock_catalog(&self) -> Result<F::Lock> {
+        // Keep this inode outside snapshot directories so deletion cannot replace it.
+        self.fs
+            .try_lock(&self.snapshots_path.join(".snapshots.lock"))?
+            .ok_or_else(|| Error::new("snapshot catalog is in use by another operation"))
+    }
 
+    // The caller holds the catalog lock for the entire scan and any subsequent mutation.
+    fn load_snapshots(&self, inner: &mut SnapshotInner<F::Lock>) -> Result<()> {
         let mut loaded = HashMap::new();
-        let mut next_id = 0;
-
+        let mut next_id = inner.next_id;
+        let counter_path = self.snapshots_path.join(".next-id");
+        if self.fs.exists(&counter_path) {
+            let counter = self.fs.read_text(&counter_path)?;
+            let counter = counter
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| Error::new(format!("invalid snapshot ID counter: {}", error)))?;
+            next_id = next_id.max(counter);
+        }
         for name in self.fs.list_dir_names(&self.snapshots_path)? {
             let Some(id_part) = name.strip_prefix("snap-") else {
                 continue;
@@ -104,84 +123,73 @@ impl<F: FileSystem> SnapshotManager<F> {
                 eprintln!("warning: invalid snapshot directory name: {}", name);
                 continue;
             };
-            let snap_path = self.snapshots_path.join(&name);
-            if !self.fs.is_dir(&snap_path) {
+            let path = self.snapshots_path.join(&name);
+            if !self.fs.is_dir(&path) {
+                continue;
+            }
+            next_id = next_id.max(
+                id.checked_add(1)
+                    .ok_or_else(|| Error::new("snapshot ID space is exhausted"))?,
+            );
+
+            if !self.fs.exists(&path.join("snap.toc")) {
+                if let Some(_lock) = self.fs.try_lock(&path.join("snap.lock"))? {
+                    eprintln!("warning: cleaning up incomplete snapshot {}", id);
+                    self.fs.remove_dir_all(&path)?;
+                }
                 continue;
             }
 
-            let toc_path = snap_path.join("snap.toc");
-            if !self.fs.exists(&toc_path) {
-                eprintln!("warning: cleaning up incomplete snapshot {}", id);
-                self.remove_snapshot_dir(&snap_path);
-                continue;
+            let mut snapshot = match inner.snapshots.get(&id) {
+                Some(snapshot) => snapshot.clone(),
+                None => Snapshot {
+                    id,
+                    path,
+                    created_secs: self
+                        .fs
+                        .mtime_secs(&self.snapshots_path.join(&name).join("snap.bin"))?,
+                    refcount: 0,
+                    externally_locked: false,
+                },
+            };
+            if !self.fs.exists(&snapshot.image_path()) {
+                return Err(Error::new(format!(
+                    "complete snapshot {} is missing its camera image",
+                    id
+                )));
             }
-
-            let snapshot = self.reconstruct_snapshot(id, &snap_path);
             if !self.fs.exists(&snapshot.metadata_path()) {
                 self.write_metadata(&snapshot)?;
             }
-            next_id = next_id.max(id + 1);
+            snapshot.externally_locked = if inner.process_locks.contains_key(&id) {
+                false
+            } else {
+                self.fs.try_lock(&snapshot.lock_path())?.is_none()
+            };
             loaded.insert(id, snapshot);
         }
-
-        let mut inner = self.inner.lock().unwrap();
+        for id in inner.process_locks.keys() {
+            if !loaded.contains_key(id) {
+                return Err(Error::new(format!("active snapshot {} disappeared", id)));
+            }
+        }
         inner.snapshots = loaded;
         inner.next_id = next_id;
         Ok(())
     }
 
-    fn reconstruct_snapshot(&self, id: u64, path: &Path) -> Snapshot {
-        let image_path = path.join("snap.bin");
-        let created_secs = self
-            .fs
-            .mtime_secs(&image_path)
-            .unwrap_or_else(|_| now_secs());
-        Snapshot {
-            id,
-            path: path.to_path_buf(),
-            created_secs,
-            refcount: 0,
-            externally_locked: false,
-        }
-    }
-
-    fn remove_snapshot_dir(&self, path: &Path) {
-        if self.fs.exists(path) {
-            if let Err(err) = self.fs.remove_dir_all(path) {
-                eprintln!("error: failed to remove {}: {}", path.display(), err);
-            }
-        }
-    }
-
     pub fn create_snapshot(&self) -> Result<Snapshot> {
-        let snap_id = {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.creating {
-                return Err(Error::new("snapshot creation already in progress"));
-            }
-            inner.creating = true;
-            inner.next_id
-        };
-
-        let result = self.create_snapshot_locked_outside(snap_id);
+        let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        inner.creating = false;
-        if let Ok(snapshot) = &result {
-            inner.next_id = snapshot.id + 1;
-            inner.snapshots.insert(snapshot.id, snapshot.clone());
-        }
-        result
-    }
-
-    fn create_snapshot_locked_outside(&self, snap_id: u64) -> Result<Snapshot> {
+        self.load_snapshots(&mut inner)?;
+        let snap_id = inner.next_id;
+        let next_id = snap_id
+            .checked_add(1)
+            .ok_or_else(|| Error::new("snapshot ID space is exhausted"))?;
+        self.fs
+            .write_text_atomic(&self.snapshots_path.join(".next-id"), &next_id.to_string())?;
         let snap_path = self.snapshots_path.join(format!("snap-{snap_id:06}"));
         self.fs.create_dir_all(&snap_path)?;
-
-        let image_path = snap_path.join("snap.bin");
-        if let Err(err) = self.fs.copy_reflink(&self.cam_disk_path, &image_path) {
-            self.remove_snapshot_dir(&snap_path);
-            return Err(err.context("failed to copy cam disk"));
-        }
 
         let snapshot = Snapshot {
             id: snap_id,
@@ -190,51 +198,62 @@ impl<F: FileSystem> SnapshotManager<F> {
             refcount: 0,
             externally_locked: false,
         };
-
+        if let Err(error) = self
+            .fs
+            .copy_reflink(&self.cam_disk_path, &snapshot.image_path())
+        {
+            self.fs
+                .remove_dir_all(&snapshot.path)
+                .map_err(|cleanup_error| {
+                    Error::new(format!(
+                        "failed to copy cam disk: {}; failed to remove incomplete snapshot: {}",
+                        error, cleanup_error
+                    ))
+                })?;
+            return Err(error.context("failed to copy cam disk"));
+        }
         self.write_metadata(&snapshot)?;
         self.fs.write_text_atomic(&snapshot.toc_path(), "")?;
         self.fs.sync_dir(&snapshot.path)?;
+        self.fs.sync_dir(&self.snapshots_path)?;
+        inner.next_id = next_id;
+        inner.snapshots.insert(snapshot.id, snapshot.clone());
         Ok(snapshot)
     }
 
     fn write_metadata(&self, snapshot: &Snapshot) -> Result<()> {
-        let metadata = format!(
-            "{{\n  \"id\": {},\n  \"path\": \"{}\",\n  \"created_at_unix\": {}\n}}\n",
-            snapshot.id,
-            json_escape(&snapshot.path.display().to_string()),
-            snapshot.created_secs
-        );
+        let metadata = serde_json::json!({
+            "id": snapshot.id,
+            "path": snapshot.path,
+            "created_at_unix": snapshot.created_secs,
+        });
         self.fs
-            .write_text_atomic(&snapshot.metadata_path(), &metadata)
+            .write_text_atomic(&snapshot.metadata_path(), &metadata.to_string())
     }
 
     pub fn acquire(&self, snapshot_id: u64) -> Result<SnapshotHandle<F>> {
-        let snapshot = {
-            let mut inner = self.inner.lock().unwrap();
-            let snapshot = inner
-                .snapshots
-                .get(&snapshot_id)
-                .ok_or_else(|| Error::new(format!("snapshot {} not found", snapshot_id)))?;
-            if snapshot.refcount == 0 {
-                self.refresh_external_lock_locked(&mut inner, snapshot_id)?;
-                let snapshot = inner.snapshots.get(&snapshot_id).unwrap().clone();
-                if snapshot.externally_locked {
-                    return Err(Error::new(format!(
-                        "snapshot {} is locked by another process",
-                        snapshot_id
-                    )));
-                }
-                self.acquire_process_lock_locked(&mut inner, &snapshot)?;
-            }
-
-            let snapshot = inner.snapshots.get_mut(&snapshot_id).unwrap();
-            snapshot.refcount += 1;
-            snapshot.externally_locked = false;
-            snapshot.clone()
-        };
+        let _catalog_lock = self.lock_catalog()?;
+        let mut inner = self.inner.lock().unwrap();
+        self.load_snapshots(&mut inner)?;
+        let snapshot = inner
+            .snapshots
+            .get(&snapshot_id)
+            .ok_or_else(|| Error::new(format!("snapshot {} not found", snapshot_id)))?;
+        if snapshot.refcount == 0 {
+            let lock = self.fs.try_lock(&snapshot.lock_path())?.ok_or_else(|| {
+                Error::new(format!(
+                    "snapshot {} is locked by another process",
+                    snapshot_id
+                ))
+            })?;
+            inner.process_locks.insert(snapshot_id, lock);
+        }
+        let snapshot = inner.snapshots.get_mut(&snapshot_id).unwrap();
+        snapshot.refcount += 1;
+        snapshot.externally_locked = false;
         Ok(SnapshotHandle {
             manager: self.clone(),
-            snapshot,
+            snapshot: snapshot.clone(),
             released: false,
         })
     }
@@ -242,27 +261,20 @@ impl<F: FileSystem> SnapshotManager<F> {
     fn release(&self, snapshot_id: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(snapshot) = inner.snapshots.get_mut(&snapshot_id) {
-            snapshot.refcount = snapshot.refcount.saturating_sub(1);
+            snapshot.refcount -= 1;
             if snapshot.refcount == 0 {
-                self.release_process_lock_locked(&mut inner, snapshot_id);
+                inner.process_locks.remove(&snapshot_id);
             }
         }
     }
 
-    pub fn get_snapshots(&self) -> Vec<Snapshot> {
+    pub fn get_snapshots(&self) -> Result<Vec<Snapshot>> {
+        let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        let ids = inner.snapshots.keys().copied().collect::<Vec<_>>();
-        for snapshot_id in ids {
-            if let Err(err) = self.refresh_external_lock_locked(&mut inner, snapshot_id) {
-                eprintln!(
-                    "warning: failed to refresh lock for snapshot {}: {}",
-                    snapshot_id, err
-                );
-            }
-        }
+        self.load_snapshots(&mut inner)?;
         let mut snapshots: Vec<_> = inner.snapshots.values().cloned().collect();
         snapshots.sort_by_key(|snapshot| (snapshot.created_secs, snapshot.id));
-        snapshots
+        Ok(snapshots)
     }
 
     #[cfg(test)]
@@ -275,124 +287,42 @@ impl<F: FileSystem> SnapshotManager<F> {
             .cloned()
     }
 
-    pub fn get_deletable_snapshots(&self) -> Vec<Snapshot> {
-        self.get_snapshots()
+    pub fn get_deletable_snapshots(&self) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .get_snapshots()?
             .into_iter()
             .filter(Snapshot::is_deletable)
-            .collect()
+            .collect())
     }
 
     pub fn delete_snapshot(&self, snapshot_id: u64) -> Result<bool> {
-        let snapshot = {
-            let mut inner = self.inner.lock().unwrap();
-            if !inner.snapshots.contains_key(&snapshot_id) {
-                return Ok(false);
-            }
-            self.refresh_external_lock_locked(&mut inner, snapshot_id)?;
-            let snapshot = inner.snapshots.get(&snapshot_id).unwrap().clone();
-            if !snapshot.is_deletable() {
-                return Err(Error::new(format!("snapshot {} is in use", snapshot_id)));
-            }
-            inner.snapshots.remove(&snapshot_id);
-            snapshot
+        let _catalog_lock = self.lock_catalog()?;
+        let mut inner = self.inner.lock().unwrap();
+        self.load_snapshots(&mut inner)?;
+        let Some(snapshot) = inner.snapshots.get(&snapshot_id) else {
+            return Ok(false);
         };
-
-        if self.fs.exists(&snapshot.toc_path()) {
-            if let Err(err) = self.fs.remove_file(&snapshot.toc_path()) {
-                eprintln!(
-                    "warning: failed to remove {}: {}",
-                    snapshot.toc_path().display(),
-                    err
-                );
-            }
+        if snapshot.refcount > 0 {
+            return Err(Error::new(format!("snapshot {} is in use", snapshot_id)));
         }
-        let _ = self.fs.sync_dir(&snapshot.path);
-        self.remove_snapshot_dir(&snapshot.path);
+        let _snapshot_lock = self
+            .fs
+            .try_lock(&snapshot.lock_path())?
+            .ok_or_else(|| Error::new(format!("snapshot {} is in use", snapshot_id)))?;
+
+        self.fs.remove_file(&snapshot.toc_path())?;
+        self.fs.sync_dir(&snapshot.path)?;
+        self.fs.remove_dir_all(&snapshot.path)?;
+        self.fs.sync_dir(&self.snapshots_path)?;
+        inner.snapshots.remove(&snapshot_id);
         Ok(true)
     }
 
     pub fn delete_oldest_if_deletable(&self) -> Result<bool> {
-        let Some(oldest) = self.get_deletable_snapshots().into_iter().next() else {
+        let Some(oldest) = self.get_deletable_snapshots()?.into_iter().next() else {
             return Ok(false);
         };
         self.delete_snapshot(oldest.id)
-    }
-
-    fn acquire_process_lock_locked(
-        &self,
-        inner: &mut SnapshotInner,
-        snapshot: &Snapshot,
-    ) -> Result<()> {
-        if !self.fs.supports_process_locks() || inner.process_locks.contains_key(&snapshot.id) {
-            return Ok(());
-        }
-
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(snapshot.lock_path())?;
-        if !try_lock_exclusive(&lock_file)? {
-            return Err(Error::new(format!(
-                "snapshot {} is locked by another process",
-                snapshot.id
-            )));
-        }
-        lock_file.set_len(0)?;
-        use std::io::Write;
-        writeln!(&lock_file, "{}", std::process::id())?;
-        inner.process_locks.insert(snapshot.id, lock_file);
-        Ok(())
-    }
-
-    fn release_process_lock_locked(&self, inner: &mut SnapshotInner, snapshot_id: u64) {
-        let Some(lock_file) = inner.process_locks.remove(&snapshot_id) else {
-            return;
-        };
-        if let Err(err) = unlock_file(&lock_file) {
-            eprintln!(
-                "warning: failed to release lock for snapshot {}: {}",
-                snapshot_id, err
-            );
-        }
-    }
-
-    fn refresh_external_lock_locked(
-        &self,
-        inner: &mut SnapshotInner,
-        snapshot_id: u64,
-    ) -> Result<()> {
-        if !self.fs.supports_process_locks() || inner.process_locks.contains_key(&snapshot_id) {
-            if let Some(snapshot) = inner.snapshots.get_mut(&snapshot_id) {
-                snapshot.externally_locked = false;
-            }
-            return Ok(());
-        }
-
-        let Some(snapshot) = inner.snapshots.get(&snapshot_id).cloned() else {
-            return Ok(());
-        };
-        let locked = self.is_locked_by_other_process(&snapshot)?;
-        if let Some(snapshot) = inner.snapshots.get_mut(&snapshot_id) {
-            snapshot.externally_locked = locked;
-        }
-        Ok(())
-    }
-
-    fn is_locked_by_other_process(&self, snapshot: &Snapshot) -> Result<bool> {
-        if !snapshot.lock_path().exists() {
-            return Ok(false);
-        }
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(snapshot.lock_path())?;
-        let locked = !try_lock_exclusive(&lock_file)?;
-        if !locked {
-            unlock_file(&lock_file)?;
-        }
-        Ok(locked)
     }
 }
 
@@ -433,63 +363,11 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn json_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-
-    unsafe extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
-
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-    if result == 0 {
-        Ok(true)
-    } else {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            Ok(false)
-        } else {
-            Err(err)
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
-    Ok(true)
-}
-
-#[cfg(unix)]
-fn unlock_file(file: &File) -> std::io::Result<()> {
-    const LOCK_UN: i32 = 8;
-
-    unsafe extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
-
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn unlock_file(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use crate::filesystem::{MockFileSystem, RealFileSystem};
+    use crate::filesystem::MockFileSystem;
 
     use super::*;
 
@@ -558,7 +436,7 @@ mod tests {
         let third = manager.create_snapshot().unwrap();
 
         assert_eq!((first.id, second.id, third.id), (0, 1, 2));
-        assert_eq!(manager.get_snapshots().len(), 3);
+        assert_eq!(manager.get_snapshots().unwrap().len(), 3);
     }
 
     #[test]
@@ -576,7 +454,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manager.get_snapshots().is_empty());
+        assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000001")));
     }
 
@@ -588,6 +466,42 @@ mod tests {
         assert!(manager.delete_snapshot(snapshot.id).is_err());
         drop(handle);
         assert!(manager.delete_snapshot(snapshot.id).unwrap());
+    }
+
+    #[test]
+    fn failure_to_remove_completion_marker_preserves_the_snapshot() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot().unwrap();
+        manager.fs.fail_removal(&snapshot.toc_path());
+        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(manager.fs.exists(&snapshot.toc_path()));
+        assert!(manager.fs.exists(&snapshot.image_path()));
+        assert_eq!(manager.get_snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_snapshot_removal_is_reported_and_recovered() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot().unwrap();
+        manager.fs.fail_removal(&snapshot.path);
+        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(!manager.fs.exists(&snapshot.toc_path()));
+        assert!(manager.fs.exists(&snapshot.image_path()));
+        assert!(manager.get_snapshots().is_err());
+
+        manager.fs.allow_removal(&snapshot.path);
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(!manager.fs.exists(&snapshot.path));
+    }
+
+    #[test]
+    fn failed_reflink_does_not_publish_a_snapshot_or_reuse_its_id() {
+        let manager = manager();
+        manager.fs.remove_file(&manager.cam_disk_path).unwrap();
+        assert!(manager.create_snapshot().is_err());
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        manager.fs.write_bytes(&manager.cam_disk_path, b"cam");
+        assert_eq!(manager.create_snapshot().unwrap().id, 1);
     }
 
     #[test]
@@ -652,6 +566,7 @@ mod tests {
 
         let ids = manager
             .get_deletable_snapshots()
+            .unwrap()
             .into_iter()
             .map(|snapshot| snapshot.id)
             .collect::<Vec<_>>();
@@ -673,7 +588,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager2.get_snapshots().len(), 2);
+        assert_eq!(manager2.get_snapshots().unwrap().len(), 2);
         assert_eq!(manager2.create_snapshot().unwrap().id, 2);
     }
 
@@ -692,7 +607,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manager.get_snapshots().is_empty());
+        assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000002")));
     }
 
@@ -712,7 +627,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshots = manager.get_snapshots();
+        let snapshots = manager.get_snapshots().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, 3);
         assert_eq!(snapshots[0].state(), SnapshotState::Ready);
@@ -735,14 +650,14 @@ mod tests {
         )
         .unwrap();
 
-        let snapshots = manager.get_snapshots();
+        let snapshots = manager.get_snapshots().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, 5);
         assert!(fs.exists(&snap_path.join("metadata.json")));
         assert!(fs
             .read_text(snap_path.join("metadata.json"))
             .unwrap()
-            .contains("\"id\": 5"));
+            .contains("\"id\":5"));
     }
 
     #[test]
@@ -760,52 +675,115 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manager.get_snapshots().is_empty());
+        assert!(manager.get_snapshots().unwrap().is_empty());
     }
 
     #[test]
-    fn real_filesystem_process_lock_blocks_other_managers() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "teslausb-snapshot-lock-{}-{suffix}",
-            std::process::id()
-        ));
-        let snapshots_path = root.join("snapshots");
-        let snap_path = snapshots_path.join("snap-000000");
-        std::fs::create_dir_all(&snap_path).unwrap();
-        std::fs::write(root.join("cam_disk.bin"), b"cam").unwrap();
-        std::fs::write(snap_path.join("snap.bin"), b"snapshot").unwrap();
-        std::fs::write(snap_path.join("snap.toc"), b"").unwrap();
-
-        let manager1 = SnapshotManager::new(
-            RealFileSystem,
-            root.join("cam_disk.bin"),
-            snapshots_path.clone(),
-        )
-        .unwrap();
+    fn process_lock_blocks_other_managers_until_handle_release() {
+        let fs = MockFileSystem::new();
+        let manager1 = manager_with_fs(fs.clone());
+        manager1.create_snapshot().unwrap();
         let mut handle = manager1.acquire(0).unwrap();
+        let manager2 = manager_with_fs(fs);
 
-        let manager2 = SnapshotManager::new(
-            RealFileSystem,
-            root.join("cam_disk.bin"),
-            snapshots_path.clone(),
-        )
-        .unwrap();
-
-        let snapshot = manager2.get_snapshots().pop().unwrap();
+        let snapshot = manager2.get_snapshots().unwrap().pop().unwrap();
         assert_eq!(snapshot.state(), SnapshotState::Archiving);
-        assert!(!snapshot.is_deletable());
-        assert!(manager2.get_deletable_snapshots().is_empty());
+        assert!(manager2.get_deletable_snapshots().unwrap().is_empty());
         assert!(manager2.acquire(0).is_err());
         assert!(manager2.delete_snapshot(0).is_err());
 
         handle.release();
-        assert_eq!(manager2.get_deletable_snapshots()[0].id, 0);
+        assert_eq!(manager2.get_deletable_snapshots().unwrap()[0].id, 0);
         assert!(manager2.delete_snapshot(0).unwrap());
+        assert!(manager1.acquire(0).is_err());
+        assert!(manager1.get_snapshots().unwrap().is_empty());
+    }
 
-        let _ = std::fs::remove_dir_all(root);
+    #[test]
+    fn separate_managers_allocate_distinct_snapshot_ids() {
+        let fs = MockFileSystem::new();
+        let manager1 = manager_with_fs(fs.clone());
+        let manager2 = manager_with_fs(fs);
+        assert_eq!(manager1.create_snapshot().unwrap().id, 0);
+        assert_eq!(manager2.create_snapshot().unwrap().id, 1);
+        assert_eq!(manager1.create_snapshot().unwrap().id, 2);
+        assert_eq!(manager2.get_snapshots().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn deleted_snapshot_ids_are_not_reused_by_stale_or_new_managers() {
+        let fs = MockFileSystem::new();
+        let first = manager_with_fs(fs.clone());
+        let stale = manager_with_fs(fs.clone());
+        let snapshot = first.create_snapshot().unwrap();
+        first.delete_snapshot(snapshot.id).unwrap();
+        assert_eq!(stale.create_snapshot().unwrap().id, 1);
+        assert!(first.acquire(snapshot.id).is_err());
+        stale.delete_snapshot(1).unwrap();
+        assert_eq!(manager_with_fs(fs).create_snapshot().unwrap().id, 2);
+    }
+
+    #[test]
+    fn corrupt_snapshot_id_counter_fails_loudly() {
+        let manager = manager();
+        manager
+            .fs
+            .write_bytes(manager.snapshots_path.join(".next-id"), b"broken");
+        assert!(manager.create_snapshot().is_err());
+        assert!(manager.get_snapshots().is_err());
+    }
+
+    #[test]
+    fn catalog_lock_protects_snapshot_being_created() {
+        let fs = MockFileSystem::new();
+        let manager = manager_with_fs(fs.clone());
+        let catalog_lock = manager.lock_catalog().unwrap();
+        let path = Path::new("/backingfiles/snapshots/snap-000000");
+        fs.create_dir_all(path).unwrap();
+        fs.write_bytes(path.join("snap.bin"), b"partial");
+
+        assert!(SnapshotManager::new(
+            fs.clone(),
+            manager.cam_disk_path.clone(),
+            manager.snapshots_path.clone()
+        )
+        .is_err());
+        assert!(manager.get_snapshots().is_err());
+        assert!(manager.create_snapshot().is_err());
+        assert!(manager.delete_snapshot(0).is_err());
+        assert!(manager.acquire(0).is_err());
+        assert!(fs.exists(&path.join("snap.bin")));
+
+        drop(catalog_lock);
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(!fs.exists(path));
+        assert_eq!(manager.create_snapshot().unwrap().id, 1);
+    }
+
+    #[test]
+    fn locked_incomplete_snapshot_is_preserved() {
+        let fs = MockFileSystem::new();
+        let manager = manager_with_fs(fs.clone());
+        let path = Path::new("/backingfiles/snapshots/snap-000000");
+        fs.create_dir_all(path).unwrap();
+        fs.write_bytes(path.join("snap.bin"), b"partial");
+        let lock = fs.try_lock(&path.join("snap.lock")).unwrap().unwrap();
+
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(fs.exists(&path.join("snap.bin")));
+        drop(lock);
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(!fs.exists(path));
+    }
+
+    #[test]
+    fn complete_snapshot_missing_image_fails_loudly() {
+        let fs = MockFileSystem::new();
+        let manager = manager_with_fs(fs.clone());
+        let snapshot = manager.create_snapshot().unwrap();
+        fs.remove_file(&snapshot.image_path()).unwrap();
+        assert!(manager.get_snapshots().is_err());
+        assert!(manager.acquire(snapshot.id).is_err());
+        assert!(fs.exists(&snapshot.toc_path()));
     }
 }
