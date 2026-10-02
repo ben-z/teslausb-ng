@@ -361,6 +361,27 @@ fn offline_mount_failure_after_effect_unmounts_and_stops_archive() {
 }
 
 #[test]
+fn offline_uncertain_loop_detach_is_not_issued_again_during_drop() {
+    let harness = Harness::new("none");
+    let config = harness.config_arg();
+    let init = harness.run_with_env(
+        &["--config", &config, "init", "--reserve", "20G"],
+        &[("TESLAUSB_FAKE_DETACH_FAIL_AFTER_EFFECT", "true")],
+    );
+    assert!(!init.status.success(), "{}", describe(&init));
+    assert!(stderr(&init).contains("injected failure after detach took effect"));
+    let log = harness.command_log();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("losetup\t-d\t"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("mount\t-o\trw"));
+}
+
+#[test]
 fn offline_mount_probe_errors_preserve_the_disk_image() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
@@ -1149,6 +1170,10 @@ case "$tool" in
         ;;
     losetup)
         if [ "${1:-}" = "-d" ]; then
+            if [ "${TESLAUSB_FAKE_DETACH_FAIL_AFTER_EFFECT:-}" = "true" ]; then
+                printf 'injected failure after detach took effect\n' >&2
+                exit 9
+            fi
             exit 0
         fi
         image=$(last_arg "$@")

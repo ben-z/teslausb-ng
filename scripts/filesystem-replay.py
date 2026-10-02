@@ -246,11 +246,20 @@ class Experiment:
 
     def inspect(self, image, name, marks):
         result = {'missing_durable_clips': [], 'wrong_durable_bytes': [],
-                  'wrong_acknowledged_path': []}
+                  'wrong_acknowledged_path': [], 'wrong_retained_source': []}
         device = self.attach(image, True)
         mount = self.mount(device, name, True)
         result['read_errors'] = []
         for item in self.manifest:
+            if self.promotion == 'copy':
+                source = mount / item['source']
+                try:
+                    if (not source.is_file() or source.stat().st_size != item['size']
+                            or digest(source.read_bytes()) != item['sha256']):
+                        result['wrong_retained_source'].append(item['source'])
+                except OSError as error:
+                    require(error.errno == errno.EIO, f'Unexpected source inspection error: {error}')
+                    result['wrong_retained_source'].append(item['source'])
             try:
                 found = [relative for relative in (item['source'], item['destination'])
                          if (mount / relative).is_file()]
@@ -368,7 +377,7 @@ class Experiment:
         for phase in ('archive', 'maintenance'):
             inspected = [result[phase] for result in results if phase in result]
             summary[phase] = {key: sum(bool(result[key]) for result in inspected)
-                              for key in ('missing_durable_clips', 'wrong_durable_bytes', 'wrong_acknowledged_path', 'read_errors')}
+                              for key in ('missing_durable_clips', 'wrong_durable_bytes', 'wrong_acknowledged_path', 'read_errors', 'wrong_retained_source')}
             summary[phase]['inspected_cases'] = len(inspected)
         (self.root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps({'event': 'filesystem_recovery_summary', **summary}), flush=True)
@@ -380,15 +389,20 @@ class Experiment:
                 and not control.get('archive_rejected', False), f'Positive control failed: {control}')
         for phase in ('archive', 'maintenance'):
             require(not any(control[phase][key] for key in
-                            ('missing_durable_clips', 'wrong_durable_bytes', 'wrong_acknowledged_path', 'read_errors')),
+                            ('missing_durable_clips', 'wrong_durable_bytes', 'wrong_acknowledged_path', 'read_errors', 'wrong_retained_source')),
                     f'Positive control failed: {control}')
 
-arguments = argparse.ArgumentParser()
-arguments.add_argument('--filesystem', choices=('fat32', 'ext4'), required=True)
-arguments.add_argument('--promotion', choices=('rename', 'copy'), required=True)
-args = arguments.parse_args()
-experiment = Experiment(args.filesystem, args.promotion, Settings())
-try:
-    experiment.execute()
-finally:
-    experiment.clean_up()
+def main():
+    arguments = argparse.ArgumentParser()
+    arguments.add_argument('--filesystem', choices=('fat32', 'ext4'), required=True)
+    arguments.add_argument('--promotion', choices=('rename', 'copy'), required=True)
+    args = arguments.parse_args()
+    experiment = Experiment(args.filesystem, args.promotion, Settings())
+    try:
+        experiment.execute()
+    finally:
+        experiment.clean_up()
+
+
+if __name__ == '__main__':
+    main()

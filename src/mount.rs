@@ -46,12 +46,12 @@ impl LoopDevice {
                 )?;
                 self.kpartx_used = false;
             }
+            self.state = LoopState::Detaching;
             CommandRunner.check(
                 "losetup",
                 ["-d", self.loop_dev.as_str()],
                 Some(Duration::from_secs(30)),
             )?;
-            self.state = LoopState::Detaching;
         }
         self.wait_detached()?;
         self.state = LoopState::Detached;
