@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
 
-static MOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MOUNT_COUNTER: Mutex<u64> = Mutex::new(0);
 
 #[derive(Debug)]
 pub struct LoopDevice {
@@ -246,13 +246,15 @@ fn temp_mount_point(timestamp: SystemTime) -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::new(format!("invalid temporary mount timestamp: {error}")))?
         .as_nanos();
-    let counter = MOUNT_COUNTER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .map_err(|_| Error::new("temporary mount identifiers exhausted"))?;
+    let mut counter = MOUNT_COUNTER
+        .lock()
+        .map_err(|_| Error::new("temporary mount counter poisoned"))?;
+    let id = *counter;
+    *counter = counter
+        .checked_add(1)
+        .ok_or_else(|| Error::new("temporary mount identifiers exhausted"))?;
     Ok(std::env::temp_dir().join(format!(
-        "teslausb-mount-{}-{suffix}-{counter}",
+        "teslausb-mount-{}-{suffix}-{id}",
         std::process::id()
     )))
 }
