@@ -192,6 +192,175 @@ fn offline_init_mount_status_doctor_and_deinit() {
 }
 
 #[test]
+fn offline_ext4_init_and_archive_use_detected_format() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let contents = fs::read_to_string(&harness.config).unwrap();
+    fs::write(&harness.config, format!("{contents}CAM_FILESYSTEM=ext4\n")).unwrap();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    assert!(harness.command_log().contains("mkfs.ext4\t-F"));
+    // Init preference must not select the repair path for an existing image.
+    fs::write(&harness.config, format!("{contents}CAM_FILESYSTEM=fat32\n")).unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    let log = harness.command_log();
+    for command in [
+        "blkid\t-p\t-s\tTYPE\t-o\tvalue",
+        "e2fsck\t-p\t-E\tjournal_only",
+        "e2fsck\t-f\t-n",
+        "losetup\t-Pf\t--show\t--read-only",
+        "mount\t-o\tro,noload",
+    ] {
+        assert!(log.contains(command), "missing {command:?}\n{log}");
+    }
+    assert!(!log.contains("mkfs.ext4\t-F"));
+    assert!(!log.contains("mkfs.vfat\t-F"));
+    assert!(harness.archive_path("SavedClips/event/front.mp4").is_file());
+    assert!(harness
+        .archive_path("SentryClips/sentry/rear.mp4")
+        .is_file());
+    assert!(fs::read_dir(harness.backingfiles.join("snapshots"))
+        .unwrap()
+        .all(|entry| { !entry.unwrap().file_name().to_string_lossy().eq("recovery") }));
+}
+
+#[test]
+fn offline_ext4_recovery_failure_prevents_upload_and_preserves_evidence() {
+    for (variable, exit_code) in [
+        ("TESLAUSB_FAKE_FSCK_EXIT", "4"),
+        ("TESLAUSB_FAKE_FSCK_VERIFY_EXIT", "4"),
+    ] {
+        let harness = Harness::new("rclone");
+        let config = harness.config_arg();
+        let contents = fs::read_to_string(&harness.config).unwrap();
+        fs::write(&harness.config, format!("{contents}CAM_FILESYSTEM=ext4\n")).unwrap();
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+        fs::write(harness.state.join("commands.log"), "").unwrap();
+        let archive =
+            harness.run_with_env(&["--config", &config, "archive"], &[(variable, exit_code)]);
+        assert!(!archive.status.success(), "{}", describe(&archive));
+        let log = harness.command_log();
+        assert!(!log.contains("rclone\tcopy"));
+        assert!(!log.contains("mount\t-o\trw"));
+        let recovery: Vec<_> = fs::read_dir(harness.backingfiles.join("snapshots"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().eq("recovery"))
+            .collect();
+        assert_eq!(recovery.len(), 1, "{}", describe(&archive));
+        assert!(recovery[0].join("raw.bin").is_file());
+        assert!(recovery[0].join("recovered.bin").is_file());
+        let copies_before = harness
+            .command_log()
+            .lines()
+            .filter(|line| line.starts_with("cp\t--reflink=always"))
+            .count();
+        let retry = harness.run(&["--config", &config, "archive"]);
+        let copies_after = harness
+            .command_log()
+            .lines()
+            .filter(|line| line.starts_with("cp\t--reflink=always"))
+            .count();
+        assert_eq!(
+            copies_before, copies_after,
+            "retry pinned another camera snapshot"
+        );
+        assert!(!retry.status.success(), "{}", describe(&retry));
+        assert!(
+            stderr(&retry).contains("recovery evidence already exists"),
+            "{}",
+            describe(&retry)
+        );
+        assert_eq!(fs::read_dir(&recovery[0]).unwrap().count(), 2);
+        assert_eq!(
+            fs::read(recovery[0].join("raw.bin")).unwrap(),
+            fs::read(harness.backingfiles.join("cam_disk.bin")).unwrap()
+        );
+        assert_success(&harness.run(&["--config", &config, "clean"]));
+        assert!(
+            recovery[0].join("raw.bin").is_file(),
+            "normal cleanup erased failed recovery evidence"
+        );
+    }
+}
+
+#[test]
+fn offline_unsupported_camera_filesystem_stops_before_mount_or_upload() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    let archive = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_FILESYSTEM", "ntfs")],
+    );
+    assert!(!archive.status.success(), "{}", describe(&archive));
+    let log = harness.command_log();
+    assert!(!log.contains("rclone\tcopy"));
+    assert!(!log.contains("mount\t-o\tro"));
+    assert!(!log.contains("mount\t-o\trw"));
+}
+
+#[test]
+fn offline_init_preference_never_reformats_existing_camera() {
+    let harness = Harness::new("none");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    let contents = fs::read_to_string(&harness.config).unwrap();
+    fs::write(&harness.config, format!("{contents}CAM_FILESYSTEM=ext4\n")).unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    let before = fs::read(harness.backingfiles.join("cam_disk.bin")).unwrap();
+    let init = harness.run(&["--config", &config, "init", "--reserve", "20G"]);
+    assert_eq!(init.status.code(), Some(1), "{}", describe(&init));
+    assert!(stderr(&init).contains("already exists"));
+    let log = harness.command_log();
+    assert!(!log.contains("mkfs.ext4\t-F"));
+    assert!(!log.contains("mkfs.vfat\t-F"));
+    assert_eq!(
+        before,
+        fs::read(harness.backingfiles.join("cam_disk.bin")).unwrap()
+    );
+}
+
+#[test]
+fn offline_mount_failure_after_effect_unmounts_and_stops_archive() {
+    for filesystem in ["fat32", "ext4"] {
+        let harness = Harness::new("rclone");
+        let config = harness.config_arg();
+        let contents = fs::read_to_string(&harness.config).unwrap();
+        fs::write(
+            &harness.config,
+            format!("{contents}CAM_FILESYSTEM={filesystem}\n"),
+        )
+        .unwrap();
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+        let mounts_before = fs::read_dir(harness.state.join("mounted")).unwrap().count();
+        fs::write(harness.state.join("commands.log"), "").unwrap();
+        let archive = harness.run_with_env(
+            &["--config", &config, "archive"],
+            &[("TESLAUSB_FAKE_MOUNT_FAIL_AFTER_EFFECT", "true")],
+        );
+        assert!(!archive.status.success(), "{}", describe(&archive));
+        assert!(
+            stderr(&archive).contains("injected failure after mount took effect"),
+            "{}",
+            describe(&archive)
+        );
+        let log = harness.command_log();
+        assert!(!log.contains("rclone\tcopy"));
+        assert!(
+            log.lines()
+                .any(|line| line.starts_with("umount\t") && line.contains("teslausb-mount-")),
+            "{log}"
+        );
+        assert_eq!(
+            fs::read_dir(harness.state.join("mounted")).unwrap().count(),
+            mounts_before
+        );
+    }
+}
+
+#[test]
 fn offline_mount_probe_errors_preserve_the_disk_image() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
@@ -454,6 +623,7 @@ fn offline_fsck_failure_prevents_writable_mount() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
     let output = harness.run_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_FSCK_EXIT", "4")],
@@ -468,6 +638,7 @@ fn offline_incomplete_fsck_repair_prevents_writable_mount() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
     let output = harness.run_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_FSCK_VERIFY_EXIT", "4")],
@@ -558,6 +729,7 @@ fn offline_manual_archive_sigterm_reaps_copy_and_unmounts_snapshot() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
     let mut child = harness.spawn_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_RCLONE_SLEEP", "true")],
@@ -627,6 +799,7 @@ fn offline_malformed_rclone_log_prevents_live_cleanup() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
     let output = harness.run_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_RCLONE_MALFORMED_LOG", "true")],
@@ -884,7 +1057,7 @@ case "$tool" in
             exit 0
         fi
         ;;
-    mount|mountpoint|umount|losetup|blockdev|fsck)
+    mount|mountpoint|umount|losetup|blockdev|fsck|blkid)
         if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
             printf '%s from util-linux %s\n' "$tool" "${TESLAUSB_FAKE_UTIL_LINUX_VERSION:-2.38.1}"
             exit 0
@@ -896,9 +1069,15 @@ case "$tool" in
             exit 0
         fi
         ;;
-    mkfs.vfat)
-        if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    mkfs.vfat|fsck.fat)
+        if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ] || [ "${1:-}" = "--help" ]; then
             printf 'mkfs.fat %s (2021-01-31)\n' "${TESLAUSB_FAKE_DOSFSTOOLS_VERSION:-4.2}"
+            exit 0
+        fi
+        ;;
+    mkfs.ext4|e2fsck)
+        if [ "${1:-}" = "-V" ]; then
+            printf '%s 1.47.0 (5-Feb-2023)\n' "$tool" >&2
             exit 0
         fi
         ;;
@@ -917,10 +1096,30 @@ case "$tool" in
 esac
 
 case "$tool" in
-    sync|mkfs.xfs|parted|blockdev|mkfs.vfat|modprobe)
+    sync|mkfs.xfs|parted|blockdev|modprobe)
         exit 0
         ;;
-    fsck)
+    mkfs.vfat)
+        printf 'vfat\n' > "$state/cam-filesystem"
+        exit 0
+        ;;
+    mkfs.ext4)
+        printf 'ext4\n' > "$state/cam-filesystem"
+        exit 0
+        ;;
+    blkid)
+        if [ -n "${TESLAUSB_FAKE_FILESYSTEM:-}" ]; then
+            printf '%s\n' "$TESLAUSB_FAKE_FILESYSTEM"
+        else
+            cat "$state/cam-filesystem"
+        fi
+        exit 0
+        ;;
+    e2fsck)
+        if [ "${1:-}" = "-f" ]; then exit "${TESLAUSB_FAKE_FSCK_VERIFY_EXIT:-0}"; fi
+        exit "${TESLAUSB_FAKE_FSCK_EXIT:-0}"
+        ;;
+    fsck|fsck.fat)
         if [ "${1:-}" = "-p" ] && [ "${TESLAUSB_FAKE_CHECK_CLEANUP_LED:-}" = "1" ]; then
             trigger=$(cat "${TESLAUSB_LED_PATH:?}/trigger")
             if [ "$trigger" != "heartbeat" ]; then
@@ -997,6 +1196,10 @@ case "$tool" in
                 fi
                 ;;
         esac
+        if [ "${TESLAUSB_FAKE_MOUNT_FAIL_AFTER_EFFECT:-}" = "true" ]; then
+            printf 'injected failure after mount took effect\n' >&2
+            exit 9
+        fi
         exit 0
         ;;
     umount)
@@ -1103,12 +1306,16 @@ exit 127
 "#;
 
     for tool in [
+        "blkid",
         "blockdev",
         "cp",
         "df",
         "fsck",
+        "fsck.fat",
+        "e2fsck",
         "kpartx",
         "losetup",
+        "mkfs.ext4",
         "mkfs.vfat",
         "mkfs.xfs",
         "modprobe",
@@ -1132,6 +1339,9 @@ exit 127
 
 fn assert_success(output: &Output) {
     assert!(output.status.success(), "{}", describe(output));
+    for error in ["error: failed to detach", "error: failed to release mount"] {
+        assert!(!stderr(output).contains(error), "{}", describe(output));
+    }
 }
 
 fn stdout(output: &Output) -> String {

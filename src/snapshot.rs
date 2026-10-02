@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 
+pub const RECOVERY_DIRECTORY: &str = "recovery";
+
 pub fn validate_camera_image(fs: &impl FileSystem, path: &Path) -> Result<()> {
     if !fs.exists(path) {
         return Err(Error::new(format!(
@@ -210,6 +212,17 @@ impl<F: FileSystem> SnapshotManager<F> {
 
     pub fn create_snapshot(&self) -> Result<Snapshot> {
         let _catalog_lock = self.lock_catalog()?;
+        if self
+            .fs
+            .list_dir_names(&self.snapshots_path)?
+            .iter()
+            .any(|name| name == RECOVERY_DIRECTORY)
+        {
+            return Err(Error::new(format!(
+                "snapshot recovery evidence already exists at {}; inspect retained files before archiving again",
+                self.snapshots_path.join(RECOVERY_DIRECTORY).display()
+            )));
+        }
         validate_camera_image(&self.fs, &self.cam_disk_path)?;
         let mut inner = self.inner.lock().unwrap();
         self.load_snapshots(&mut inner, true)?;
@@ -429,6 +442,53 @@ mod tests {
         assert!(manager.fs.exists(&snapshot.image_path()));
         assert!(manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.metadata_path()));
+    }
+
+    #[test]
+    fn retained_recovery_evidence_prevents_new_snapshots_and_id_allocation() {
+        let manager = manager();
+        let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+        manager.fs.create_dir_all(&recovery).unwrap();
+        manager
+            .fs
+            .write_bytes(recovery.join("raw.bin"), b"original");
+        manager
+            .fs
+            .write_bytes(recovery.join("recovered.bin"), b"replayed");
+        let catalog_before = manager.fs.list_dir_names(&manager.snapshots_path).unwrap();
+
+        for _ in 0..3 {
+            manager
+                .fs
+                .write_bytes(&manager.cam_disk_path, b"new recording");
+            let error = manager.create_snapshot().unwrap_err().to_string();
+            assert!(error.contains("recovery evidence already exists"));
+            assert!(error.contains(recovery.to_str().unwrap()));
+            assert_eq!(
+                manager.fs.list_dir_names(&manager.snapshots_path).unwrap(),
+                catalog_before
+            );
+            assert!(!manager.fs.exists(&manager.snapshots_path.join(".next-id")));
+            assert_eq!(
+                manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                manager
+                    .fs
+                    .read_bytes(recovery.join("recovered.bin"))
+                    .unwrap(),
+                b"replayed"
+            );
+        }
+
+        manager.fs.remove_dir_all(&recovery).unwrap();
+        let snapshot = manager.create_snapshot().unwrap();
+        assert_eq!(snapshot.id, 0);
+        assert_eq!(
+            manager.fs.read_bytes(snapshot.image_path()).unwrap(),
+            b"new recording"
+        );
     }
 
     #[test]

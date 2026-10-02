@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::command::CommandRunner;
-use crate::config::Config;
+use crate::config::{CameraFilesystem, Config};
 use crate::error::{Error, Result};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -106,18 +106,18 @@ pub fn dependency_detail(report: &DependencyReport) -> String {
 fn specs_for(config: &Config, set: DependencySet) -> Vec<DependencySpec> {
     let mut specs = Vec::new();
     match set {
-        DependencySet::Init => add_init_specs(&mut specs),
+        DependencySet::Init => add_init_specs(&mut specs, config),
         DependencySet::Mount => add_mount_specs(&mut specs),
         DependencySet::Runtime => add_runtime_specs(&mut specs, config),
         DependencySet::Gadget => add_gadget_specs(&mut specs),
         DependencySet::Service => add_service_specs(&mut specs),
         DependencySet::Startup => {
-            add_init_specs(&mut specs);
+            add_init_specs(&mut specs, config);
             add_runtime_specs(&mut specs, config);
             add_gadget_specs(&mut specs);
         }
         DependencySet::Full => {
-            add_init_specs(&mut specs);
+            add_init_specs(&mut specs, config);
             add_runtime_specs(&mut specs, config);
             add_gadget_specs(&mut specs);
             add_service_specs(&mut specs);
@@ -126,7 +126,8 @@ fn specs_for(config: &Config, set: DependencySet) -> Vec<DependencySpec> {
     specs
 }
 
-fn add_init_specs(specs: &mut Vec<DependencySpec>) {
+fn add_init_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
+    add(specs, spec("blkid", "blkid", &["--version"], None));
     add(specs, spec("df", "df", &["--version"], None));
     add(specs, spec("truncate", "truncate", &["--version"], None));
     add(
@@ -137,7 +138,14 @@ fn add_init_specs(specs: &mut Vec<DependencySpec>) {
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
     add(specs, spec("kpartx", "kpartx", &["-V"], None));
-    add(specs, spec("mkfs.vfat", "mkfs.vfat", &["--version"], None));
+    match config.cam_filesystem {
+        CameraFilesystem::Fat32 => {
+            add(specs, spec("mkfs.vfat", "mkfs.vfat", &["--version"], None));
+        }
+        CameraFilesystem::Ext4 => {
+            add(specs, spec("mkfs.ext4", "mkfs.ext4", &["-V"], None));
+        }
+    }
     add_mount_specs(specs);
     add_reflink_cp(specs);
     add(specs, spec("sync", "sync", &["--version"], None));
@@ -158,6 +166,9 @@ fn add_runtime_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
     add(specs, spec("df", "df", &["--version"], None));
     add(specs, spec("sync", "sync", &["--version"], None));
     add(specs, spec("fsck", "fsck", &["--version"], None));
+    add(specs, spec("blkid", "blkid", &["--version"], None));
+    add(specs, spec("fsck.fat", "fsck.fat", &["--help"], None));
+    add(specs, spec("e2fsck", "e2fsck", &["-V"], None));
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
     add(specs, spec("kpartx", "kpartx", &["-V"], None));
@@ -425,5 +436,29 @@ mod tests {
 
         assert!(dependency_detail(&report).contains("nonzero status"));
         assert!(dependency_detail(&report).contains("version 4.2.0"));
+    }
+
+    #[test]
+    fn init_selects_formatter_but_runtime_supports_existing_formats() {
+        let mut config = Config::default();
+        for filesystem in [CameraFilesystem::Fat32, CameraFilesystem::Ext4] {
+            config.cam_filesystem = filesystem;
+            let init = specs_for(&config, DependencySet::Init);
+            assert_eq!(
+                init.iter().any(|item| item.command == "mkfs.vfat"),
+                filesystem == CameraFilesystem::Fat32
+            );
+            assert_eq!(
+                init.iter().any(|item| item.command == "mkfs.ext4"),
+                filesystem == CameraFilesystem::Ext4
+            );
+            let runtime = specs_for(&config, DependencySet::Runtime);
+            for command in ["blkid", "fsck.fat", "e2fsck"] {
+                assert!(
+                    runtime.iter().any(|item| item.command == command),
+                    "missing {command}"
+                );
+            }
+        }
     }
 }

@@ -9,6 +9,31 @@ use crate::error::{Error, Result};
 pub const GB: u64 = 1024 * 1024 * 1024;
 const MB: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraFilesystem {
+    Fat32,
+    Ext4,
+}
+
+impl CameraFilesystem {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fat32" => Ok(Self::Fat32),
+            "ext4" => Ok(Self::Ext4),
+            _ => Err(Error::new(format!(
+                "CAM_FILESYSTEM must be fat32 or ext4, got {value:?}"
+            ))),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fat32 => "fat32",
+            Self::Ext4 => "ext4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveConfig {
     pub system: String,
@@ -67,6 +92,7 @@ impl Default for RuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub cam_filesystem: CameraFilesystem,
     pub backingfiles_path: PathBuf,
     pub mutable_path: PathBuf,
     pub archive: ArchiveConfig,
@@ -76,6 +102,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            cam_filesystem: CameraFilesystem::Fat32,
             backingfiles_path: PathBuf::from("/backingfiles"),
             mutable_path: PathBuf::from("/mutable"),
             archive: ArchiveConfig::default(),
@@ -176,6 +203,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
     let mut config = Config::default();
     let mut archive = ArchiveConfig::default();
+
+    if let Some(value) = get_var(file_values, "CAM_FILESYSTEM") {
+        config.cam_filesystem = CameraFilesystem::parse(&value)?;
+    }
 
     if let Some(value) = get_var(file_values, "MUTABLE_PATH") {
         config.mutable_path = PathBuf::from(value);
@@ -347,6 +378,7 @@ mod tests {
     #[test]
     fn defaults_and_derived_paths_match_expected_layout() {
         let config = Config::default();
+        assert_eq!(config.cam_filesystem, CameraFilesystem::Fat32);
         assert_eq!(config.backingfiles_path, PathBuf::from("/backingfiles"));
         assert_eq!(config.mutable_path, PathBuf::from("/mutable"));
         assert_eq!(
@@ -365,6 +397,25 @@ mod tests {
         assert!(config.archive.archive_saved);
         assert!(config.archive.archive_sentry);
         assert!(!config.archive.archive_recent);
+    }
+
+    #[test]
+    fn camera_filesystem_is_explicit_and_rejects_unknown_formats() {
+        for (value, expected) in [
+            ("fat32", CameraFilesystem::Fat32),
+            ("ext4", CameraFilesystem::Ext4),
+        ] {
+            let values = HashMap::from([("CAM_FILESYSTEM".to_string(), value.to_string())]);
+            assert_eq!(load_from_sources(&values).unwrap().cam_filesystem, expected);
+            assert_eq!(expected.name(), value);
+        }
+        for value in ["", "exfat", "vfat", "EXT4"] {
+            let values = HashMap::from([("CAM_FILESYSTEM".to_string(), value.to_string())]);
+            assert!(load_from_sources(&values)
+                .unwrap_err()
+                .to_string()
+                .contains("CAM_FILESYSTEM must be fat32 or ext4"));
+        }
     }
 
     #[test]

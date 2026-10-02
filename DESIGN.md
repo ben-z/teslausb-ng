@@ -75,7 +75,8 @@ set status LED to fast blink while the archive cycle runs
 delete all stale/deletable snapshots
 wait for USB writes to become idle; skip on timeout
 create reflink snapshot
-mount snapshot read-only
+recover ext4 journal on a private reflink copy, then verify it
+mount snapshot through a read-only loop device
 copy enabled clip directories with rclone JSON confirmations
 select complete, stable Saved/Sentry events for cleanup
 wait for USB writes to become idle again; skip cleanup on timeout
@@ -91,6 +92,18 @@ delete snapshot
 set status LED to heartbeat after a successful cycle
 repeat
 ```
+
+Archive readers detect the filesystem from the snapshot partition. FAT32 uses
+the raw snapshot through a read-only loop. Ext4 uses a private reflink copy for
+journal-only replay followed by a forced read-only filesystem check. A successful
+check permits a read-only loop and `ro,noload` mount, so mounting cannot replay the
+journal or modify the raw snapshot. A failed check stops the archive and retains
+both raw and recovered images in `snapshots/recovery/`, outside the normal
+`snap-*` cleanup namespace. Exclusive creation prevents another recovery attempt
+while that directory exists. Snapshot creation also refuses retained recovery
+evidence before cloning the camera image, preserving the single-snapshot space
+bound across retries.
+Successful recovery copies are removed after checked unmount and loop detach.
 
 The live camera disk is never mounted read-write while it is exposed to the car
 through the USB gadget.
@@ -111,7 +124,7 @@ lock prevents concurrent processes from maintaining the live camera disk.
 ```text
 /mutable/backingfiles.img  (XFS, reflink-capable)
   mounted at /backingfiles
-    cam_disk.bin           (FAT32 disk image exposed to Tesla)
+    cam_disk.bin           (FAT32 or ext4 disk image exposed to Tesla)
     snapshots/
       snap-000000/
         snap.bin           (reflink copy of cam_disk.bin)
