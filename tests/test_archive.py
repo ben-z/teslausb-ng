@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from teslausb.archive import (
+    ArchiveCommandInterruptedError,
     ArchivedFile,
     ArchiveManager,
     ArchiveResult,
@@ -471,7 +472,7 @@ class TestRcloneBackend:
                 ),
             )
 
-        monkeypatch.setattr(subprocess, "run", run_success)
+        monkeypatch.setattr(RcloneBackend, "_run_command", staticmethod(run_success))
 
         backend = RcloneBackend(remote="gdrive", fs=fs)
         result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
@@ -512,7 +513,7 @@ class TestRcloneBackend:
                 ),
             )
 
-        monkeypatch.setattr(subprocess, "run", run_failure)
+        monkeypatch.setattr(RcloneBackend, "_run_command", staticmethod(run_failure))
 
         backend = RcloneBackend(remote="gdrive", fs=fs)
         result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")
@@ -536,9 +537,9 @@ class TestRcloneBackend:
 
         def timeout_run(*args, **kwargs):
             assert "--use-json-log" in args[0]
-            raise subprocess.TimeoutExpired(
-                cmd=args[0],
-                timeout=kwargs["timeout"],
+            raise ArchiveCommandInterruptedError(
+                "Timeout",
+                stdout=b"",
                 stderr=rclone_json_output(
                     {
                         "level": "info",
@@ -558,7 +559,7 @@ class TestRcloneBackend:
                 ),
             )
 
-        monkeypatch.setattr(subprocess, "run", timeout_run)
+        monkeypatch.setattr(RcloneBackend, "_run_command", staticmethod(timeout_run))
 
         backend = RcloneBackend(remote="gdrive", fs=fs, timeout=1)
         result = backend.copy_directory(Path("/test/SavedClips"), "SavedClips")

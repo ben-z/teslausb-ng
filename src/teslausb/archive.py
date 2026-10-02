@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -37,6 +38,15 @@ def format_size(num_bytes: int | float) -> str:
         value /= 1024
     # Unreachable: the loop always returns at "GiB"
     return f"{value:.1f} GiB"
+
+
+class ArchiveCommandInterruptedError(Exception):
+    """A stopped command with the output captured before its child was reaped."""
+
+    def __init__(self, reason: str, stdout: bytes, stderr: bytes) -> None:
+        super().__init__(reason)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class ArchiveState(Enum):
@@ -194,34 +204,57 @@ class RcloneBackend(ArchiveBackend):
             return f"{remote}{path_str}"
         return remote
 
+    def _run_command(
+        self, cmd: list[str], timeout: float, input_data: bytes | None
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Drain subprocess streams while honoring cancellation and the deadline."""
+        if self.stop_event and self.stop_event.is_set():
+            raise ArchiveCommandInterruptedError("Stopped", b"", b"")
+        # communicate retries cannot resume an unfinished stdin pipe write.
+        with tempfile.TemporaryFile() as input_stream:
+            if input_data is not None:
+                input_stream.write(input_data)
+                input_stream.seek(0)
+            with subprocess.Popen(
+                cmd, stdin=input_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ) as proc:
+                deadline = time.monotonic() + timeout
+                try:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        stopped = self.stop_event is not None and self.stop_event.is_set()
+                        if stopped or remaining <= 0:
+                            proc.kill()
+                            stdout, stderr = proc.communicate()
+                            reason = "Stopped" if stopped else "Timeout"
+                            raise ArchiveCommandInterruptedError(reason, stdout, stderr)
+                        try:
+                            stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
+                            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+                        except subprocess.TimeoutExpired:
+                            continue
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+
     def is_reachable(self) -> bool:
         """Check the archive root while draining output and honoring stop requests."""
-        with subprocess.Popen(
-            ["rclone", "lsf", self._remote_with_colon(), "--max-depth", "1"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ) as proc:
-            deadline = time.monotonic() + 30
-            try:
-                while time.monotonic() < deadline:
-                    if self.stop_event and self.stop_event.is_set():
-                        return False
-                    try:
-                        _, stderr = proc.communicate(timeout=0.1)
-                    except subprocess.TimeoutExpired:
-                        continue
-                    if proc.returncode != 0:
-                        logger.warning(
-                            "Archive reachability check failed: %s",
-                            stderr.decode(errors="replace").strip(),
-                        )
-                    return proc.returncode == 0
-                logger.warning("Archive reachability check timed out")
-                return False
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                proc.communicate()
+        try:
+            result = self._run_command(
+                ["rclone", "lsf", self._remote_with_colon(), "--max-depth", "1"],
+                timeout=30,
+                input_data=None,
+            )
+        except ArchiveCommandInterruptedError as error:
+            logger.warning("Archive reachability check interrupted: %s", error)
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "Archive reachability check failed: %s",
+                result.stderr.decode(errors="replace").strip(),
+            )
+        return result.returncode == 0
 
     def _scan_directory(self, src: Path) -> list[ArchivedFile]:
         """Scan a directory and collect file info for later deletion verification.
@@ -359,6 +392,8 @@ class RcloneBackend(ArchiveBackend):
             result.archived_files.extend(copied.archived_files)
             if not copied.success:
                 errors.append(f"{day}: {copied.error}")
+                if self.stop_event and self.stop_event.is_set():
+                    break
         if errors:
             result.success = False
             result.error = "; ".join(errors)
@@ -390,72 +425,40 @@ class RcloneBackend(ArchiveBackend):
 
         logger.info(f"Running: {' '.join(cmd)}")
 
+        error: str | None = None
         try:
-            result = subprocess.run(
+            result = self._run_command(
                 cmd,
-                input="\n".join(file.relative_path for file in archived_files).encode(),
-                capture_output=True,
                 timeout=self.timeout,
-                check=False,
+                input_data="\n".join(file.relative_path for file in archived_files).encode(),
             )
-
-            # Parse output for stats
             output = self._combined_output(result.stdout, result.stderr)
-
-            for line in output.splitlines():
-                logger.debug(f"rclone: {line}")
-
-            copied_paths = self._parse_rclone_paths(output, ("Copied",))
-            copied_files = self._select_archived_files(archived_files, copied_paths)
-            files_transferred = len(copied_files)
-            bytes_transferred = sum(file.size for file in copied_files)
-            confirmed_paths = self._parse_rclone_paths(output, ("Copied", "Unchanged skipping"))
-            confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
-
             if result.returncode != 0:
-                error_msg = self._rclone_error_message(output)
-                confirmed_paths = self._parse_rclone_paths(
-                    output,
-                    ("Copied", "Unchanged skipping"),
-                )
-                confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
-                logger.error(f"rclone copy failed: {error_msg}")
-                return CopyResult(
-                    success=False,
-                    files_transferred=files_transferred,
-                    bytes_transferred=bytes_transferred,
-                    error=error_msg,
-                    archived_files=confirmed_files,
-                )
+                error = self._rclone_error_message(output)
+        except ArchiveCommandInterruptedError as interrupted:
+            output = self._combined_output(interrupted.stdout, interrupted.stderr)
+            error = str(interrupted)
+        except OSError as exception:
+            logger.error("rclone error: %s", exception)
+            return CopyResult(success=False, error=str(exception))
 
-            return CopyResult(
-                success=True,
-                files_transferred=files_transferred,
-                bytes_transferred=bytes_transferred,
-                archived_files=confirmed_files,
-            )
-
-        except subprocess.TimeoutExpired as e:
-            output = self._combined_output(e.stdout, e.stderr)
-            confirmed_paths = self._parse_rclone_paths(
-                output,
-                ("Copied", "Unchanged skipping"),
-            )
-            confirmed_files = self._select_archived_files(archived_files, confirmed_paths)
-            copied_files = self._select_archived_files(
-                archived_files, self._parse_rclone_paths(output, ("Copied",))
-            )
-            logger.error(f"rclone timeout copying {src}")
-            return CopyResult(
-                success=False,
-                files_transferred=len(copied_files),
-                bytes_transferred=sum(file.size for file in copied_files),
-                error="Timeout",
-                archived_files=confirmed_files,
-            )
-        except (OSError, FileNotFoundError) as e:
-            logger.error(f"rclone error: {e}")
-            return CopyResult(success=False, error=str(e))
+        for line in output.splitlines():
+            logger.debug("rclone: %s", line)
+        copied_files = self._select_archived_files(
+            archived_files, self._parse_rclone_paths(output, ("Copied",))
+        )
+        confirmed_files = self._select_archived_files(
+            archived_files, self._parse_rclone_paths(output, ("Copied", "Unchanged skipping"))
+        )
+        if error:
+            logger.error("rclone copy failed for %s: %s", src, error)
+        return CopyResult(
+            success=error is None,
+            files_transferred=len(copied_files),
+            bytes_transferred=sum(file.size for file in copied_files),
+            error=error,
+            archived_files=confirmed_files,
+        )
 
 
 class ArchiveManager:

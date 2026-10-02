@@ -55,14 +55,14 @@ def test_recent_clips_copied_into_date_folders(monkeypatch):
     calls = []
 
     def run(cmd, **kwargs):
-        calls.append((cmd, kwargs["input"]))
+        calls.append((cmd, kwargs["input_data"]))
         output = "\n".join(
             json.dumps({"object": name, "msg": "Copied (new)"})
-            for name in kwargs["input"].decode().splitlines()
+            for name in kwargs["input_data"].decode().splitlines()
         )
         return subprocess.CompletedProcess(cmd, 0, b"", output.encode())
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(RcloneBackend, "_run_command", staticmethod(run))
     result = RcloneBackend("drive", path="camera", fs=fs).copy_directory(src, "RecentClips")
     assert result.success
     assert [cmd[3] for cmd, _ in calls] == [
@@ -80,7 +80,7 @@ def test_invalid_recent_date_fails_before_upload():
     fs.mkdir(Path("/RecentClips"))
     fs.write_text(Path("/RecentClips/2026-02-30_bad.mp4"), "video")
     with (
-        patch("teslausb.archive.subprocess.run") as run,
+        patch("teslausb.archive.RcloneBackend._run_command") as run,
         pytest.raises(ValueError, match="date-partition"),
     ):
         RcloneBackend("drive", fs=fs).copy_directory(Path("/RecentClips"), "RecentClips")
@@ -93,7 +93,7 @@ def test_successful_dry_run_never_authorizes_deletion():
     fs.write_text(Path("/SavedClips/front.mp4"), "video")
     output = json.dumps({"object": "front.mp4", "msg": "Skipped copy as --dry-run is set"}).encode()
     with patch(
-        "teslausb.archive.subprocess.run",
+        "teslausb.archive.RcloneBackend._run_command",
         return_value=subprocess.CompletedProcess([], 0, b"", output),
     ):
         result = RcloneBackend("drive", fs=fs, flags=["--dry-run"]).copy_directory(
@@ -107,16 +107,16 @@ def test_large_subprocess_output_is_drained(monkeypatch):
     fs = MockFilesystem()
     fs.mkdir(Path("/SavedClips"))
     fs.write_text(Path("/SavedClips/front.mp4"), "video")
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
     script = (
         'import sys,json; print("x"*1048576); print("x"*1048576,file=sys.stderr); '
         'print(json.dumps({"object":"front.mp4","msg":"Copied (new)"}),file=sys.stderr)'
     )
 
-    def run(cmd, **kwargs):
-        return real_run([sys.executable, "-c", script], **kwargs)
+    def popen(cmd, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     result = RcloneBackend("drive", fs=fs, timeout=5).copy_directory(
         Path("/SavedClips"), "SavedClips"
     )
@@ -216,3 +216,110 @@ def test_reachability_drains_large_directory_listing(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     assert RcloneBackend("drive", fs=MockFilesystem()).is_reachable()
+
+
+def test_stop_reaps_actual_copy_child_and_preserves_confirmed_files(monkeypatch):
+    import time
+    from threading import Event, Timer
+
+    fs = MockFilesystem()
+    fs.mkdir(Path("/SavedClips"))
+    fs.write_text(Path("/SavedClips/front.mp4"), "video")
+    fs.write_text(Path("/SavedClips/back.mp4"), "pending")
+    stop = Event()
+    real_popen = subprocess.Popen
+    children = []
+    timers = []
+    script = (
+        "import json,signal,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        'print(json.dumps({"object":"front.mp4","msg":"Copied (new)"}),'
+        "file=sys.stderr,flush=True); "
+        'print("ready",flush=True); time.sleep(30)'
+    )
+
+    def popen(cmd, **kwargs):
+        child = real_popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        assert child.stdout.readline() == b"ready\n"
+        timer = Timer(0.2, stop.set)
+        timers.append(timer)
+        timer.start()
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    started = time.monotonic()
+    try:
+        result = RcloneBackend("drive", fs=fs, stop_event=stop).copy_directory(
+            Path("/SavedClips"), "SavedClips"
+        )
+    finally:
+        for timer in timers:
+            timer.join()
+    assert time.monotonic() - started < 3
+    assert not result.success
+    assert result.error == "Stopped"
+    assert result.archived_files == [ArchivedFile("front.mp4", 5, 0)]
+    assert result.files_transferred == 1
+    assert children[0].returncode is not None
+
+
+def test_timeout_reaps_actual_copy_child_and_preserves_output(monkeypatch):
+    fs = MockFilesystem()
+    fs.mkdir(Path("/SavedClips"))
+    fs.write_text(Path("/SavedClips/front.mp4"), "video")
+    real_popen = subprocess.Popen
+    children = []
+    script = (
+        "import json,sys,time; "
+        'print(json.dumps({"object":"front.mp4","msg":"Copied (new)"}),'
+        "file=sys.stderr,flush=True); time.sleep(30)"
+    )
+
+    def popen(cmd, **kwargs):
+        child = real_popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    result = RcloneBackend("drive", fs=fs, timeout=1).copy_directory(
+        Path("/SavedClips"), "SavedClips"
+    )
+    assert not result.success
+    assert result.error == "Timeout"
+    assert result.archived_files == [ArchivedFile("front.mp4", 5, 0)]
+    assert children[0].returncode is not None
+
+
+def test_stopped_copy_never_starts_child():
+    from threading import Event
+
+    fs = MockFilesystem()
+    fs.mkdir(Path("/SavedClips"))
+    fs.write_text(Path("/SavedClips/front.mp4"), "video")
+    stop = Event()
+    stop.set()
+    with patch("teslausb.archive.subprocess.Popen") as popen:
+        result = RcloneBackend("drive", fs=fs, stop_event=stop).copy_directory(
+            Path("/SavedClips"), "SavedClips"
+        )
+    popen.assert_not_called()
+    assert not result.success
+    assert result.error == "Stopped"
+    assert result.archived_files == []
+
+
+def test_command_retries_preserve_unsent_input():
+    backend = RcloneBackend("drive", fs=MockFilesystem())
+    payload = b"clip-name\n" * 200_000
+    result = backend._run_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time; time.sleep(0.3); print(len(sys.stdin.buffer.read()))",
+        ],
+        timeout=5,
+        input_data=payload,
+    )
+    assert result.returncode == 0
+    assert int(result.stdout) == len(payload)
