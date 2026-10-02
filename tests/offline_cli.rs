@@ -254,7 +254,19 @@ fn offline_archive_snapshots_and_clean_with_fake_rclone() {
     );
     assert_success(&archive);
     assert!(stderr(&archive).contains("fake rclone startup diagnostic"));
-    assert!(stderr(&archive).contains("archive complete"));
+    for expected in [
+        "SavedClips: transferred 1 files (11 B)",
+        "SentryClips: transferred 1 files (11 B)",
+        "TrackMode: transferred 1 files (11 B)",
+        "Photobooth: transferred 1 files (5 B)",
+        "archive complete: 4 files transferred, 38 B",
+    ] {
+        assert!(
+            stderr(&archive).contains(expected),
+            "{}",
+            describe(&archive)
+        );
+    }
     assert!(stderr(&archive).contains("clean up complete"));
 
     assert_eq!(
@@ -310,6 +322,11 @@ fn offline_archive_failure_returns_nonzero_without_privileged_tools() {
         assert!(!archive.status.success(), "{}", describe(&archive));
         assert!(stderr(&archive).contains("warning: archive finished with issues"));
         assert!(
+            stderr(&archive).contains("SavedClips: failed after transferring 0 files (0 B)"),
+            "{}",
+            describe(&archive)
+        );
+        assert!(
             stderr(&archive).contains("injected rclone failure for fake:TeslaArchive/SavedClips"),
             "{}",
             describe(&archive)
@@ -340,6 +357,7 @@ fn offline_run_loop_archives_updates_monitors_and_stops_on_sigterm() {
             ("TESLAUSB_THERMAL_PATH", thermal_path_s.as_str()),
             ("TESLAUSB_PROC_PATH", proc_path_s.as_str()),
             ("TESLAUSB_IDLE_TIMEOUT_SECS", "1"),
+            ("TESLAUSB_FAKE_CHECK_CLEANUP_LED", "1"),
         ],
     );
 
@@ -372,6 +390,7 @@ fn offline_run_loop_archives_updates_monitors_and_stops_on_sigterm() {
     assert!(stderr.contains("temperature warning: 85.0 C"), "{stderr}");
     assert!(stderr.contains("temperature caution: 85.0 C"), "{stderr}");
     assert!(stderr.contains("archive complete"), "{stderr}");
+    assert!(harness.command_log().contains("cleanup-led\theartbeat"));
 
     assert_eq!(
         fs::read_to_string(led_path.join("trigger")).unwrap(),
@@ -657,6 +676,62 @@ fn offline_startup_check_rejects_old_rclone_before_archive() {
 }
 
 #[test]
+fn offline_invalid_camera_image_blocks_mutations_and_reports_status() {
+    for condition in ["missing", "empty", "directory"] {
+        let harness = Harness::new("none");
+        let config = harness.config_arg();
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+        let image = harness.backingfiles.join("cam_disk.bin");
+        fs::remove_file(&image).unwrap();
+        let expected = match condition {
+            "empty" => {
+                fs::write(&image, b"").unwrap();
+                "camera disk is empty"
+            }
+            "directory" => {
+                fs::create_dir(&image).unwrap();
+                "camera disk is a directory"
+            }
+            _ => "camera disk not found",
+        };
+        let incomplete = harness.backingfiles.join("snapshots/snap-000123");
+        write_file(incomplete.join("snap.bin"), "preserve incomplete snapshot");
+        fs::write(harness.state.join("commands.log"), "").unwrap();
+
+        for command in ["run", "archive", "clean"] {
+            let output = harness.run(&["--config", &config, command]);
+            assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+            assert!(stderr(&output).contains(expected), "{}", describe(&output));
+            assert!(incomplete.join("snap.bin").exists());
+        }
+        assert!(!harness.command_log().contains("cp\t--reflink=always"));
+
+        let status = harness.run(&["--config", &config, "status", "--json"]);
+        assert_success(&status);
+        let data: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert!(data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning.as_str().unwrap().contains(expected) }));
+        assert!(incomplete.join("snap.bin").exists());
+    }
+}
+
+#[test]
+fn offline_service_status_preserves_systemctl_exit_code() {
+    let harness = Harness::new("none");
+    for code in ["0", "3", "4"] {
+        let output = harness.run_with_env(
+            &["service", "status"],
+            &[("TESLAUSB_FAKE_SYSTEMCTL_STATUS_EXIT", code)],
+        );
+        assert_eq!(output.status.code(), Some(code.parse().unwrap()));
+        assert!(stdout(&output).contains("teslausb.service fake active"));
+    }
+}
+
+#[test]
 fn offline_service_install_status_and_uninstall() {
     let harness = Harness::new("none");
 
@@ -846,6 +921,14 @@ case "$tool" in
         exit 0
         ;;
     fsck)
+        if [ "${1:-}" = "-p" ] && [ "${TESLAUSB_FAKE_CHECK_CLEANUP_LED:-}" = "1" ]; then
+            trigger=$(cat "${TESLAUSB_LED_PATH:?}/trigger")
+            if [ "$trigger" != "heartbeat" ]; then
+                printf 'expected cleanup heartbeat before fsck, got %s\n' "$trigger" >&2
+                exit 4
+            fi
+            printf 'cleanup-led\theartbeat\n' >> "$log"
+        fi
         if [ "${1:-}" = "-n" ]; then exit "${TESLAUSB_FAKE_FSCK_VERIFY_EXIT:-0}"; fi
         exit "${TESLAUSB_FAKE_FSCK_EXIT:-0}"
         ;;
@@ -862,7 +945,7 @@ case "$tool" in
             path=$(last_arg "$@")
         fi
         mkdir -p "$(dirname "$path")"
-        : > "$path"
+        printf 'fake disk image\n' > "$path"
         exit 0
         ;;
     losetup)
@@ -1009,6 +1092,7 @@ case "$tool" in
     systemctl)
         if [ "${1:-}" = "status" ]; then
             printf 'teslausb.service fake active\n'
+            exit "${TESLAUSB_FAKE_SYSTEMCTL_STATUS_EXIT:-0}"
         fi
         exit 0
         ;;

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::archive::ArchiveManager;
+use crate::archive::{format_size, ArchiveManager};
 use crate::config::RuntimeConfig;
 use crate::error::Result;
 use crate::filesystem::FileSystem;
@@ -156,12 +156,15 @@ impl<F: FileSystem> Coordinator<F> {
         let result = self.archive_manager.archive_new_snapshot()?;
         if result.success() {
             eprintln!(
-                "archive complete: {} files, {} bytes",
-                result.files_transferred, result.bytes_transferred
+                "archive complete: {} files transferred, {}",
+                result.files_transferred,
+                format_size(result.bytes_transferred)
             );
         } else {
             eprintln!(
-                "warning: archive finished with issues: {}",
+                "warning: archive finished with issues: {} files transferred, {}: {}",
+                result.files_transferred,
+                format_size(result.bytes_transferred),
                 result
                     .error
                     .clone()
@@ -197,6 +200,7 @@ impl<F: FileSystem> Coordinator<F> {
     }
 
     fn delete_archived_files(&self, result: &crate::archive::ArchiveResult) -> Result<()> {
+        self.set_led(LedPattern::Heartbeat)?;
         let guard = if let Some(gadget) = &self.gadget {
             Some(GadgetDisableGuard::disable_if_needed(gadget.clone())?)
         } else {

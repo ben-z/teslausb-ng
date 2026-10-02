@@ -79,6 +79,7 @@ mount snapshot read-only
 copy enabled clip directories with rclone JSON confirmations
 select complete, stable Saved/Sentry events for cleanup
 wait for USB writes to become idle again; skip cleanup on timeout
+set status LED to heartbeat while cleaning up
 disable USB gadget if it is enabled
 repair and independently verify the cam filesystem
 mount cam disk read-write

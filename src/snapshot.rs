@@ -1,10 +1,32 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
+
+pub fn validate_camera_image(fs: &impl FileSystem, path: &Path) -> Result<()> {
+    if !fs.exists(path) {
+        return Err(Error::new(format!(
+            "camera disk not found: {}; run 'teslausb init'",
+            path.display()
+        )));
+    }
+    if fs.is_dir(path) {
+        return Err(Error::new(format!(
+            "camera disk is a directory: {}",
+            path.display()
+        )));
+    }
+    if fs.file_size(path)? == 0 {
+        return Err(Error::new(format!(
+            "camera disk is empty: {}; run 'teslausb init'",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotState {
@@ -188,6 +210,7 @@ impl<F: FileSystem> SnapshotManager<F> {
 
     pub fn create_snapshot(&self) -> Result<Snapshot> {
         let _catalog_lock = self.lock_catalog()?;
+        validate_camera_image(&self.fs, &self.cam_disk_path)?;
         let mut inner = self.inner.lock().unwrap();
         self.load_snapshots(&mut inner, true)?;
         let snap_id = inner.next_id;
@@ -409,6 +432,30 @@ mod tests {
     }
 
     #[test]
+    fn invalid_camera_image_cannot_publish_or_recover_snapshots() {
+        for condition in ["missing", "empty", "directory"] {
+            let manager = manager();
+            manager.fs.remove_file(&manager.cam_disk_path).unwrap();
+            match condition {
+                "empty" => manager.fs.write_bytes(&manager.cam_disk_path, b""),
+                "directory" => manager.fs.create_dir_all(&manager.cam_disk_path).unwrap(),
+                _ => {}
+            }
+            let incomplete = manager.snapshots_path.join("snap-000000");
+            manager.fs.create_dir_all(&incomplete).unwrap();
+            manager
+                .fs
+                .write_bytes(incomplete.join("snap.bin"), b"recoverable");
+
+            let error = manager.create_snapshot().unwrap_err().to_string();
+            assert!(error.contains("camera disk"), "{condition}: {error}");
+            assert!(manager.fs.exists(&incomplete.join("snap.bin")));
+            assert!(!manager.fs.exists(&incomplete.join("snap.toc")));
+            assert!(!manager.fs.exists(&manager.snapshots_path.join(".next-id")));
+        }
+    }
+
+    #[test]
     fn snapshot_paths_are_stable() {
         let snapshot = Snapshot {
             id: 1,
@@ -509,10 +556,13 @@ mod tests {
     #[test]
     fn failed_reflink_does_not_publish_a_snapshot_or_reuse_its_id() {
         let manager = manager();
-        manager.fs.remove_file(&manager.cam_disk_path).unwrap();
-        assert!(manager.create_snapshot().is_err());
+        manager.fs.fail_next_reflink();
+        assert!(manager
+            .create_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("injected reflink failure"));
         assert!(manager.get_snapshots().unwrap().is_empty());
-        manager.fs.write_bytes(&manager.cam_disk_path, b"cam");
         assert_eq!(manager.create_snapshot().unwrap().id, 1);
     }
 

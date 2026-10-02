@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
+
+static MOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct LoopDevice {
@@ -200,8 +203,8 @@ pub fn fsck_image(image_path: &Path) -> Result<()> {
 
 pub fn mount_image(image_path: &Path, readonly: bool) -> Result<MountedImage> {
     let loop_device = setup_loop_device(image_path)?;
-    let mount_point = temp_mount_point();
-    fs::create_dir_all(&mount_point)?;
+    let mount_point = temp_mount_point(SystemTime::now())?;
+    fs::create_dir(&mount_point)?;
     let opts = if readonly { "ro" } else { "rw" };
     let output = CommandRunner.run(
         "mount",
@@ -238,12 +241,20 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     path.exists()
 }
 
-fn temp_mount_point() -> PathBuf {
-    let suffix = SystemTime::now()
+fn temp_mount_point(timestamp: SystemTime) -> Result<PathBuf> {
+    let suffix = timestamp
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .map_err(|error| Error::new(format!("invalid temporary mount timestamp: {error}")))?
         .as_nanos();
-    std::env::temp_dir().join(format!("teslausb-mount-{}-{}", std::process::id(), suffix))
+    let counter = MOUNT_COUNTER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| Error::new("temporary mount identifiers exhausted"))?;
+    Ok(std::env::temp_dir().join(format!(
+        "teslausb-mount-{}-{suffix}-{counter}",
+        std::process::id()
+    )))
 }
 
 #[cfg(test)]
@@ -280,9 +291,29 @@ mod tests {
 
     #[test]
     fn temp_mount_points_are_under_temp_and_unique() {
-        let first = temp_mount_point();
-        let second = temp_mount_point();
-        assert!(first.starts_with(std::env::temp_dir()));
-        assert_ne!(first, second);
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1);
+        let mut paths = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let path = temp_mount_point(timestamp).unwrap();
+            assert_eq!(path.parent().unwrap(), std::env::temp_dir());
+            assert!(paths.insert(path));
+        }
+        let workers = (0..8)
+            .map(|_| {
+                thread::spawn(move || {
+                    (0..256)
+                        .map(|_| temp_mount_point(timestamp).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            for path in worker.join().unwrap() {
+                assert_eq!(path.parent().unwrap(), std::env::temp_dir());
+                assert!(paths.insert(path));
+            }
+        }
+        assert_eq!(paths.len(), 2304);
+        assert!(temp_mount_point(UNIX_EPOCH - Duration::from_secs(1)).is_err());
     }
 }

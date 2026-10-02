@@ -10,6 +10,22 @@ use crate::filesystem::FileSystem;
 use crate::mount::mount_image;
 use crate::snapshot::{SnapshotHandle, SnapshotManager};
 
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut unit = 0;
+    let mut divisor = 1_u64;
+    while bytes / divisor >= 1024 && unit + 1 < UNITS.len() {
+        divisor *= 1024;
+        unit += 1;
+    }
+    let tenths = (u128::from(bytes) * 10 + u128::from(divisor) / 2) / u128::from(divisor);
+    if tenths.is_multiple_of(10) {
+        format!("{} {}", tenths / 10, UNITS[unit])
+    } else {
+        format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveState {
     Pending,
@@ -607,12 +623,24 @@ impl<F: FileSystem> ArchiveManager<F> {
             let copy = self.backend.copy_directory(&src, &dst_name);
             result.files_transferred += copy.files_transferred;
             result.bytes_transferred += copy.bytes_transferred;
-            if !copy.success {
-                errors.push(format!(
-                    "{}: {}",
-                    dst_name,
-                    copy.error.unwrap_or_else(|| "unknown error".to_string())
-                ));
+            if copy.success {
+                eprintln!(
+                    "{dst_name}: transferred {} files ({})",
+                    copy.files_transferred,
+                    format_size(copy.bytes_transferred)
+                );
+            } else {
+                let error = copy.error.ok_or_else(|| {
+                    Error::new(format!(
+                        "{dst_name}: archive backend failed without error details"
+                    ))
+                })?;
+                eprintln!(
+                    "warning: {dst_name}: failed after transferring {} files ({}): {error}",
+                    copy.files_transferred,
+                    format_size(copy.bytes_transferred)
+                );
+                errors.push(format!("{dst_name}: {error}"));
             }
             let cleanup_files = self.cleanup_candidates(&src, &dst_name, copy.archived_files)?;
             if !cleanup_files.is_empty() {
@@ -1011,6 +1039,26 @@ mod tests {
             }],
         ));
         result
+    }
+
+    #[test]
+    fn format_size_uses_iec_units_and_handles_boundaries() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (1, "1 B"),
+            (1023, "1023 B"),
+            (1024, "1 KiB"),
+            (1536, "1.5 KiB"),
+            (1024 * 1024 - 1, "1024 KiB"),
+            (1024 * 1024, "1 MiB"),
+            (1 << 30, "1 GiB"),
+            (1 << 40, "1 TiB"),
+            (1 << 50, "1 PiB"),
+            (1 << 60, "1 EiB"),
+            (u64::MAX, "16 EiB"),
+        ] {
+            assert_eq!(format_size(bytes), expected, "{bytes} bytes");
+        }
     }
 
     #[test]
