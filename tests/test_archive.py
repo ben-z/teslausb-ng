@@ -1,5 +1,6 @@
 """Tests for archive management."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,11 @@ from teslausb.archive import (
 )
 from teslausb.filesystem import MockFilesystem
 from teslausb.snapshot import SnapshotManager
+
+
+def rclone_json_output(*records: dict[str, object]) -> bytes:
+    """Build line-delimited rclone JSON log output."""
+    return ("\n".join(json.dumps(record) for record in records) + "\n").encode()
 
 
 class PartialFailureBackend(MockArchiveBackend):
@@ -454,13 +460,26 @@ class TestRcloneBackend:
         fs.write_text(Path("/test/SavedClips/event1/left.mp4"), "x" * 3000)
 
         def run_success(*args, **kwargs):
+            assert "--use-json-log" in args[0]
             return subprocess.CompletedProcess(
                 args=args[0],
                 returncode=0,
-                stderr=(
-                    b"<6>INFO  : event1/front.mp4: Copied (new)\n"
-                    b"<6>INFO  : event1/back.mp4: Unchanged skipping\n"
-                    b"<6>INFO  : event1/left.mp4: Copied (new)\n"
+                stderr=rclone_json_output(
+                    {
+                        "level": "info",
+                        "msg": "Copied (new)",
+                        "object": "event1/front.mp4",
+                    },
+                    {
+                        "level": "info",
+                        "msg": "Unchanged skipping",
+                        "object": "event1/back.mp4",
+                    },
+                    {
+                        "level": "info",
+                        "msg": "Copied (server-side copy)",
+                        "object": "event1/left.mp4",
+                    },
                 ),
             )
 
@@ -474,6 +493,51 @@ class TestRcloneBackend:
         assert result.bytes_transferred == 4000
         assert len(result.archived_files) == 3
 
+    def test_copy_directory_failure_returns_confirmed_archived_files(self, monkeypatch):
+        """Test failed copies return files rclone confirmed as copied or unchanged."""
+        fs = MockFilesystem()
+        fs.mkdir(Path("/test/RecentClips/event1"), parents=True)
+        fs.write_text(Path("/test/RecentClips/event1/front.mp4"), "x" * 1000)
+        fs.write_text(Path("/test/RecentClips/event1/back.mp4"), "x" * 2000)
+        fs.write_text(Path("/test/RecentClips/event1/left.mp4"), "x" * 3000)
+
+        def run_failure(*args, **kwargs):
+            assert "--use-json-log" in args[0]
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=1,
+                stderr=rclone_json_output(
+                    {
+                        "level": "info",
+                        "msg": "Copied (new)",
+                        "object": "event1/front.mp4",
+                    },
+                    {
+                        "level": "info",
+                        "msg": "Unchanged skipping",
+                        "object": "event1/back.mp4",
+                    },
+                    {
+                        "level": "error",
+                        "msg": "Failed to copy: network interrupted",
+                    },
+                ),
+            )
+
+        monkeypatch.setattr(subprocess, "run", run_failure)
+
+        backend = RcloneBackend(remote="gdrive", fs=fs)
+        result = backend.copy_directory(Path("/test/RecentClips"), "RecentClips")
+
+        assert not result.success
+        assert result.error == "Failed to copy: network interrupted"
+        assert result.files_transferred == 2
+        assert result.bytes_transferred == 3000
+        assert result.archived_files == [
+            ArchivedFile(relative_path="event1/back.mp4", size=2000),
+            ArchivedFile(relative_path="event1/front.mp4", size=1000),
+        ]
+
     def test_copy_directory_timeout_returns_confirmed_archived_files(self, monkeypatch):
         """Test timeout returns files rclone confirmed as copied or unchanged."""
         fs = MockFilesystem()
@@ -483,13 +547,26 @@ class TestRcloneBackend:
         fs.write_text(Path("/test/RecentClips/event1/left.mp4"), "x" * 3000)
 
         def timeout_run(*args, **kwargs):
+            assert "--use-json-log" in args[0]
             raise subprocess.TimeoutExpired(
                 cmd=args[0],
                 timeout=kwargs["timeout"],
-                stderr=(
-                    b"<6>INFO  : event1/front.mp4: Copied (new)\n"
-                    b"<6>INFO  : event1/back.mp4: Unchanged skipping\n"
-                    b"<6>INFO  : event1/right.mp4: Copied (new)\n"
+                stderr=rclone_json_output(
+                    {
+                        "level": "info",
+                        "msg": "Copied (new)",
+                        "object": "event1/front.mp4",
+                    },
+                    {
+                        "level": "info",
+                        "msg": "Unchanged skipping",
+                        "object": "event1/back.mp4",
+                    },
+                    {
+                        "level": "info",
+                        "msg": "Copied (new)",
+                        "object": "event1/right.mp4",
+                    },
                 ),
             )
 
