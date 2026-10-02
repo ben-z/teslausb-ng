@@ -287,7 +287,11 @@ impl<F: FileSystem> RcloneBackend<F> {
         };
         let mut errors = Vec::new();
         for (date, files) in batches {
-            let list = ArchiveFileList::new(self.fs.clone(), &files)?;
+            let content = files
+                .iter()
+                .map(|file| format!("{}\n", file.relative_path.display()))
+                .collect::<String>();
+            let list = ArchiveTempFile::new(self.fs.clone(), "files", &content)?;
             let batch = self.copy_batch(
                 src,
                 &format!("RecentClips/{date}"),
@@ -315,6 +319,7 @@ impl<F: FileSystem> RcloneBackend<F> {
         files: &[ArchivedFile],
         file_list: Option<&Path>,
     ) -> Result<CopyResult> {
+        let log_file = ArchiveTempFile::new(self.fs.clone(), "log", "")?;
         let mut args = vec![
             "copy".to_string(),
             src.display().to_string(),
@@ -324,6 +329,10 @@ impl<F: FileSystem> RcloneBackend<F> {
         args.extend(
             ["--use-json-log", "--log-level", "DEBUG", "--no-traverse"].map(str::to_string),
         );
+        args.extend([
+            "--log-file".to_string(),
+            log_file.path.display().to_string(),
+        ]);
         if let Some(path) = file_list {
             args.extend(["--files-from-raw".to_string(), path.display().to_string()]);
         }
@@ -332,13 +341,35 @@ impl<F: FileSystem> RcloneBackend<F> {
             args.iter().map(String::as_str),
             Some(self.timeout),
         )?;
-        let log = combined_command_output(&output);
-        let confirmed = parse_rclone_paths(&log, &["Copied (", "Unchanged skipping"])?;
-        let copied = select_archived_files(files, &parse_rclone_paths(&log, &["Copied ("])?);
+        let diagnostics = combined_command_output(&output);
+        if !diagnostics.trim().is_empty() {
+            eprintln!(
+                "rclone diagnostics for {destination}:\n{}",
+                diagnostics.trim_end()
+            );
+        }
+        let log = self.fs.read_text(&log_file.path)?;
+        let records = parse_rclone_records(&log)?;
+        let confirmed = rclone_paths(&records, &["Copied (", "Unchanged skipping"]);
+        let copied = select_archived_files(files, &rclone_paths(&records, &["Copied ("]));
         let error = if output.timed_out {
             Some(format!("rclone copy to {destination} timed out"))
         } else if !output.success() {
-            Some(output.last_error_line())
+            let mut detail = records
+                .iter()
+                .filter(|record| {
+                    matches!(record["level"].as_str(), Some("error" | "fatal" | "panic"))
+                })
+                .filter_map(|record| record["msg"].as_str())
+                .collect::<Vec<_>>();
+            if !diagnostics.trim().is_empty() {
+                detail.push(diagnostics.trim());
+            }
+            Some(format!(
+                "rclone copy to {destination} failed (exit {:?}): {}",
+                output.code,
+                detail.join("; ")
+            ))
         } else {
             None
         };
@@ -429,33 +460,29 @@ fn recent_archive_directory(path: &Path) -> Result<String> {
     Ok(date.to_string())
 }
 
-struct ArchiveFileList<F: FileSystem> {
+struct ArchiveTempFile<F: FileSystem> {
     fs: F,
     path: PathBuf,
 }
 
-impl<F: FileSystem> ArchiveFileList<F> {
-    fn new(fs: F, files: &[ArchivedFile]) -> Result<Self> {
+impl<F: FileSystem> ArchiveTempFile<F> {
+    fn new(fs: F, purpose: &str, content: &str) -> Result<Self> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| Error::new(error.to_string()))?
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("teslausb-files-{}-{nonce}", std::process::id()));
-        let content = files
-            .iter()
-            .map(|file| format!("{}\n", file.relative_path.display()))
-            .collect::<String>();
-        fs.write_text_atomic(&path, &content)?;
+            std::env::temp_dir().join(format!("teslausb-{purpose}-{}-{nonce}", std::process::id()));
+        fs.create_private_file(&path, content)?;
         Ok(Self { fs, path })
     }
 }
 
-impl<F: FileSystem> Drop for ArchiveFileList<F> {
+impl<F: FileSystem> Drop for ArchiveTempFile<F> {
     fn drop(&mut self) {
         if let Err(error) = self.fs.remove_file(&self.path) {
             eprintln!(
-                "error: failed to remove archive file list {}: {}",
+                "error: failed to remove archive temporary file {}: {}",
                 self.path.display(),
                 error
             );
@@ -871,14 +898,23 @@ fn combined_command_output(output: &crate::command::CommandOutput) -> String {
         .join("\n")
 }
 
-fn parse_rclone_paths(
-    output: &str,
+fn parse_rclone_records(output: &str) -> Result<Vec<serde_json::Value>> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|error| Error::new(format!("invalid rclone JSON log record: {error}")))
+        })
+        .collect()
+}
+
+fn rclone_paths(
+    records: &[serde_json::Value],
     markers: &[&str],
-) -> Result<std::collections::HashSet<PathBuf>> {
+) -> std::collections::HashSet<PathBuf> {
     let mut paths = std::collections::HashSet::new();
-    for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        let record: serde_json::Value = serde_json::from_str(line)
-            .map_err(|error| Error::new(format!("invalid rclone JSON log record: {error}")))?;
+    for record in records {
         let (Some(object), Some(message)) = (record["object"].as_str(), record["msg"].as_str())
         else {
             continue;
@@ -894,7 +930,7 @@ fn parse_rclone_paths(
             }
         }
     }
-    Ok(paths)
+    paths
 }
 
 fn select_archived_files(
@@ -1210,6 +1246,28 @@ mod tests {
     }
 
     #[test]
+    fn temporary_archive_files_are_removed_on_drop() {
+        let fs = MockFileSystem::new();
+        let path;
+        {
+            let log = ArchiveTempFile::new(fs.clone(), "log", "record").unwrap();
+            path = log.path.clone();
+            assert_eq!(fs.read_text(&path).unwrap(), "record");
+        }
+        assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn structured_rclone_log_rejects_plaintext_and_truncated_records() {
+        for output in [
+            "2026/10/02 10:17:14 DEBUG : cache directory warning",
+            "{\"object\":\"event/front.mp4\",\"msg\":\"Copied (new)\"}\n{\"msg\":",
+        ] {
+            assert!(parse_rclone_records(output).is_err());
+        }
+    }
+
+    #[test]
     fn rclone_output_parsing_selects_confirmed_files() {
         let output = r#"{"object":"event1/front.mp4","msg":"Copied (new)"}
 {"object":"event1/back.mp4","msg":"Unchanged skipping"}
@@ -1217,7 +1275,8 @@ mod tests {
 {"object":"/outside.mp4","msg":"Copied (new)"}
 {"msg":"summary"}
 "#;
-        let paths = parse_rclone_paths(output, &["Copied (", "Unchanged skipping"]).unwrap();
+        let records = parse_rclone_records(output).unwrap();
+        let paths = rclone_paths(&records, &["Copied (", "Unchanged skipping"]);
         let files = vec![
             ArchivedFile {
                 relative_path: PathBuf::from("event1/front.mp4"),
