@@ -10,6 +10,7 @@ teslausb-ng is a Rust implementation of TeslaUSB-style dashcam archiving. See
 - Keep modules focused on one purpose
 - Use `Result<T>` with contextual errors instead of panics in production paths
 - Use RAII guards for resources that must be cleaned up
+- Use 1024-based units (KiB/MiB/GiB) for sizes, parsing, and formatting
 - Tests that touch snapshot/archive behavior should use `MockFileSystem`, not the
   real filesystem
 
