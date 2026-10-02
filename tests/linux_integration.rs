@@ -37,7 +37,7 @@ impl Harness {
 
         let mutable_mount = MountGuard::xfs_loop(root.join("mutable-volume.img"), &mutable, "3G");
         let mut config_content = format!(
-            "MUTABLE_PATH={}\nBACKINGFILES_PATH={}\nARCHIVE_SYSTEM={archive_system}\n",
+            "MUTABLE_PATH={}\nBACKINGFILES_PATH={}\nARCHIVE_SYSTEM={archive_system}\nEVENT_STABILITY_SECONDS=0\n",
             mutable.display(),
             backingfiles.display()
         );
@@ -217,6 +217,69 @@ fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
 
 #[test]
 #[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
+fn linux_archive_refuses_to_repair_an_already_mounted_camera_image() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let archive_root = harness.root.join("archive-mounted");
+    let fsck_marker = harness.root.join("unexpected-fsck");
+
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    let cam = PartitionMount::mount(
+        &harness.cam_disk(),
+        &harness.root.join("cam-still-mounted"),
+        "rw",
+    );
+    write_cam_fixture(cam.path());
+    assert_success(&run("sync", std::iter::empty::<&str>()));
+
+    let fsck = harness.fake_bin.join("fsck");
+    fs::write(
+        &fsck,
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+    -p|-n)
+        : > "$TESLAUSB_FSCK_MARKER"
+        printf 'fsck must not run while the camera image is mounted\n' >&2
+        exit 97
+        ;;
+esac
+exec /usr/sbin/fsck "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fsck, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let archive = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[
+            ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
+            ("TESLAUSB_FSCK_MARKER", &fsck_marker),
+        ],
+    );
+    assert!(!archive.status.success(), "{}", describe(&archive));
+    assert!(
+        stderr(&archive).contains("still mounted locally"),
+        "{}",
+        describe(&archive)
+    );
+    assert!(
+        !fsck_marker.exists(),
+        "fsck must be rejected before its process starts"
+    );
+    assert_archive_contains_fixture(&archive_root);
+    assert_success(&run(
+        "mountpoint",
+        [OsStr::new("-q"), cam.path().as_os_str()],
+    ));
+    assert_eq!(
+        fs::read_to_string(cam.path().join("TeslaCam/SavedClips/event/front.mp4")).unwrap(),
+        "saved-front"
+    );
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
 fn linux_failed_archive_cleans_files_confirmed_before_rclone_error() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -277,16 +340,42 @@ fn linux_run_loop_uses_real_mounts_and_stops_cleanly_on_sigterm() {
         write_cam_fixture(cam.path());
     }
 
+    let thermal_path = harness.root.join("thermal");
+    fs::write(&thermal_path, "45000").unwrap();
+    let led_path = harness.root.join("led");
+    fs::create_dir_all(&led_path).unwrap();
+    for (name, content) in [
+        ("trigger", "[none] timer heartbeat"),
+        ("brightness", "0"),
+        ("delay_on", "0"),
+        ("delay_off", "0"),
+        ("invert", "0"),
+    ] {
+        fs::write(led_path.join(name), content).unwrap();
+    }
     let mut child = harness.spawn_with_env(
         &["--config", &config, "run"],
-        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+        &[
+            ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
+            ("TESLAUSB_THERMAL_PATH", &thermal_path),
+            ("TESLAUSB_LED_PATH", &led_path),
+        ],
     );
 
     if !wait_until(
         || {
             archive_root
-                .join("fake:TeslaArchive/SavedClips/event/front.mp4")
+                .join("fake:TeslaArchive/Photobooth/photo.jpg")
                 .exists()
+                && fs::read_dir(harness.backingfiles.join("snapshots"))
+                    .unwrap()
+                    .all(|entry| {
+                        !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("snap-")
+                    })
         },
         Duration::from_secs(30),
     ) {
@@ -313,7 +402,7 @@ fn linux_run_loop_uses_real_mounts_and_stops_cleanly_on_sigterm() {
 
 #[test]
 #[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
-fn linux_incomplete_snapshot_directory_is_cleaned_on_load() {
+fn linux_snapshot_inspection_preserves_incomplete_data_until_recovery() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
 
@@ -328,8 +417,13 @@ fn linux_incomplete_snapshot_directory_is_cleaned_on_load() {
     assert_success(&snapshots);
     assert_eq!(stdout(&snapshots).trim(), "[]");
     assert!(
+        incomplete.exists(),
+        "snapshot inspection must preserve incomplete data"
+    );
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert!(
         !incomplete.exists(),
-        "snapshot load should remove directories without snap.toc"
+        "archive start should recover incomplete snapshots"
     );
 }
 
@@ -619,14 +713,15 @@ case "${1:-}" in
         /bin/cp -R "$src"/. "$archive/$dst"/
         (cd "$src" && find . -type f) | while IFS= read -r file; do
             file=${file#./}
-            printf '%s: Copied (new)\n' "$file" >&2
+            relative="${file#"$src"/}"
+                printf '{"object":"%s","msg":"Copied (new)"}\n' "$relative" >&2
         done
         fail_after="${TESLAUSB_FAKE_RCLONE_FAIL_AFTER_COPY:-}"
         if [ -n "$fail_after" ]; then
             fail_name=$(basename "$fail_after")
             case "$dst" in
                 *"$fail_name"*)
-                    printf 'injected rclone failure after copying %s\n' "$dst" >&2
+                    printf '{"msg":"injected rclone failure after copying %s","level":"error"}\n' "$dst" >&2
                     exit 9
                     ;;
             esac
