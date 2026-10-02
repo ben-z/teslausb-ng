@@ -12,7 +12,7 @@ use crate::dependencies::{
     check_dependencies, dependency_detail, ensure_dependencies, DependencySet,
 };
 use crate::error::{Error, Result};
-use crate::filesystem::RealFileSystem;
+use crate::filesystem::{FileSystem, RealFileSystem};
 use crate::gadget::{LunConfig, UsbGadget};
 use crate::idle::ProcIdleDetector;
 use crate::led::SysfsLedController;
@@ -40,6 +40,7 @@ struct GlobalArgs {
 
 fn run(argv: Vec<String>) -> Result<i32> {
     let parsed = parse_global_args(argv)?;
+    validate_args(&parsed)?;
     match parsed.command.as_str() {
         "init" => cmd_init(&parsed),
         "deinit" => cmd_deinit(&parsed),
@@ -79,7 +80,9 @@ fn parse_global_args(argv: Vec<String>) -> Result<GlobalArgs> {
                 config_path = Some(PathBuf::from(value));
             }
             "-l" | "--log-level" => {
-                let _ = iter.next();
+                return Err(Error::new(
+                    "--log-level is unsupported; archive and failure details are always logged",
+                ));
             }
             "--version" | "-V" | "--help" | "-h" => {
                 rest.push(arg);
@@ -105,6 +108,44 @@ fn parse_global_args(argv: Vec<String>) -> Result<GlobalArgs> {
     })
 }
 
+fn validate_args(args: &GlobalArgs) -> Result<()> {
+    let (flags, values, options): (&[&str], &[&str], &[String]) = match args.command.as_str() {
+        "init" => (&[], &["--reserve"], &args.args),
+        "deinit" => (&["--yes", "-y"], &[], &args.args),
+        "status" | "snapshots" => (&["--json"], &[], &args.args),
+        "clean" => (&["--dry-run"], &[], &args.args),
+        "doctor" => (&["--startup"], &[], &args.args),
+        "gadget" | "service" => {
+            let options = args.args.get(1..).unwrap_or(&[]);
+            match (args.command.as_str(), args.args.first().map(String::as_str)) {
+                ("gadget", Some("status")) => (&["--json"], &[], options),
+                ("service", Some("install")) => (&["--force"], &[], options),
+                _ => (&[], &[], options),
+            }
+        }
+        _ => (&[], &[], &args.args),
+    };
+    let mut iter = options.iter();
+    while let Some(option) = iter.next() {
+        if values.contains(&option.as_str()) {
+            iter.next()
+                .ok_or_else(|| Error::new(format!("{option} requires a value")))?;
+        } else if !flags.contains(&option.as_str()) {
+            return Err(Error::new(format!(
+                "unexpected argument for {}: {option}",
+                args.command
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn archive_lock(config: &Config) -> Result<<RealFileSystem as FileSystem>::Lock> {
+    RealFileSystem
+        .try_lock(&config.backingfiles_path.join("archive.lock"))?
+        .ok_or_else(|| Error::new("another TeslaUSB process is using the camera disk"))
+}
+
 fn config(args: &GlobalArgs) -> Result<Config> {
     load_config(args.config_path.as_deref())
 }
@@ -118,6 +159,7 @@ fn create_components(
     let fs = RealFileSystem;
     let snapshot_manager =
         SnapshotManager::new(fs, config.cam_disk_path(), config.snapshots_path())?;
+    snapshot_manager.recover_incomplete()?;
     let backend = ArchiveBackend::from_config(&config.archive, fs);
     let archive_manager = ArchiveManager::new(
         fs,
@@ -236,24 +278,25 @@ fn cmd_run(args: &GlobalArgs) -> Result<i32> {
     let config = config(args)?;
     ensure_dependencies(&config, DependencySet::Runtime)?;
     ensure_mounted(&config)?;
+    let _archive_lock = archive_lock(&config)?;
     for warning in config.warnings() {
         eprintln!("warning: {}", warning);
     }
     let (snapshot_manager, archive_manager) = create_components(&config)?;
-    let temperature_monitor = SysfsTemperatureMonitor::default_sysfs(TemperatureConfig {
-        warning_threshold: Some(80_000),
-        caution_threshold: Some(70_000),
-        poll_interval: Duration::from_secs(60),
-    });
-    let _temperature_guard = temperature_monitor.start();
+    let temperature_monitor = SysfsTemperatureMonitor::default_sysfs(TemperatureConfig::default());
+    let temperature_guard = temperature_monitor.start()?;
     let mut coordinator = Coordinator::new(
         snapshot_manager,
         archive_manager,
         Some(UsbGadget::default()),
+        &config.runtime,
     )
-    .with_led(SysfsLedController::auto_detect())
-    .with_idle_detector(ProcIdleDetector::default());
-    coordinator.run()?;
+    .with_led(SysfsLedController::auto_detect()?)
+    .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
+    let run_result = coordinator.run();
+    let temperature_result = temperature_guard.stop();
+    run_result?;
+    temperature_result?;
     Ok(0)
 }
 
@@ -261,13 +304,15 @@ fn cmd_archive(args: &GlobalArgs) -> Result<i32> {
     let config = config(args)?;
     ensure_dependencies(&config, DependencySet::Runtime)?;
     ensure_mounted(&config)?;
+    let _archive_lock = archive_lock(&config)?;
     let (snapshot_manager, archive_manager) = create_components(&config)?;
     let mut coordinator = Coordinator::new(
         snapshot_manager,
         archive_manager,
         Some(UsbGadget::default()),
+        &config.runtime,
     )
-    .with_idle_detector(ProcIdleDetector::default());
+    .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
     Ok(if coordinator.run_once()? { 0 } else { 1 })
 }
 
@@ -284,8 +329,7 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
             config.cam_disk_path(),
             config.snapshots_path(),
         )
-        .map(|manager| manager.get_snapshots())
-        .unwrap_or_default()
+        .and_then(|manager| manager.get_snapshots())?
     } else {
         Vec::new()
     };
@@ -369,7 +413,7 @@ fn cmd_snapshots(args: &GlobalArgs) -> Result<i32> {
         config.cam_disk_path(),
         config.snapshots_path(),
     )?;
-    let snapshots = manager.get_snapshots();
+    let snapshots = manager.get_snapshots()?;
     if json {
         println!(
             "[{}]",
@@ -424,7 +468,7 @@ fn cmd_clean(args: &GlobalArgs) -> Result<i32> {
         config.cam_disk_path(),
         config.snapshots_path(),
     )?;
-    let deletable = manager.get_deletable_snapshots();
+    let deletable = manager.get_deletable_snapshots()?;
     if deletable.is_empty() {
         println!("No deletable snapshots");
         return Ok(0);
@@ -456,6 +500,7 @@ fn cmd_gadget(args: &GlobalArgs) -> Result<i32> {
     match command.as_str() {
         "on" => {
             let config = config(args)?;
+            let _archive_lock = archive_lock(&config)?;
             ensure_dependencies(&config, DependencySet::Gadget)?;
             gadget.initialize(&[(0, LunConfig::new(config.cam_disk_path()))])?;
             gadget.enable()?;
@@ -463,13 +508,15 @@ fn cmd_gadget(args: &GlobalArgs) -> Result<i32> {
             Ok(0)
         }
         "off" => {
+            let config = config(args)?;
+            let _archive_lock = archive_lock(&config)?;
             gadget.remove()?;
             println!("Gadget disabled");
             Ok(0)
         }
         "status" => {
             if has_flag(&args.args, "--json") {
-                print!("{}", gadget.status_json());
+                println!("{}", gadget.status_json()?);
             } else {
                 println!("Gadget: {}", gadget.name());
                 println!(
@@ -478,7 +525,7 @@ fn cmd_gadget(args: &GlobalArgs) -> Result<i32> {
                 );
                 println!(
                     "  Enabled: {}",
-                    if gadget.is_enabled() { "Yes" } else { "No" }
+                    if gadget.is_enabled()? { "Yes" } else { "No" }
                 );
             }
             Ok(0)
@@ -497,7 +544,7 @@ fn cmd_service(args: &GlobalArgs) -> Result<i32> {
             let force = has_flag(&args.args, "--force");
             let config = config(args)?;
             ensure_dependencies(&config, DependencySet::Full)?;
-            install_service(force)?;
+            install_service(force, args.config_path.as_deref())?;
             Ok(0)
         }
         "uninstall" => {
@@ -600,7 +647,7 @@ fn create_backingfiles_image(path: &Path, size: u64) -> Result<()> {
     )?;
     CommandRunner.check(
         "mkfs.xfs",
-        ["-f", &path.display().to_string()],
+        ["-f", "-m", "reflink=1", &path.display().to_string()],
         Some(Duration::from_secs(300)),
     )?;
     Ok(())
@@ -745,7 +792,7 @@ fn systemd_service_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(SYSTEMD_SERVICE_PATH))
 }
 
-fn install_service(force: bool) -> Result<()> {
+fn install_service(force: bool, config_path: Option<&Path>) -> Result<()> {
     let path = systemd_service_path();
     if path.exists() && !force {
         return Err(Error::new(format!(
@@ -753,12 +800,18 @@ fn install_service(force: bool) -> Result<()> {
             path.display()
         )));
     }
-    let exe = env::current_exe()?;
+    let mut command = systemd_quote(&env::current_exe()?.display().to_string());
+    if let Some(path) = config_path {
+        command.push_str(" --config ");
+        command.push_str(&systemd_quote(
+            &fs::canonicalize(path)?.display().to_string(),
+        ));
+    }
     let service = format!(
         "[Unit]\n\
 Description=TeslaUSB Archiver\n\
-After=local-fs.target network-online.target\n\
-Wants=local-fs.target network-online.target\n\
+After=local-fs.target\n\
+Wants=local-fs.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
@@ -766,14 +819,16 @@ ExecStartPre={exe} doctor --startup\n\
 ExecStartPre={exe} mount\n\
 ExecStartPre={exe} gadget on\n\
 ExecStart={exe} run\n\
-ExecStop={exe} gadget off\n\
-TimeoutStartSec=120\n\
+ExecStopPost={exe} gadget off\n\
+TimeoutStartSec=300\n\
+KillMode=mixed\n\
+TimeoutStopSec=900\n\
 Restart=always\n\
 RestartSec=10\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n",
-        exe = exe.display()
+        exe = command
     );
     fs::write(&path, service)?;
     CommandRunner.check(
@@ -790,28 +845,38 @@ WantedBy=multi-user.target\n",
     Ok(())
 }
 
+fn systemd_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
+}
+
 fn uninstall_service() -> Result<()> {
     let path = systemd_service_path();
     if !path.exists() {
         println!("Service is not installed");
         return Ok(());
     }
-    let _ = CommandRunner.run(
+    CommandRunner.check(
         "systemctl",
         ["stop", "teslausb.service"],
         Some(Duration::from_secs(30)),
-    );
-    let _ = CommandRunner.run(
+    )?;
+    CommandRunner.check(
         "systemctl",
         ["disable", "teslausb.service"],
         Some(Duration::from_secs(30)),
-    );
+    )?;
     fs::remove_file(&path)?;
-    let _ = CommandRunner.run(
+    CommandRunner.check(
         "systemctl",
         ["daemon-reload"],
         Some(Duration::from_secs(30)),
-    );
+    )?;
     println!("Service uninstalled");
     Ok(())
 }
@@ -946,21 +1011,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_global_args_accepts_short_config_and_ignores_log_level() {
-        let parsed = parse_global_args(strings(&[
-            "teslausb",
-            "-l",
-            "debug",
-            "-c",
-            "/tmp/conf",
-            "clean",
-            "--dry-run",
-        ]))
-        .unwrap();
-
-        assert_eq!(parsed.config_path, Some(PathBuf::from("/tmp/conf")));
-        assert_eq!(parsed.command, "clean");
-        assert_eq!(parsed.args, ["--dry-run"]);
+    fn parse_global_args_rejects_unsupported_log_level() {
+        assert!(parse_global_args(strings(&["teslausb", "-l", "debug", "status"])).is_err());
+        assert!(run(strings(&["teslausb", "clean", "--dryrun"]))
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected argument"));
     }
 
     #[test]

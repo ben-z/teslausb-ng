@@ -3,16 +3,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::archive::{ArchiveManager, ArchiveState};
+use crate::archive::ArchiveManager;
+use crate::config::RuntimeConfig;
 use crate::error::Result;
 use crate::filesystem::FileSystem;
 use crate::gadget::{GadgetDisableGuard, UsbGadget};
-use crate::idle::{default_timeout, ProcIdleDetector};
+use crate::idle::ProcIdleDetector;
 use crate::led::{LedPattern, SysfsLedController};
 use crate::mount::{fsck_image, mount_image};
 use crate::snapshot::SnapshotManager;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone)]
 pub struct Coordinator<F: FileSystem> {
@@ -24,6 +33,7 @@ pub struct Coordinator<F: FileSystem> {
     idle_timeout: Duration,
     poll_interval: Duration,
     max_idle_interval: Duration,
+    retry_interval: Duration,
 }
 
 impl<F: FileSystem> Coordinator<F> {
@@ -31,6 +41,7 @@ impl<F: FileSystem> Coordinator<F> {
         snapshot_manager: SnapshotManager<F>,
         archive_manager: ArchiveManager<F>,
         gadget: Option<UsbGadget>,
+        config: &RuntimeConfig,
     ) -> Self {
         Self {
             snapshot_manager,
@@ -38,9 +49,10 @@ impl<F: FileSystem> Coordinator<F> {
             gadget,
             led: None,
             idle_detector: None,
-            idle_timeout: default_timeout(),
-            poll_interval: Duration::from_secs(5),
-            max_idle_interval: Duration::from_secs(300),
+            idle_timeout: config.idle_timeout,
+            poll_interval: config.poll_interval,
+            max_idle_interval: config.max_poll_interval,
+            retry_interval: config.retry_interval,
         }
     }
 
@@ -55,6 +67,7 @@ impl<F: FileSystem> Coordinator<F> {
     }
 
     pub fn run_once(&mut self) -> Result<bool> {
+        install_signal_handlers();
         if !self.archive_manager.backend().is_reachable() {
             eprintln!("error: archive backend is not reachable");
             return Ok(false);
@@ -64,17 +77,19 @@ impl<F: FileSystem> Coordinator<F> {
 
     pub fn run(&mut self) -> Result<()> {
         let result = self.run_inner();
-        self.set_led(LedPattern::Off);
-        result
+        let led_result = self.set_led(LedPattern::Off);
+        if let Err(error) = &led_result {
+            eprintln!("error: failed to turn off status LED: {error}");
+        }
+        result.and(led_result)
     }
 
     fn run_inner(&mut self) -> Result<()> {
-        STOP_REQUESTED.store(false, Ordering::SeqCst);
         install_signal_handlers();
 
         let mut idle_backoff = Backoff::new(self.poll_interval, self.max_idle_interval);
         while !STOP_REQUESTED.load(Ordering::SeqCst) {
-            self.wait_for_archive(&STOP_REQUESTED);
+            self.wait_for_archive(&STOP_REQUESTED)?;
             if STOP_REQUESTED.load(Ordering::SeqCst) {
                 break;
             }
@@ -82,7 +97,7 @@ impl<F: FileSystem> Coordinator<F> {
             let cycle = self.do_archive_cycle()?;
             let delay = if !cycle.success {
                 idle_backoff.reset();
-                Duration::from_secs(30)
+                self.retry_interval
             } else if cycle.files_transferred == 0 {
                 let delay = idle_backoff.next();
                 eprintln!(
@@ -99,12 +114,12 @@ impl<F: FileSystem> Coordinator<F> {
         Ok(())
     }
 
-    fn wait_for_archive(&self, stop: &AtomicBool) {
-        self.set_led(LedPattern::SlowBlink);
+    fn wait_for_archive(&self, stop: &AtomicBool) -> Result<()> {
+        self.set_led(LedPattern::SlowBlink)?;
         let mut backoff = Backoff::new(self.poll_interval, self.max_idle_interval);
         while !stop.load(Ordering::SeqCst) {
             if self.archive_manager.backend().is_reachable() {
-                return;
+                return Ok(());
             }
             let delay = backoff.next();
             eprintln!(
@@ -113,10 +128,11 @@ impl<F: FileSystem> Coordinator<F> {
             );
             wait_interruptible(delay, stop);
         }
+        Ok(())
     }
 
     fn do_archive_cycle(&mut self) -> Result<ArchiveCycle> {
-        self.set_led(LedPattern::FastBlink);
+        self.set_led(LedPattern::FastBlink)?;
         let mut stale = 0;
         while self.snapshot_manager.delete_oldest_if_deletable()? {
             stale += 1;
@@ -130,10 +146,15 @@ impl<F: FileSystem> Coordinator<F> {
             );
         }
 
-        self.wait_for_usb_idle();
+        if !self.wait_for_usb_idle() {
+            return Ok(ArchiveCycle {
+                success: false,
+                files_transferred: 0,
+            });
+        }
 
-        let result = self.archive_manager.archive_new_snapshot(false)?;
-        if result.state == ArchiveState::Completed {
+        let result = self.archive_manager.archive_new_snapshot()?;
+        if result.success() {
             eprintln!(
                 "archive complete: {} files, {} bytes",
                 result.files_transferred, result.bytes_transferred
@@ -148,7 +169,11 @@ impl<F: FileSystem> Coordinator<F> {
             );
         }
 
-        if !result.archived_files.is_empty() {
+        let needs_cleanup = result
+            .archived_files
+            .iter()
+            .any(|(name, files)| name != "RecentClips" && !files.is_empty());
+        if needs_cleanup && !stop_requested() && self.wait_for_usb_idle() && !stop_requested() {
             self.delete_archived_files(&result)?;
         }
 
@@ -160,32 +185,34 @@ impl<F: FileSystem> Coordinator<F> {
         }
 
         let cycle = ArchiveCycle {
-            success: result.state == ArchiveState::Completed,
+            success: result.success(),
             files_transferred: result.files_transferred,
         };
         if cycle.success {
-            self.set_led(LedPattern::Heartbeat);
+            self.set_led(LedPattern::Heartbeat)?;
         } else {
-            self.set_led(LedPattern::SlowBlink);
+            self.set_led(LedPattern::SlowBlink)?;
         }
         Ok(cycle)
     }
 
     fn delete_archived_files(&self, result: &crate::archive::ArchiveResult) -> Result<()> {
-        let _guard = if let Some(gadget) = &self.gadget {
+        let guard = if let Some(gadget) = &self.gadget {
             Some(GadgetDisableGuard::disable_if_needed(gadget.clone())?)
         } else {
             None
         };
 
         let cam_disk: PathBuf = self.archive_manager.cam_disk_path().to_path_buf();
-        if !fsck_image(&cam_disk)? {
-            eprintln!("warning: fsck reported unresolved errors; proceeding with mount");
-        }
+        fsck_image(&cam_disk)?;
         let mounted = mount_image(&cam_disk, false)?;
         let (deleted, skipped) = self
             .archive_manager
             .delete_archived_files(result, mounted.path())?;
+        mounted.unmount()?;
+        if let Some(guard) = guard {
+            guard.restore()?;
+        }
         eprintln!(
             "clean up complete: deleted {}, skipped {}",
             deleted, skipped
@@ -193,20 +220,22 @@ impl<F: FileSystem> Coordinator<F> {
         Ok(())
     }
 
-    fn set_led(&self, pattern: LedPattern) {
+    fn set_led(&self, pattern: LedPattern) -> Result<()> {
         if let Some(led) = &self.led {
-            led.set_pattern(pattern);
+            led.set_pattern(pattern)?;
         }
+        Ok(())
     }
 
-    fn wait_for_usb_idle(&mut self) {
+    fn wait_for_usb_idle(&mut self) -> bool {
         if let Some(detector) = &mut self.idle_detector {
             eprintln!(
                 "waiting up to {}s for USB writes to become idle",
                 self.idle_timeout.as_secs()
             );
-            detector.wait_for_idle(self.idle_timeout);
+            return detector.wait_for_idle(self.idle_timeout);
         }
+        true
     }
 }
 
@@ -264,7 +293,7 @@ fn install_signal_handlers() {
     }
 
     extern "C" fn handle_signal(_signum: c_int) {
-        STOP_REQUESTED.store(true, Ordering::SeqCst);
+        request_stop();
     }
 
     unsafe {

@@ -3,7 +3,7 @@ set -eu
 
 if [ "$(uname -s)" != "Linux" ]; then
     echo "Linux integration tests require Linux; run this inside a Linux host, VM, or QEMU guest." >&2
-    exit 0
+    exit 1
 fi
 
 missing=''

@@ -172,16 +172,42 @@ impl UsbGadget {
         if !self.is_initialized() {
             return Err(Error::new("gadget is not initialized"));
         }
-        if self.is_enabled() {
+        if self.is_enabled()? {
             return Ok(());
         }
+        self.ensure_luns_unmounted()?;
         let udc = self.get_udc()?;
         self.write(&self.path.join("UDC"), &udc)?;
         Ok(())
     }
 
+    fn ensure_luns_unmounted(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let functions = self.path.join("functions/mass_storage.0");
+            if !functions.exists() {
+                return Err(Error::new("USB gadget has no mass-storage function"));
+            }
+            for entry in fs::read_dir(functions)? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with("lun.") {
+                    let image = fs::read_to_string(entry.path().join("file"))?;
+                    if !image.trim().is_empty() {
+                        ensure_image_unmounted(
+                            Path::new(image.trim()),
+                            Path::new("/sys/class/block"),
+                            Path::new("/proc/self/mountinfo"),
+                        )?;
+                        crate::mount::fsck_image(Path::new(image.trim()))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn disable(&self) -> Result<()> {
-        if !self.is_enabled() {
+        if !self.is_enabled()? {
             return Ok(());
         }
         self.write(&self.path.join("UDC"), "")?;
@@ -192,36 +218,27 @@ impl UsbGadget {
         self.path.exists()
     }
 
-    pub fn is_enabled(&self) -> bool {
-        let udc = self.path.join("UDC");
-        udc.exists()
-            && fs::read_to_string(udc)
-                .map(|content| !content.trim().is_empty())
-                .unwrap_or(false)
+    pub fn is_enabled(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        Ok(!fs::read_to_string(self.path.join("UDC"))?.trim().is_empty())
     }
 
-    pub fn status_json(&self) -> String {
-        let enabled = self.is_enabled();
+    pub fn status_json(&self) -> Result<String> {
         let initialized = self.is_initialized();
         let udc = if initialized {
-            fs::read_to_string(self.path.join("UDC"))
-                .unwrap_or_default()
+            fs::read_to_string(self.path.join("UDC"))?
                 .trim()
                 .to_string()
         } else {
             String::new()
         };
-        format!(
-            "{{\n  \"name\": \"{}\",\n  \"initialized\": {},\n  \"enabled\": {},\n  \"udc\": {}\n}}\n",
-            self.name,
-            initialized,
-            enabled,
-            if udc.is_empty() {
-                "null".to_string()
-            } else {
-                format!("\"{}\"", udc)
-            }
-        )
+        Ok(serde_json::json!({
+            "name": self.name, "initialized": initialized,
+            "enabled": !udc.is_empty(), "udc": if udc.is_empty() { None } else { Some(udc) },
+        })
+        .to_string())
     }
 
     pub fn name(&self) -> &str {
@@ -241,9 +258,8 @@ impl UsbGadget {
             )));
         }
         let mut udcs = fs::read_dir(&self.udc_path)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().to_string()))
+            .collect::<std::io::Result<Vec<_>>>()?;
         udcs.sort();
         udcs.into_iter()
             .next()
@@ -259,10 +275,10 @@ pub struct GadgetDisableGuard {
 
 impl GadgetDisableGuard {
     pub fn disable_if_needed(gadget: UsbGadget) -> Result<Self> {
-        let was_enabled = gadget.is_enabled();
+        let was_enabled = gadget.is_enabled()?;
         if was_enabled {
             gadget.disable()?;
-            if gadget.is_enabled() {
+            if gadget.is_enabled()? {
                 return Err(Error::new("gadget is still enabled after disable"));
             }
         }
@@ -271,16 +287,79 @@ impl GadgetDisableGuard {
             was_enabled,
         })
     }
+
+    pub fn restore(mut self) -> Result<()> {
+        if self.was_enabled {
+            self.gadget.enable()?;
+            self.was_enabled = false;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for GadgetDisableGuard {
     fn drop(&mut self) {
         if self.was_enabled {
-            if let Err(err) = self.gadget.enable() {
-                eprintln!("error: failed to re-enable USB gadget: {}", err);
+            eprintln!(
+                "error: USB gadget remains disabled because disk maintenance did not finish safely"
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn ensure_image_unmounted(
+    image: &Path,
+    block_devices: &Path,
+    mountinfo: &Path,
+) -> Result<()> {
+    let mounted = fs::read_to_string(mountinfo)?
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2).map(str::to_string))
+        .collect::<std::collections::HashSet<_>>();
+    let image = fs::canonicalize(image)?;
+    for entry in fs::read_dir(block_devices)? {
+        let device = fs::canonicalize(entry?.path())?;
+        let device_id = fs::read_to_string(device.join("dev"))?;
+        if mounted.contains(device_id.trim()) && device_backs_image(&device, &image)? {
+            return Err(Error::new(format!(
+                "cannot use camera image: {} is still mounted locally",
+                image.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn device_backs_image(device: &Path, image: &Path) -> Result<bool> {
+    if device.join("partition").exists() {
+        return device_backs_image(
+            device
+                .parent()
+                .ok_or_else(|| Error::new("partition has no parent block device"))?,
+            image,
+        );
+    }
+    let backing = device.join("loop/backing_file");
+    if backing.exists() {
+        let backing = fs::read_to_string(backing)?;
+        let backing = backing
+            .trim()
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\134", "\\");
+        return Ok(Path::new(&backing) == image);
+    }
+    let slaves = device.join("slaves");
+    if slaves.exists() {
+        for entry in fs::read_dir(slaves)? {
+            if device_backs_image(&fs::canonicalize(entry?.path())?, image)? {
+                return Ok(true);
             }
         }
     }
+    Ok(false)
 }
 
 fn run_modprobe(module: &str) -> bool {
@@ -328,15 +407,15 @@ mod tests {
         let gadget = UsbGadget::new("test", configfs.clone());
         assert_eq!(gadget.name(), "test");
         assert!(!gadget.is_initialized());
-        assert!(!gadget.is_enabled());
+        assert!(!gadget.is_enabled().unwrap());
 
-        fs::create_dir_all(configfs.join("test")).unwrap();
+        fs::create_dir_all(configfs.join("test/functions/mass_storage.0")).unwrap();
         fs::write(configfs.join("test/UDC"), "").unwrap();
         assert!(gadget.is_initialized());
-        assert!(!gadget.is_enabled());
+        assert!(!gadget.is_enabled().unwrap());
 
         fs::write(configfs.join("test/UDC"), "fake-udc\n").unwrap();
-        assert!(gadget.is_enabled());
+        assert!(gadget.is_enabled().unwrap());
 
         let _ = fs::remove_dir_all(configfs);
     }
@@ -389,7 +468,7 @@ mod tests {
         fs::create_dir_all(&configfs).unwrap();
         fs::create_dir_all(&udc_path).unwrap();
         fs::create_dir_all(udc_path.join("fake-udc")).unwrap();
-        fs::create_dir_all(configfs.join("test")).unwrap();
+        fs::create_dir_all(configfs.join("test/functions/mass_storage.0")).unwrap();
         fs::write(configfs.join("test/UDC"), "").unwrap();
 
         let mut gadget = UsbGadget::new("test", configfs.clone());
@@ -400,7 +479,7 @@ mod tests {
             "fake-udc\n"
         );
         gadget.disable().unwrap();
-        assert!(!gadget.is_enabled());
+        assert!(!gadget.is_enabled().unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -417,7 +496,7 @@ mod tests {
         gadget.udc_path = udc_path.clone();
         assert!(gadget.enable().is_err());
 
-        fs::create_dir_all(configfs.join("test")).unwrap();
+        fs::create_dir_all(configfs.join("test/functions/mass_storage.0")).unwrap();
         fs::write(configfs.join("test/UDC"), "").unwrap();
         assert!(gadget.enable().is_err());
 
@@ -427,36 +506,75 @@ mod tests {
     #[test]
     fn status_json_reports_basic_state() {
         let configfs = temp_dir("gadget-status");
-        fs::create_dir_all(configfs.join("test")).unwrap();
+        fs::create_dir_all(configfs.join("test/functions/mass_storage.0")).unwrap();
         fs::write(configfs.join("test/UDC"), "fake\n").unwrap();
         let gadget = UsbGadget::new("test", configfs.clone());
 
-        let json = gadget.status_json();
+        let json = gadget.status_json().unwrap();
 
-        assert!(json.contains("\"name\": \"test\""));
-        assert!(json.contains("\"initialized\": true"));
-        assert!(json.contains("\"enabled\": true"));
-        assert!(json.contains("\"udc\": \"fake\""));
+        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"initialized\":true"));
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"udc\":\"fake\""));
 
         let _ = fs::remove_dir_all(configfs);
     }
 
     #[test]
-    fn disable_guard_reenables_when_it_disabled_the_gadget() {
+    fn gadget_rejects_loop_partition_mounts_of_live_image() {
+        let root = temp_dir("gadget-mounted");
+        let blocks = root.join("blocks");
+        let loop_device = root.join("devices/loop0");
+        let partition = loop_device.join("loop0p1");
+        let disk = root.join("cam.bin");
+        fs::write(&disk, "disk").unwrap();
+        fs::create_dir_all(loop_device.join("loop")).unwrap();
+        fs::create_dir_all(&partition).unwrap();
+        fs::create_dir_all(&blocks).unwrap();
+        fs::write(
+            loop_device.join("loop/backing_file"),
+            disk.display().to_string(),
+        )
+        .unwrap();
+        fs::write(loop_device.join("dev"), "7:0").unwrap();
+        fs::write(partition.join("dev"), "259:0").unwrap();
+        fs::write(partition.join("partition"), "1").unwrap();
+        std::os::unix::fs::symlink(&loop_device, blocks.join("loop0")).unwrap();
+        std::os::unix::fs::symlink(&partition, blocks.join("loop0p1")).unwrap();
+        let mounts = root.join("mountinfo");
+        fs::write(
+            &mounts,
+            "11 10 259:0 / /tmp/cam rw - vfat /dev/loop0p1 rw\n",
+        )
+        .unwrap();
+        assert!(ensure_image_unmounted(&disk, &blocks, &mounts)
+            .unwrap_err()
+            .to_string()
+            .contains("still mounted locally"));
+        fs::write(&mounts, "").unwrap();
+        ensure_image_unmounted(&disk, &blocks, &mounts).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_guard_restores_only_after_explicit_success() {
         let root = temp_dir("gadget-guard");
         let configfs = root.join("usb_gadget");
         let udc_path = root.join("udc");
-        fs::create_dir_all(configfs.join("test")).unwrap();
+        fs::create_dir_all(configfs.join("test/functions/mass_storage.0")).unwrap();
         fs::write(configfs.join("test/UDC"), "fake\n").unwrap();
         fs::create_dir_all(udc_path.join("fake")).unwrap();
 
         let mut gadget = UsbGadget::new("test", configfs.clone());
         gadget.udc_path = udc_path;
         {
-            let _guard = GadgetDisableGuard::disable_if_needed(gadget.clone()).unwrap();
-            assert!(!gadget.is_enabled());
+            let guard = GadgetDisableGuard::disable_if_needed(gadget.clone()).unwrap();
+            assert!(!gadget.is_enabled().unwrap());
+            guard.restore().unwrap();
         }
-        assert!(gadget.is_enabled());
+        assert!(gadget.is_enabled().unwrap());
+        drop(GadgetDisableGuard::disable_if_needed(gadget.clone()).unwrap());
+        assert!(!gadget.is_enabled().unwrap());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,9 +44,37 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.run_inner(program, args, timeout, false)
+    }
+
+    pub fn run_interruptible<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        timeout: Option<Duration>,
+    ) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.run_inner(program, args, timeout, true)
+    }
+
+    fn run_inner<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        timeout: Option<Duration>,
+        interruptible: bool,
+    ) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
         let mut child = Command::new(program)
             .args(&args)
+            .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -56,31 +86,41 @@ impl CommandRunner {
                 ))
             })?;
 
+        // Drain both pipes while the child runs; either pipe can fill independently.
+        let stdout = read_pipe(child.stdout.take().expect("stdout was piped"));
+        let stderr = read_pipe(child.stderr.take().expect("stderr was piped"));
         let started = Instant::now();
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                return Ok(CommandOutput {
-                    code: output.status.code(),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    timed_out: false,
-                });
+        let mut interrupted = false;
+        let (status, timed_out) = loop {
+            let status = child.try_wait()?;
+            if stdout.is_finished() && stderr.is_finished() {
+                if let Some(status) = status {
+                    break (status, false);
+                }
             }
-
+            if interruptible && crate::coordinator::stop_requested() {
+                interrupted = true;
+                kill_process_group(child.id())?;
+                break (child.wait()?, false);
+            }
             if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                return Ok(CommandOutput {
-                    code: output.status.code(),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    timed_out: true,
-                });
+                // Descendants can hold the pipes open after the direct child is killed.
+                kill_process_group(child.id())?;
+                break (child.wait()?, true);
             }
-
             thread::sleep(Duration::from_millis(50));
+        };
+        let stdout = join_reader(stdout)?;
+        let stderr = join_reader(stderr)?;
+        if interrupted {
+            return Err(Error::new(format!("{program} stopped by shutdown request")));
         }
+        Ok(CommandOutput {
+            code: status.code(),
+            stdout,
+            stderr,
+            timed_out,
+        })
     }
 
     pub fn check<I, S>(
@@ -107,6 +147,35 @@ impl CommandRunner {
             )))
         }
     }
+}
+
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_reader(reader: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<String> {
+    let bytes = reader
+        .join()
+        .map_err(|_| Error::new("command output reader panicked"))??;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn kill_process_group(pid: u32) -> Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(-(pid as i32), 9) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // The group may exit between the timeout check and kill.
+        if error.raw_os_error() != Some(3) {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 pub fn display_cmd(program: &str, args: &[String]) -> String {
@@ -177,6 +246,51 @@ mod tests {
         assert!(output.success());
         assert_eq!(output.stdout, "out");
         assert_eq!(output.stderr, "err");
+    }
+
+    #[test]
+    fn run_drains_large_stdout_and_stderr_without_deadlock() {
+        let output = CommandRunner
+            .run(
+                "sh",
+                [
+                    "-c",
+                    "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+                ],
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert!(output.success());
+        assert_eq!(output.stdout.len(), 1048576);
+        assert_eq!(output.stderr.len(), 1048576);
+    }
+
+    #[test]
+    fn timeout_bounds_output_drain_after_direct_child_exits() {
+        let started = Instant::now();
+        let output = CommandRunner
+            .run(
+                "sh",
+                ["-c", "sleep 30 & exit 0"],
+                Some(Duration::from_millis(100)),
+            )
+            .unwrap();
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn timeout_kills_descendants_that_hold_output_pipes() {
+        let started = Instant::now();
+        let output = CommandRunner
+            .run(
+                "sh",
+                ["-c", "sleep 30 & wait"],
+                Some(Duration::from_millis(100)),
+            )
+            .unwrap();
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

@@ -262,7 +262,8 @@ at least ten minutes before removal. Every file must have positive rclone
 confirmation, and live files must still match the archived sizes. Incomplete
 events and events containing only metadata stay on the camera disk.
 
-When enabled, RecentClips uploads go into `RecentClips/YYYY-MM-DD/`. The car
+When enabled, RecentClips videos go into `RecentClips/YYYY-MM-DD/`; the known
+`thumb.png` and `event.json` files go into `RecentClips/metadata/`. The car
 manages the local RecentClips buffer. TeslaUSB retains those local files so
 saving a recent event can still use them.
 

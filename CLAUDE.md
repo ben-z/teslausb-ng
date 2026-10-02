@@ -2,7 +2,7 @@
 
 This file provides guidance for AI assistants working with teslausb-ng.
 
-teslausb-ng is now a Rust CLI. It coordinates Linux system tools to expose a
+teslausb-ng is a Rust CLI. It coordinates Linux system tools to expose a
 Tesla camera disk over USB gadget mode, take XFS reflink snapshots, archive clips
 with `rclone`, and clean up copied files conservatively.
 
@@ -40,14 +40,15 @@ src/
 ## Important Invariants
 
 - `snap.toc` is the snapshot completion marker.
-- No `snap.toc` means the snapshot is incomplete and should be deleted on load.
+- No `snap.toc` means the snapshot is incomplete; explicit runtime recovery removes it.
 - Delete `snap.toc` before deleting snapshot data.
 - Disable the USB gadget before mounting `cam_disk.bin` read-write.
-- Re-enable the USB gadget after files are cleaned up if it was enabled before.
-- Verify file size before deleting a file from the live camera disk.
-- Wait for USB writes to become idle before taking a snapshot; proceed on
-  timeout rather than blocking archiving indefinitely.
-- Keep LED and temperature monitoring best-effort; they must not block archiving.
+- Re-enable the USB gadget only after checked unmount and successful filesystem verification.
+- Require positive rclone confirmations and revalidate the whole Saved/Sentry event file set, sizes, and modification times before deletion.
+- Require five consecutive samples with no USB `wchar` writes before snapshots and cleanup; skip the cycle on timeout.
+- Preserve the car-owned RecentClips buffer and metadata-only Saved/Sentry events.
+- Require Saved/Sentry event stability across snapshots for the configured grace period before cleanup.
+- Surface missing or failing LED and temperature capabilities as errors.
 - Keep external tools external; this binary coordinates them.
 
 ## Testing Guidance

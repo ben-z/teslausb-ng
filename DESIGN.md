@@ -46,9 +46,9 @@ The snapshot completion marker is the source of truth.
 
 | Operation | Order | Recovery |
 | --- | --- | --- |
-| Create | reflink `snap.bin`, write metadata, atomically write `snap.toc` | no `snap.toc` means delete on load |
-| Delete | remove `snap.toc`, sync directory, remove snapshot directory | no `snap.toc` means delete on load |
-| Load | scan `snap-*` directories and require `snap.toc` | incomplete directories are removed |
+| Create | reflink `snap.bin`, write metadata, atomically write `snap.toc` | no `snap.toc` means remove during explicit recovery |
+| Delete | remove `snap.toc`, sync directory, remove snapshot directory | no `snap.toc` means remove during explicit recovery |
+| Load | scan `snap-*` directories and require `snap.toc` | inspection preserves incomplete directories; runtime recovery removes them |
 
 Metadata is useful but not trusted. If metadata is missing or stale, the snapshot
 can be reconstructed from the directory name and `snap.bin` mtime.
@@ -59,7 +59,7 @@ Rust destructors are used for resources that must be unwound:
 
 - `LoopDevice` detaches `losetup` and removes `kpartx` mappings
 - `MountedImage` unmounts and removes the temporary mount directory
-- `GadgetDisableGuard` re-enables the gadget if it was disabled to clean up files
+- `GadgetDisableGuard` restores the gadget only after explicit checked completion; failures leave it disabled
 - `SnapshotHandle` decrements snapshot refcounts on drop
 - `TemperatureMonitorGuard` stops the background temperature thread on drop
 
@@ -73,16 +73,19 @@ wait until archive is reachable
 set status LED to slow blink
 set status LED to fast blink while the archive cycle runs
 delete all stale/deletable snapshots
-wait for USB writes to become idle; proceed on timeout
+wait for USB writes to become idle; skip on timeout
 create reflink snapshot
 mount snapshot read-only
-copy enabled clip directories with rclone
+copy enabled clip directories with rclone JSON confirmations
+select complete, stable Saved/Sentry events for cleanup
+wait for USB writes to become idle again; skip cleanup on timeout
 disable USB gadget if it is enabled
-fsck cam disk
+repair and independently verify the cam filesystem
 mount cam disk read-write
-delete only files whose sizes still match the archived scan
-unmount cam disk
-re-enable USB gadget
+revalidate whole event file sets, sizes, and modification times
+delete only confirmed files in unchanged events
+check cam disk unmount succeeds
+verify cam filesystem and re-enable USB gadget
 delete snapshot
 set status LED to heartbeat after a successful cycle
 repeat
@@ -90,6 +93,17 @@ repeat
 
 The live camera disk is never mounted read-write while it is exposed to the car
 through the USB gadget.
+
+RecentClips uploads are partitioned by date, with the known metadata files in a
+separate metadata directory. Local RecentClips files remain owned by the car.
+Saved/Sentry events must remain unchanged across snapshots for the configured
+grace period and every event file must have a positive rclone confirmation.
+Metadata-only events remain on the camera disk.
+
+A catalog lock serializes snapshot creation, inspection, recovery, and deletion.
+Per-snapshot locks remain held through use or deletion, and a persistent ID
+counter prevents stale processes from reusing snapshot IDs. A separate archive
+lock prevents concurrent processes from maintaining the live camera disk.
 
 ## Storage Model
 

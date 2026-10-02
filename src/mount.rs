@@ -50,40 +50,55 @@ impl Drop for LoopDevice {
 pub struct MountedImage {
     mount_point: PathBuf,
     readonly: bool,
-    _loop_device: LoopDevice,
+    loop_device: Option<LoopDevice>,
 }
 
 impl MountedImage {
     pub fn path(&self) -> &Path {
         &self.mount_point
     }
+
+    pub fn unmount(mut self) -> Result<()> {
+        self.unmount_inner()
+    }
+
+    fn unmount_inner(&mut self) -> Result<()> {
+        if self.loop_device.is_none() {
+            return Ok(());
+        }
+        if !self.readonly {
+            CommandRunner.check(
+                "sync",
+                std::iter::empty::<&str>(),
+                Some(Duration::from_secs(30)),
+            )?;
+        }
+        CommandRunner.check(
+            "umount",
+            [self.mount_point.display().to_string().as_str()],
+            Some(Duration::from_secs(30)),
+        )?;
+        drop(self.loop_device.take());
+        if self.mount_point.exists() {
+            fs::remove_dir(&self.mount_point)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for MountedImage {
     fn drop(&mut self) {
-        let runner = CommandRunner;
-        if !self.readonly {
-            let _ = runner.run(
-                "sync",
-                std::iter::empty::<&str>(),
-                Some(Duration::from_secs(30)),
+        if let Err(err) = self.unmount_inner() {
+            eprintln!(
+                "error: failed to unmount {}: {}",
+                self.mount_point.display(),
+                err
             );
-        }
-        let output = runner.run(
-            "umount",
-            [self.mount_point.display().to_string().as_str()],
-            Some(Duration::from_secs(30)),
-        );
-        if let Ok(output) = output {
-            if !output.success() {
-                eprintln!(
-                    "warning: umount {} failed: {}",
-                    self.mount_point.display(),
-                    output.last_error_line()
-                );
+            // Keep the loop mapping attached when the filesystem is still mounted.
+            if let Some(device) = self.loop_device.take() {
+                std::mem::forget(device);
             }
         }
-        let _ = fs::remove_dir(&self.mount_point);
     }
 }
 
@@ -100,59 +115,87 @@ pub fn setup_loop_device(image_path: &Path) -> Result<LoopDevice> {
         return Err(Error::new("losetup did not print a loop device"));
     }
 
-    let direct_partition = format!("{}p1", loop_dev);
+    let mut device = LoopDevice {
+        partition: format!("{}p1", loop_dev),
+        loop_dev,
+        kpartx_used: false,
+    };
     let _ = runner.run(
         "blockdev",
-        ["--rereadpt", loop_dev.as_str()],
+        ["--rereadpt", device.loop_dev.as_str()],
         Some(Duration::from_secs(10)),
     );
-    if wait_for_path(Path::new(&direct_partition), Duration::from_secs(2)) {
-        return Ok(LoopDevice {
-            loop_dev,
-            partition: direct_partition,
-            kpartx_used: false,
-        });
+    if wait_for_path(Path::new(&device.partition), Duration::from_secs(2)) {
+        return Ok(device);
     }
-
-    let output = runner.run(
+    runner.check(
         "kpartx",
-        ["-av", loop_dev.as_str()],
+        ["-av", device.loop_dev.as_str()],
         Some(Duration::from_secs(30)),
     )?;
-    if output.success() {
-        let loop_name = Path::new(&loop_dev)
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| loop_dev.trim_start_matches("/dev/").to_string());
-        let mapper_partition = format!("/dev/mapper/{}p1", loop_name);
-        if wait_for_path(Path::new(&mapper_partition), Duration::from_secs(2)) {
-            return Ok(LoopDevice {
-                loop_dev,
-                partition: mapper_partition,
-                kpartx_used: true,
-            });
-        }
+    device.kpartx_used = true;
+    let loop_name = Path::new(&device.loop_dev)
+        .file_name()
+        .ok_or_else(|| Error::new("invalid loop-device path"))?
+        .to_string_lossy();
+    device.partition = format!("/dev/mapper/{}p1", loop_name);
+    if wait_for_path(Path::new(&device.partition), Duration::from_secs(2)) {
+        return Ok(device);
     }
 
-    let _ = runner.run(
-        "losetup",
-        ["-d", loop_dev.as_str()],
-        Some(Duration::from_secs(30)),
-    );
     Err(Error::new(format!(
         "partition device did not appear for {}",
         image_path.display()
     )))
 }
 
-pub fn fsck_image(image_path: &Path) -> Result<bool> {
+pub fn fsck_image(image_path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    crate::gadget::ensure_image_unmounted(
+        image_path,
+        Path::new("/sys/class/block"),
+        Path::new("/proc/self/mountinfo"),
+    )?;
     let loop_device = setup_loop_device(image_path)?;
     let output = CommandRunner.run(
         "fsck",
         ["-p", loop_device.partition()],
         Some(Duration::from_secs(120)),
     )?;
-    Ok(matches!(output.code, Some(0 | 1)) && !output.timed_out)
+    if !output.stdout.trim().is_empty() {
+        eprintln!("fsck repair: {}", output.stdout.trim());
+    }
+    if !output.stderr.trim().is_empty() {
+        eprintln!("fsck repair: {}", output.stderr.trim());
+    }
+    if !matches!(output.code, Some(0 | 1)) || output.timed_out {
+        return Err(Error::new(format!(
+            "filesystem check failed for {} (exit {:?}, timed out {}): {}",
+            image_path.display(),
+            output.code,
+            output.timed_out,
+            output.last_error_line()
+        )));
+    }
+    let verification = CommandRunner.run(
+        "fsck",
+        ["-n", loop_device.partition()],
+        Some(Duration::from_secs(120)),
+    )?;
+    if !verification.stdout.trim().is_empty() {
+        eprintln!("fsck verification: {}", verification.stdout.trim());
+    }
+    if !verification.stderr.trim().is_empty() {
+        eprintln!("fsck verification: {}", verification.stderr.trim());
+    }
+    if !verification.success() {
+        return Err(Error::new(format!(
+            "filesystem remains inconsistent after repair for {}: {}",
+            image_path.display(),
+            verification.last_error_line()
+        )));
+    }
+    Ok(())
 }
 
 pub fn mount_image(image_path: &Path, readonly: bool) -> Result<MountedImage> {
@@ -180,7 +223,7 @@ pub fn mount_image(image_path: &Path, readonly: bool) -> Result<MountedImage> {
     Ok(MountedImage {
         mount_point,
         readonly,
-        _loop_device: loop_device,
+        loop_device: Some(loop_device),
     })
 }
 

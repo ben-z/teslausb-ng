@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 
@@ -19,6 +20,8 @@ pub struct ArchiveConfig {
     pub archive_sentry: bool,
     pub archive_track: bool,
     pub archive_photobooth: bool,
+    pub event_stability: Duration,
+    pub copy_timeout: Duration,
 }
 
 impl Default for ArchiveConfig {
@@ -33,6 +36,31 @@ impl Default for ArchiveConfig {
             archive_sentry: true,
             archive_track: true,
             archive_photobooth: true,
+            event_stability: Duration::from_secs(600),
+            copy_timeout: Duration::from_secs(3600),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    pub idle_timeout: Duration,
+    pub idle_confirm_samples: u64,
+    pub idle_sample_interval: Duration,
+    pub poll_interval: Duration,
+    pub max_poll_interval: Duration,
+    pub retry_interval: Duration,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(90),
+            idle_confirm_samples: 5,
+            idle_sample_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_secs(5),
+            max_poll_interval: Duration::from_secs(300),
+            retry_interval: Duration::from_secs(30),
         }
     }
 }
@@ -42,6 +70,7 @@ pub struct Config {
     pub backingfiles_path: PathBuf,
     pub mutable_path: PathBuf,
     pub archive: ArchiveConfig,
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for Config {
@@ -50,6 +79,7 @@ impl Default for Config {
             backingfiles_path: PathBuf::from("/backingfiles"),
             mutable_path: PathBuf::from("/mutable"),
             archive: ArchiveConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -135,10 +165,15 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         }
         None => HashMap::new(),
     };
-    Ok(load_from_sources(&file_values))
+    let config = load_from_sources(&file_values)?;
+    let errors = config.warnings();
+    if !errors.is_empty() {
+        return Err(Error::new(errors.join("; ")));
+    }
+    Ok(config)
 }
 
-fn load_from_sources(file_values: &HashMap<String, String>) -> Config {
+fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
     let mut config = Config::default();
     let mut archive = ArchiveConfig::default();
 
@@ -149,39 +184,59 @@ fn load_from_sources(file_values: &HashMap<String, String>) -> Config {
         config.backingfiles_path = PathBuf::from(value);
     }
 
-    archive.system = get_var(file_values, "ARCHIVE_SYSTEM")
-        .unwrap_or_else(|| "none".to_string())
-        .to_ascii_lowercase();
+    if let Some(value) = get_var(file_values, "ARCHIVE_SYSTEM") {
+        archive.system = value.to_ascii_lowercase();
+    }
     archive.rclone_drive = get_var(file_values, "RCLONE_DRIVE").unwrap_or_default();
     archive.rclone_path = get_var(file_values, "RCLONE_PATH").unwrap_or_default();
     archive.rclone_flags = get_var(file_values, "RCLONE_FLAGS")
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
 
-    archive.archive_recent = get_bool(file_values, "ARCHIVE_RECENTCLIPS", false);
-    archive.archive_saved = get_bool_default_true(file_values, "ARCHIVE_SAVEDCLIPS");
-    archive.archive_sentry = get_bool_default_true(file_values, "ARCHIVE_SENTRYCLIPS");
-    archive.archive_track = get_bool_default_true(file_values, "ARCHIVE_TRACKMODECLIPS");
-    archive.archive_photobooth = get_bool_default_true(file_values, "ARCHIVE_PHOTOBOOTH");
+    archive.archive_recent = get_bool(file_values, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
+    archive.archive_saved = get_bool(file_values, "ARCHIVE_SAVEDCLIPS", archive.archive_saved)?;
+    archive.archive_sentry = get_bool(file_values, "ARCHIVE_SENTRYCLIPS", archive.archive_sentry)?;
+    archive.archive_track = get_bool(file_values, "ARCHIVE_TRACKMODECLIPS", archive.archive_track)?;
+    archive.archive_photobooth = get_bool(
+        file_values,
+        "ARCHIVE_PHOTOBOOTH",
+        archive.archive_photobooth,
+    )?;
+
+    if let Some(value) = get_var(file_values, "EVENT_STABILITY_SECONDS") {
+        archive.event_stability =
+            Duration::from_secs(value.parse().map_err(|error| {
+                Error::new(format!("invalid EVENT_STABILITY_SECONDS: {error}"))
+            })?);
+    }
+
+    if let Some(value) = get_var(file_values, "TESLAUSB_IDLE_TIMEOUT_SECS") {
+        let seconds: u64 = value
+            .parse()
+            .map_err(|error| Error::new(format!("invalid TESLAUSB_IDLE_TIMEOUT_SECS: {error}")))?;
+        if seconds == 0 {
+            return Err(Error::new("TESLAUSB_IDLE_TIMEOUT_SECS must be positive"));
+        }
+        config.runtime.idle_timeout = Duration::from_secs(seconds);
+    }
 
     config.archive = archive;
-    config
+    Ok(config)
 }
 
 fn get_var(file_values: &HashMap<String, String>, key: &str) -> Option<String> {
     file_values.get(key).cloned().or_else(|| env::var(key).ok())
 }
 
-fn get_bool(file_values: &HashMap<String, String>, key: &str, default: bool) -> bool {
-    get_var(file_values, key)
-        .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
-}
-
-fn get_bool_default_true(file_values: &HashMap<String, String>, key: &str) -> bool {
-    get_var(file_values, key)
-        .map(|value| !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+fn get_bool(file_values: &HashMap<String, String>, key: &str, default: bool) -> Result<bool> {
+    match get_var(file_values, key) {
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) => Err(Error::new(format!(
+            "{key} must be true or false, got {value:?}"
+        ))),
+        None => Ok(default),
+    }
 }
 
 fn parse_config_file(path: &Path) -> Result<HashMap<String, String>> {
@@ -194,7 +249,7 @@ fn parse_config_file(path: &Path) -> Result<HashMap<String, String>> {
     })?;
     let mut values = HashMap::new();
 
-    for raw_line in content.lines() {
+    for (index, raw_line) in content.lines().enumerate() {
         let mut line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -203,9 +258,24 @@ fn parse_config_file(path: &Path) -> Result<HashMap<String, String>> {
             line = rest.trim_start();
         }
         let Some((key, value)) = line.split_once('=') else {
-            continue;
+            return Err(Error::new(format!(
+                "{}:{}: expected KEY=value",
+                path.display(),
+                index + 1
+            )));
         };
         let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err(Error::new(format!(
+                "{}:{}: invalid configuration key",
+                path.display(),
+                index + 1
+            )));
+        }
         let mut value = value.trim();
         if ((value.starts_with('"') && value.ends_with('"'))
             || (value.starts_with('\'') && value.ends_with('\'')))
@@ -360,6 +430,21 @@ ARCHIVE_PHOTOBOOTH=false
     }
 
     #[test]
+    fn malformed_configuration_and_invalid_timeouts_fail() {
+        for content in [
+            "ARCHIVE_SYSTEM rclone",
+            "=value",
+            "TESLAUSB_IDLE_TIMEOUT_SECS=wrong",
+            "TESLAUSB_IDLE_TIMEOUT_SECS=0",
+            "ARCHIVE_RECENTCLIPS=maybe",
+        ] {
+            let path = temp_config(content);
+            assert!(load_config(Some(&path)).is_err(), "{content}");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn load_config_rejects_missing_file() {
         let path = std::env::temp_dir().join("teslausb-definitely-missing.conf");
         let _ = fs::remove_file(&path);
@@ -392,7 +477,7 @@ ARCHIVE_PHOTOBOOTH=false
         std::env::set_var("ARCHIVE_RECENTCLIPS", "true");
         std::env::set_var("ARCHIVE_SAVEDCLIPS", "false");
 
-        let config = load_from_sources(&std::collections::HashMap::new());
+        let config = load_from_sources(&std::collections::HashMap::new()).unwrap();
 
         assert_eq!(config.mutable_path, PathBuf::from("/env/mutable"));
         assert_eq!(config.backingfiles_path, PathBuf::from("/env/backingfiles"));

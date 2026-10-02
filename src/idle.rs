@@ -1,14 +1,12 @@
+use crate::config::RuntimeConfig;
+use crate::error::{Error, Result};
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const WRITE_THRESHOLD: u64 = 500_000;
-pub const IDLE_CONFIRM_SECONDS: u64 = 5;
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 pub const PROC_PATH_ENV: &str = "TESLAUSB_PROC_PATH";
 pub const PROCESS_NAME_ENV: &str = "TESLAUSB_IDLE_PROCESS";
-pub const IDLE_TIMEOUT_ENV: &str = "TESLAUSB_IDLE_TIMEOUT_SECS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleState {
@@ -56,10 +54,15 @@ pub struct ProcIdleDetector {
     burst_size: u64,
     idle_count: u64,
     sample_interval: Duration,
+    confirm_samples: u64,
 }
 
 impl ProcIdleDetector {
-    pub fn new(proc_path: PathBuf, process_name: impl Into<String>) -> Self {
+    pub fn new(
+        proc_path: PathBuf,
+        process_name: impl Into<String>,
+        config: &RuntimeConfig,
+    ) -> Self {
         Self {
             proc_path,
             process_name: process_name.into(),
@@ -67,17 +70,18 @@ impl ProcIdleDetector {
             prev_written: None,
             burst_size: 0,
             idle_count: 0,
-            sample_interval: Duration::from_secs(1),
+            sample_interval: config.idle_sample_interval,
+            confirm_samples: config.idle_confirm_samples,
         }
     }
 
-    pub fn default_proc() -> Self {
+    pub fn default_proc(config: &RuntimeConfig) -> Self {
         let proc_path = std::env::var_os(PROC_PATH_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/proc"));
         let process_name =
             std::env::var(PROCESS_NAME_ENV).unwrap_or_else(|_| "file-storage".to_string());
-        Self::new(proc_path, process_name)
+        Self::new(proc_path, process_name, config)
     }
 
     #[cfg(test)]
@@ -86,31 +90,37 @@ impl ProcIdleDetector {
         self
     }
 
-    pub fn find_process_pid(&self) -> Option<u32> {
-        let entries = fs::read_dir(&self.proc_path).ok()?;
-        for entry in entries.flatten() {
+    pub fn find_process_pid(&self) -> Result<Option<u32>> {
+        let entries = fs::read_dir(&self.proc_path)?;
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.chars().all(|ch| ch.is_ascii_digit()) {
                 continue;
             }
 
-            let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
-                continue;
+            let comm = match fs::read_to_string(entry.path().join("comm")) {
+                Ok(comm) => comm,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
             if comm.trim() == self.process_name {
                 if let Ok(pid) = name.parse::<u32>() {
-                    return Some(pid);
+                    return Ok(Some(pid));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
-    pub fn write_bytes_for_pid(&self, pid: u32) -> Option<u64> {
-        parse_write_bytes(
-            &fs::read_to_string(self.proc_path.join(pid.to_string()).join("io")).ok()?,
-        )
+    pub fn write_bytes_for_pid(&self, pid: u32) -> Result<u64> {
+        let content = fs::read_to_string(self.proc_path.join(pid.to_string()).join("io"))?;
+        parse_write_bytes(&content).ok_or_else(|| {
+            Error::new(format!(
+                "missing or invalid wchar counter for USB writer {pid}"
+            ))
+        })
     }
 
     pub fn wait_for_idle(&mut self, timeout: Duration) -> bool {
@@ -121,16 +131,30 @@ impl ProcIdleDetector {
 
         let started = Instant::now();
         while started.elapsed() < timeout {
+            if crate::coordinator::stop_requested() {
+                return false;
+            }
             if !self.sample_interval.is_zero() {
                 thread::sleep(self.sample_interval);
             }
 
-            let Some(pid) = self.find_process_pid() else {
-                self.state = IdleState::Idle;
-                return true;
+            let pid = match self.find_process_pid() {
+                Ok(Some(pid)) => pid,
+                Ok(None) => {
+                    self.state = IdleState::Idle;
+                    return true;
+                }
+                Err(error) => {
+                    eprintln!("error: cannot observe USB writes: {error}");
+                    return false;
+                }
             };
-            let Some(written) = self.write_bytes_for_pid(pid) else {
-                continue;
+            let written = match self.write_bytes_for_pid(pid) {
+                Ok(written) => written,
+                Err(error) => {
+                    eprintln!("error: cannot observe USB writes: {error}");
+                    return false;
+                }
             };
             let Some(previous) = self.prev_written.replace(written) else {
                 continue;
@@ -138,13 +162,13 @@ impl ProcIdleDetector {
             let delta = written.saturating_sub(previous);
             self.update_state(delta);
 
-            if self.state == IdleState::Idle && self.idle_count >= IDLE_CONFIRM_SECONDS {
+            if self.state == IdleState::Idle && self.idle_count >= self.confirm_samples {
                 return true;
             }
         }
         let status = self.status();
         eprintln!(
-            "warning: timed out waiting for USB writes to become idle; proceeding \
+            "warning: timed out waiting for USB writes to become idle; skipping archive cycle \
              (state={}, bytes_written={}, burst_size={}, idle_seconds={})",
             status.state.as_str(),
             status.bytes_written,
@@ -157,7 +181,7 @@ impl ProcIdleDetector {
     fn update_state(&mut self, delta: u64) {
         match self.state {
             IdleState::Undetermined => {
-                if delta > WRITE_THRESHOLD {
+                if delta > 0 {
                     self.state = IdleState::Writing;
                     self.burst_size = delta;
                 } else {
@@ -166,7 +190,7 @@ impl ProcIdleDetector {
                 }
             }
             IdleState::Writing => {
-                if delta < WRITE_THRESHOLD {
+                if delta == 0 {
                     self.state = IdleState::Idle;
                     self.burst_size = 0;
                     self.idle_count = 0;
@@ -175,7 +199,7 @@ impl ProcIdleDetector {
                 }
             }
             IdleState::Idle => {
-                if delta > WRITE_THRESHOLD {
+                if delta > 0 {
                     self.state = IdleState::Writing;
                     self.burst_size = delta;
                     self.idle_count = 0;
@@ -196,30 +220,16 @@ impl ProcIdleDetector {
     }
 }
 
-impl Default for ProcIdleDetector {
-    fn default() -> Self {
-        Self::default_proc()
-    }
-}
-
 fn parse_write_bytes(content: &str) -> Option<u64> {
     for line in content.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        if key.trim() == "write_bytes" {
+        if key.trim() == "wchar" {
             return value.trim().parse::<u64>().ok();
         }
     }
     None
-}
-
-pub fn default_timeout() -> Duration {
-    std::env::var(IDLE_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TIMEOUT)
 }
 
 #[cfg(test)]
@@ -291,12 +301,15 @@ mod tests {
     fn write_proc(root: &Path, pid: u32, comm: &str, write_bytes: u64) {
         let proc_dir = root.join(pid.to_string());
         fs::create_dir_all(&proc_dir).unwrap();
-        fs::write(proc_dir.join("comm"), format!("{comm}\n")).unwrap();
+        if !proc_dir.join("comm").exists() {
+            fs::write(proc_dir.join("comm"), format!("{comm}\n")).unwrap();
+        }
         fs::write(
-            proc_dir.join("io"),
-            format!("read_bytes: 1\nwrite_bytes: {write_bytes}\n"),
+            proc_dir.join("io.tmp"),
+            format!("read_bytes: 1\nwchar: {write_bytes}\n"),
         )
         .unwrap();
+        fs::rename(proc_dir.join("io.tmp"), proc_dir.join("io")).unwrap();
     }
 
     #[test]
@@ -326,9 +339,10 @@ mod tests {
         let root = temp_dir("proc");
         write_proc(&root, 1234, "file-storage", 2000);
 
-        let detector = ProcIdleDetector::new(root.clone(), "file-storage");
-        assert_eq!(detector.find_process_pid(), Some(1234));
-        assert_eq!(detector.write_bytes_for_pid(1234), Some(2000));
+        let detector =
+            ProcIdleDetector::new(root.clone(), "file-storage", &RuntimeConfig::default());
+        assert_eq!(detector.find_process_pid().unwrap(), Some(1234));
+        assert_eq!(detector.write_bytes_for_pid(1234).unwrap(), 2000);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -336,8 +350,9 @@ mod tests {
     #[test]
     fn proc_detector_treats_missing_process_as_idle() {
         let root = temp_dir("no-process");
-        let mut detector = ProcIdleDetector::new(root.clone(), "file-storage")
-            .with_sample_interval(Duration::ZERO);
+        let mut detector =
+            ProcIdleDetector::new(root.clone(), "file-storage", &RuntimeConfig::default())
+                .with_sample_interval(Duration::ZERO);
 
         assert!(detector.wait_for_idle(Duration::from_millis(10)));
         assert_eq!(detector.status().state, IdleState::Idle);
@@ -351,9 +366,10 @@ mod tests {
         fs::create_dir_all(root.join("1")).unwrap();
         write_proc(&root, 2, "file-storage", 1234);
 
-        let detector = ProcIdleDetector::new(root.clone(), "file-storage");
+        let detector =
+            ProcIdleDetector::new(root.clone(), "file-storage", &RuntimeConfig::default());
 
-        assert_eq!(detector.find_process_pid(), Some(2));
+        assert_eq!(detector.find_process_pid().unwrap(), Some(2));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -362,8 +378,9 @@ mod tests {
     fn low_write_delta_becomes_idle_without_first_large_burst() {
         let root = temp_dir("quiet");
         write_proc(&root, 42, "file-storage", 1000);
-        let mut detector = ProcIdleDetector::new(root.clone(), "file-storage")
-            .with_sample_interval(Duration::from_millis(1));
+        let mut detector =
+            ProcIdleDetector::new(root.clone(), "file-storage", &RuntimeConfig::default())
+                .with_sample_interval(Duration::from_millis(1));
 
         let updater_root = root.clone();
         let updater = thread::spawn(move || {
@@ -382,10 +399,7 @@ mod tests {
 
     #[test]
     fn parse_write_bytes_reads_expected_field() {
-        assert_eq!(
-            parse_write_bytes("read_bytes: 5\nwrite_bytes: 123\n"),
-            Some(123)
-        );
+        assert_eq!(parse_write_bytes("read_bytes: 5\nwchar: 123\n"), Some(123));
         assert_eq!(parse_write_bytes("read_bytes: 5\n"), None);
     }
 }

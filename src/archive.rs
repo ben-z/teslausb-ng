@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::command::CommandRunner;
 use crate::config::ArchiveConfig;
@@ -76,6 +78,7 @@ impl<F: FileSystem> ArchiveBackend<F> {
                 config.rclone_drive.clone(),
                 config.rclone_path.clone(),
                 config.rclone_flags.clone(),
+                config.copy_timeout,
                 fs,
             ))
         } else {
@@ -205,12 +208,12 @@ pub struct RcloneBackend<F: FileSystem> {
 }
 
 impl<F: FileSystem> RcloneBackend<F> {
-    pub fn new(remote: String, path: String, flags: Vec<String>, fs: F) -> Self {
+    pub fn new(remote: String, path: String, flags: Vec<String>, timeout: Duration, fs: F) -> Self {
         Self {
             remote,
             path: path.trim_matches('/').to_string(),
             flags,
-            timeout: Duration::from_secs(3600),
+            timeout,
             fs,
         }
     }
@@ -241,7 +244,7 @@ impl<F: FileSystem> RcloneBackend<F> {
 
     pub fn is_reachable(&self) -> bool {
         CommandRunner
-            .run(
+            .run_interruptible(
                 "rclone",
                 ["lsf", &self.remote_with_colon(), "--max-depth", "1"],
                 Some(Duration::from_secs(30)),
@@ -251,72 +254,101 @@ impl<F: FileSystem> RcloneBackend<F> {
     }
 
     pub fn copy_directory(&self, src: &Path, dst_name: &str) -> CopyResult {
-        let archived_files = match self.scan_directory(src) {
-            Ok(files) => files,
-            Err(err) => {
-                eprintln!(
-                    "warning: could not scan {} before archive: {}",
-                    src.display(),
-                    err
-                );
-                Vec::new()
-            }
+        match self.copy_directory_inner(src, dst_name) {
+            Ok(result) => result,
+            Err(error) => CopyResult {
+                success: false,
+                files_transferred: 0,
+                bytes_transferred: 0,
+                error: Some(error.to_string()),
+                archived_files: Vec::new(),
+            },
+        }
+    }
+
+    fn copy_directory_inner(&self, src: &Path, dst_name: &str) -> Result<CopyResult> {
+        let files = self.scan_directory(src)?;
+        if dst_name != "RecentClips" {
+            return self.copy_batch(src, dst_name, &files, None);
+        }
+        let mut batches = std::collections::BTreeMap::<String, Vec<ArchivedFile>>::new();
+        for file in files {
+            batches
+                .entry(recent_archive_directory(&file.relative_path)?)
+                .or_default()
+                .push(file);
+        }
+        let mut result = CopyResult {
+            success: true,
+            files_transferred: 0,
+            bytes_transferred: 0,
+            error: None,
+            archived_files: Vec::new(),
         };
+        let mut errors = Vec::new();
+        for (date, files) in batches {
+            let list = ArchiveFileList::new(self.fs.clone(), &files)?;
+            let batch = self.copy_batch(
+                src,
+                &format!("RecentClips/{date}"),
+                &files,
+                Some(&list.path),
+            )?;
+            result.files_transferred += batch.files_transferred;
+            result.bytes_transferred += batch.bytes_transferred;
+            result.archived_files.extend(batch.archived_files);
+            if let Some(error) = batch.error {
+                errors.push(error);
+            }
+        }
+        result.success = errors.is_empty();
+        if !errors.is_empty() {
+            result.error = Some(errors.join("; "));
+        }
+        Ok(result)
+    }
+
+    fn copy_batch(
+        &self,
+        src: &Path,
+        destination: &str,
+        files: &[ArchivedFile],
+        file_list: Option<&Path>,
+    ) -> Result<CopyResult> {
         let mut args = vec![
             "copy".to_string(),
             src.display().to_string(),
-            self.destination(dst_name),
-            "--stats-one-line".to_string(),
-            "-v".to_string(),
+            self.destination(destination),
         ];
         args.extend(self.flags.clone());
-
-        let output = CommandRunner.run(
+        args.extend(
+            ["--use-json-log", "--log-level", "DEBUG", "--no-traverse"].map(str::to_string),
+        );
+        if let Some(path) = file_list {
+            args.extend(["--files-from-raw".to_string(), path.display().to_string()]);
+        }
+        let output = CommandRunner.run_interruptible(
             "rclone",
             args.iter().map(String::as_str),
             Some(self.timeout),
-        );
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                return CopyResult {
-                    success: false,
-                    files_transferred: 0,
-                    bytes_transferred: 0,
-                    error: Some(err.to_string()),
-                    archived_files: Vec::new(),
-                };
-            }
+        )?;
+        let log = combined_command_output(&output);
+        let confirmed = parse_rclone_paths(&log, &["Copied (", "Unchanged skipping"])?;
+        let copied = select_archived_files(files, &parse_rclone_paths(&log, &["Copied ("])?);
+        let error = if output.timed_out {
+            Some(format!("rclone copy to {destination} timed out"))
+        } else if !output.success() {
+            Some(output.last_error_line())
+        } else {
+            None
         };
-
-        let combined_output = combined_command_output(&output);
-        if !output.success() {
-            let confirmed_paths =
-                parse_rclone_paths(&combined_output, &[": Copied (", ": Unchanged skipping"]);
-            let confirmed_files = select_archived_files(&archived_files, &confirmed_paths);
-            return CopyResult {
-                success: false,
-                files_transferred: confirmed_files.len() as u64,
-                bytes_transferred: confirmed_files.iter().map(|file| file.size).sum(),
-                error: Some(if output.timed_out {
-                    "Timeout".to_string()
-                } else {
-                    output.last_error_line()
-                }),
-                archived_files: confirmed_files,
-            };
-        }
-
-        let copied_paths = parse_rclone_paths(&combined_output, &[": Copied ("]);
-        let copied_files = select_archived_files(&archived_files, &copied_paths);
-
-        CopyResult {
-            success: true,
-            files_transferred: copied_files.len() as u64,
-            bytes_transferred: copied_files.iter().map(|file| file.size).sum(),
-            error: None,
-            archived_files,
-        }
+        Ok(CopyResult {
+            success: error.is_none(),
+            files_transferred: copied.len() as u64,
+            bytes_transferred: copied.iter().map(|file| file.size).sum(),
+            error,
+            archived_files: select_archived_files(files, &confirmed),
+        })
     }
 
     fn scan_directory(&self, src: &Path) -> Result<Vec<ArchivedFile>> {
@@ -335,6 +367,130 @@ impl<F: FileSystem> RcloneBackend<F> {
     }
 }
 
+fn recent_archive_directory(path: &Path) -> Result<String> {
+    let name = path
+        .to_str()
+        .ok_or_else(|| Error::new("RecentClips filename is not UTF-8"))?;
+    if matches!(name, "thumb.png" | "event.json") {
+        return Ok("metadata".to_string());
+    }
+    let date = name
+        .get(..10)
+        .ok_or_else(|| Error::new(format!("invalid RecentClips filename: {name}")))?;
+    let parts: Vec<_> = date.split('-').collect();
+    let valid_date = (|| -> Option<bool> {
+        if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+            return Some(false);
+        }
+        let year: u32 = parts[0].parse().ok()?;
+        let month: u32 = parts[1].parse().ok()?;
+        let day: u32 = parts[2].parse().ok()?;
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+            2 => 28,
+            _ => return Some(false),
+        };
+        Some(year > 0 && (1..=days).contains(&day))
+    })() == Some(true);
+    let valid_time = name.get(11..19).is_some_and(|time| {
+        let parts: Vec<_> = time.split('-').collect();
+        parts.len() == 3
+            && parts.iter().all(|part| part.len() == 2)
+            && parts[0].parse::<u32>().is_ok_and(|hour| hour < 24)
+            && parts[1].parse::<u32>().is_ok_and(|minute| minute < 60)
+            && parts[2].parse::<u32>().is_ok_and(|second| second < 60)
+    });
+    let valid_camera = name
+        .get(19..)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .and_then(|suffix| suffix.strip_suffix(".mp4"))
+        .is_some_and(|camera| {
+            !camera.is_empty()
+                && camera
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        });
+    if !valid_date
+        || !valid_time
+        || !valid_camera
+        || !name.get(10..).is_some_and(|rest| rest.starts_with('_'))
+        || !name.ends_with(".mp4")
+        || path.components().count() != 1
+        || name.contains(['\n', '\r'])
+    {
+        return Err(Error::new(format!("invalid RecentClips filename: {name}")));
+    }
+    Ok(date.to_string())
+}
+
+struct ArchiveFileList<F: FileSystem> {
+    fs: F,
+    path: PathBuf,
+}
+
+impl<F: FileSystem> ArchiveFileList<F> {
+    fn new(fs: F, files: &[ArchivedFile]) -> Result<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| Error::new(error.to_string()))?
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("teslausb-files-{}-{nonce}", std::process::id()));
+        let content = files
+            .iter()
+            .map(|file| format!("{}\n", file.relative_path.display()))
+            .collect::<String>();
+        fs.write_text_atomic(&path, &content)?;
+        Ok(Self { fs, path })
+    }
+}
+
+impl<F: FileSystem> Drop for ArchiveFileList<F> {
+    fn drop(&mut self) {
+        if let Err(error) = self.fs.remove_file(&self.path) {
+            eprintln!(
+                "error: failed to remove archive file list {}: {}",
+                self.path.display(),
+                error
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EventFile {
+    path: PathBuf,
+    size: u64,
+    modified: u64,
+}
+
+#[derive(Debug)]
+struct EventObservation {
+    files: Vec<EventFile>,
+    unchanged_since: Instant,
+    warned: bool,
+}
+
+fn has_video(files: &[EventFile]) -> bool {
+    files.iter().any(|file| {
+        file.size > 0
+            && file
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "mp4")
+    })
+}
+
+fn fully_confirmed(event: &[EventFile], confirmed: &[ArchivedFile]) -> bool {
+    event.iter().all(|file| {
+        confirmed
+            .iter()
+            .any(|copy| copy.relative_path == file.path && copy.size == file.size)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ArchiveManager<F: FileSystem> {
     fs: F,
@@ -346,6 +502,8 @@ pub struct ArchiveManager<F: FileSystem> {
     archive_sentry: bool,
     archive_track: bool,
     archive_photobooth: bool,
+    event_stability: Duration,
+    events: Arc<Mutex<HashMap<(String, PathBuf), EventObservation>>>,
 }
 
 impl<F: FileSystem> ArchiveManager<F> {
@@ -366,6 +524,8 @@ impl<F: FileSystem> ArchiveManager<F> {
             archive_sentry: config.archive_sentry,
             archive_track: config.archive_track,
             archive_photobooth: config.archive_photobooth,
+            event_stability: config.event_stability,
+            events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -377,18 +537,12 @@ impl<F: FileSystem> ArchiveManager<F> {
         &self.cam_disk_path
     }
 
-    pub fn archive_new_snapshot(&self, delete_after_archive: bool) -> Result<ArchiveResult> {
+    pub fn archive_new_snapshot(&self) -> Result<ArchiveResult> {
         let snapshot = self.snapshot_manager.create_snapshot()?;
         let handle = self.snapshot_manager.acquire(snapshot.id)?;
         let mounted = mount_image(&snapshot.image_path(), true)?;
         let result = self.archive_snapshot(&handle, mounted.path())?;
-        drop(mounted);
-
-        if delete_after_archive && result.success() && !result.archived_files.is_empty() {
-            let mounted_cam = mount_image(&self.cam_disk_path, false)?;
-            let (deleted, skipped) = self.delete_archived_files(&result, mounted_cam.path())?;
-            eprintln!("clean up: deleted {}, skipped {}", deleted, skipped);
-        }
+        mounted.unmount()?;
 
         Ok(result)
     }
@@ -420,25 +574,18 @@ impl<F: FileSystem> ArchiveManager<F> {
         let mut errors = Vec::new();
         for (src, dst_name) in dirs {
             let copy = self.backend.copy_directory(&src, &dst_name);
-            if copy.success {
-                result.files_transferred += copy.files_transferred;
-                result.bytes_transferred += copy.bytes_transferred;
-                if !copy.archived_files.is_empty() {
-                    result.archived_files.push((dst_name, copy.archived_files));
-                }
-            } else {
-                result.files_transferred += copy.files_transferred;
-                result.bytes_transferred += copy.bytes_transferred;
-                if !copy.archived_files.is_empty() {
-                    result
-                        .archived_files
-                        .push((dst_name.clone(), copy.archived_files));
-                }
+            result.files_transferred += copy.files_transferred;
+            result.bytes_transferred += copy.bytes_transferred;
+            if !copy.success {
                 errors.push(format!(
                     "{}: {}",
                     dst_name,
                     copy.error.unwrap_or_else(|| "unknown error".to_string())
                 ));
+            }
+            let cleanup_files = self.cleanup_candidates(&src, &dst_name, copy.archived_files)?;
+            if !cleanup_files.is_empty() {
+                result.archived_files.push((dst_name, cleanup_files));
             }
         }
 
@@ -450,6 +597,82 @@ impl<F: FileSystem> ArchiveManager<F> {
             result.error = Some(errors.join("; "));
         }
         Ok(result)
+    }
+
+    fn cleanup_candidates(
+        &self,
+        source: &Path,
+        directory: &str,
+        files: Vec<ArchivedFile>,
+    ) -> Result<Vec<ArchivedFile>> {
+        if directory == "RecentClips" {
+            return Ok(Vec::new());
+        }
+        if !matches!(directory, "SavedClips" | "SentryClips") {
+            return Ok(files);
+        }
+        let events = self.event_files(source)?;
+        let mut observations = self.events.lock().unwrap();
+        observations.retain(|(name, event), _| name != directory || events.contains_key(event));
+        let mut eligible = std::collections::HashSet::new();
+        for (event, signature) in events {
+            let observation = observations
+                .entry((directory.to_string(), event.clone()))
+                .or_insert_with(|| EventObservation {
+                    files: signature.clone(),
+                    unchanged_since: Instant::now(),
+                    warned: false,
+                });
+            if observation.files != signature {
+                *observation = EventObservation {
+                    files: signature.clone(),
+                    unchanged_since: Instant::now(),
+                    warned: false,
+                };
+            }
+            if observation.unchanged_since.elapsed() < self.event_stability {
+                continue;
+            }
+            if !has_video(&signature) {
+                if !observation.warned {
+                    eprintln!("warning: {directory}/{} has remained without video; preserving the event on the camera disk", event.display());
+                    observation.warned = true;
+                }
+            } else if fully_confirmed(&signature, &files) {
+                eligible.insert(event);
+            }
+        }
+        Ok(files
+            .into_iter()
+            .filter(|file| {
+                file.relative_path
+                    .parent()
+                    .is_some_and(|parent| eligible.contains(parent))
+            })
+            .collect())
+    }
+
+    fn event_files(&self, source: &Path) -> Result<HashMap<PathBuf, Vec<EventFile>>> {
+        let mut events = HashMap::<PathBuf, Vec<EventFile>>::new();
+        for path in self.fs.walk_files(source)? {
+            let relative = path
+                .strip_prefix(source)
+                .map_err(|error| Error::new(error.to_string()))?
+                .to_path_buf();
+            let event = relative
+                .parent()
+                .ok_or_else(|| Error::new("event file has no parent"))?
+                .to_path_buf();
+            events.entry(event).or_default().push(EventFile {
+                path: relative,
+                size: self.fs.file_size(&path)?,
+                modified: self.fs.mtime_secs(&path)?,
+            });
+        }
+        for files in events.values_mut() {
+            files.sort();
+        }
+        Ok(events)
     }
 
     fn dirs_to_archive(&self, mount_path: &Path) -> Vec<(PathBuf, String)> {
@@ -515,64 +738,93 @@ impl<F: FileSystem> ArchiveManager<F> {
         let mut skipped = 0;
 
         for (dir_name, files) in &result.archived_files {
+            if dir_name == "RecentClips" {
+                // The car uses this rolling buffer when saving dashcam and Sentry events.
+                skipped += files.len() as u64;
+                continue;
+            }
             let Some(relative_base) = cam_dir_for_archive_name(dir_name) else {
                 eprintln!("warning: unknown archive directory name: {}", dir_name);
                 continue;
             };
             let base_path = cam_disk_mount.join(relative_base);
+            let eligible_events = if matches!(dir_name.as_str(), "SavedClips" | "SentryClips") {
+                let live_events = self.event_files(&base_path)?;
+                let observations = self.events.lock().unwrap();
+                Some(
+                    live_events
+                        .into_iter()
+                        .filter_map(|(event, signature)| {
+                            let unchanged = observations
+                                .get(&(dir_name.clone(), event.clone()))
+                                .is_some_and(|observation| {
+                                    observation.files == signature
+                                        && observation.unchanged_since.elapsed()
+                                            >= self.event_stability
+                                });
+                            (unchanged
+                                && has_video(&signature)
+                                && fully_confirmed(&signature, files))
+                            .then_some(event)
+                        })
+                        .collect::<std::collections::HashSet<_>>(),
+                )
+            } else {
+                None
+            };
             for archived_file in files {
+                if !archived_file
+                    .relative_path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err(Error::new(
+                        "archive cleanup path must be relative and stay inside its event",
+                    ));
+                }
                 let file_path = base_path.join(&archived_file.relative_path);
+                if eligible_events.as_ref().is_some_and(|events| {
+                    !archived_file
+                        .relative_path
+                        .parent()
+                        .is_some_and(|parent| events.contains(parent))
+                }) {
+                    skipped += 1;
+                    continue;
+                }
                 if !self.fs.exists(&file_path) {
                     skipped += 1;
                     continue;
                 }
-                match self.fs.file_size(&file_path) {
-                    Ok(size) if size == archived_file.size => {}
-                    Ok(size) => {
-                        eprintln!(
-                            "warning: file size changed for {}; archived={}, current={}, skipping",
-                            file_path.display(),
-                            archived_file.size,
-                            size
-                        );
-                        skipped += 1;
-                        continue;
-                    }
-                    Err(err) => {
-                        eprintln!("warning: could not stat {}: {}", file_path.display(), err);
-                        skipped += 1;
-                        continue;
-                    }
+                let size = self.fs.file_size(&file_path)?;
+                if size != archived_file.size {
+                    eprintln!(
+                        "warning: file size changed for {}; archived={}, current={}, skipping",
+                        file_path.display(),
+                        archived_file.size,
+                        size
+                    );
+                    skipped += 1;
+                    continue;
                 }
-                match self.fs.remove_file(&file_path) {
-                    Ok(()) => deleted += 1,
-                    Err(err) => {
-                        eprintln!("warning: could not delete {}: {}", file_path.display(), err);
-                        skipped += 1;
-                    }
-                }
+                self.fs.remove_file(&file_path)?;
+                deleted += 1;
             }
-            self.cleanup_empty_dirs(&base_path);
+            self.cleanup_empty_dirs(&base_path)?;
         }
 
         Ok((deleted, skipped))
     }
 
-    fn cleanup_empty_dirs(&self, base_path: &Path) {
-        let Ok(mut files_or_dirs) = self.collect_dirs(base_path) else {
-            return;
-        };
-        files_or_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        for dir in files_or_dirs {
-            if self
-                .fs
-                .list_dir_names(&dir)
-                .map(|entries| entries.is_empty())
-                .unwrap_or(false)
-            {
-                let _ = self.fs.remove_dir(&dir);
+    fn cleanup_empty_dirs(&self, base_path: &Path) -> Result<()> {
+        let mut dirs = self.collect_dirs(base_path)?;
+        dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for dir in dirs {
+            if self.fs.list_dir_names(&dir)?.is_empty() {
+                self.fs.remove_dir(&dir)?;
             }
         }
+        Ok(())
     }
 
     fn collect_dirs(&self, base_path: &Path) -> Result<Vec<PathBuf>> {
@@ -615,27 +867,30 @@ fn combined_command_output(output: &crate::command::CommandOutput) -> String {
         .join("\n")
 }
 
-fn parse_rclone_paths(output: &str, markers: &[&str]) -> std::collections::HashSet<PathBuf> {
+fn parse_rclone_paths(
+    output: &str,
+    markers: &[&str],
+) -> Result<std::collections::HashSet<PathBuf>> {
     let mut paths = std::collections::HashSet::new();
-    for raw_line in output.lines() {
-        let line = raw_line.trim();
-        for marker in markers {
-            let Some((prefix, _)) = line.split_once(marker) else {
-                continue;
-            };
-            let rel_path = prefix
-                .rsplit_once(" : ")
-                .map(|(_, path)| path)
-                .unwrap_or(prefix)
-                .trim()
-                .trim_start_matches('/');
-            if !rel_path.is_empty() {
-                paths.insert(PathBuf::from(rel_path));
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| Error::new(format!("invalid rclone JSON log record: {error}")))?;
+        let (Some(object), Some(message)) = (record["object"].as_str(), record["msg"].as_str())
+        else {
+            continue;
+        };
+        if markers.iter().any(|marker| message.starts_with(marker)) {
+            let path = PathBuf::from(object);
+            if !path.as_os_str().is_empty()
+                && path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                paths.insert(path);
             }
-            break;
         }
     }
-    paths
+    Ok(paths)
 }
 
 fn select_archived_files(
@@ -677,7 +932,7 @@ mod tests {
 
     fn manager_with(
         fs: MockFileSystem,
-        config: ArchiveConfig,
+        mut config: ArchiveConfig,
         backend: ArchiveBackend<MockFileSystem>,
     ) -> ArchiveManager<MockFileSystem> {
         fs.create_dir_all(Path::new("/backingfiles/snapshots"))
@@ -689,13 +944,21 @@ mod tests {
             PathBuf::from("/backingfiles/snapshots"),
         )
         .unwrap();
-        ArchiveManager::new(
+        config.event_stability = Duration::ZERO;
+        let manager = ArchiveManager::new(
             fs,
             snapshot_manager,
             backend,
             PathBuf::from("/backingfiles/cam_disk.bin"),
             &config,
-        )
+        );
+        for directory in ["SavedClips", "SentryClips"] {
+            let source = PathBuf::from("/cam/TeslaCam").join(directory);
+            manager
+                .cleanup_candidates(&source, directory, Vec::new())
+                .unwrap();
+        }
+        manager
     }
 
     fn result_with_file(dir_name: &str, relative_path: &str, size: u64) -> ArchiveResult {
@@ -745,9 +1008,159 @@ mod tests {
     }
 
     #[test]
+    fn recent_archive_directory_rejects_invalid_dates_and_paths() {
+        assert_eq!(
+            recent_archive_directory(Path::new("2026-10-02_12-30-00-front.mp4")).unwrap(),
+            "2026-10-02"
+        );
+        assert!(recent_archive_directory(Path::new("2024-02-29_12-30-00-front.mp4")).is_ok());
+        for name in [
+            "2026-02-29_12-30-00-front.mp4",
+            "2026-13-01_x.mp4",
+            "../2026-10-02_x.mp4",
+            "unknown.mp4",
+            "2026-10-02_x.png",
+            "2026-10-02_x\n.mp4",
+        ] {
+            assert!(recent_archive_directory(Path::new(name)).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn recent_and_marker_only_events_are_never_cleanup_candidates() {
+        let fs = MockFileSystem::new();
+        fs.write_bytes("/clips/event/event.json", b"{}");
+        fs.write_bytes("/clips/event/thumb.png", b"png");
+        let manager = manager(fs.clone());
+        let files = vec![ArchivedFile {
+            relative_path: "event/event.json".into(),
+            size: 2,
+        }];
+        assert!(manager
+            .cleanup_candidates(Path::new("/clips"), "RecentClips", files.clone())
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .cleanup_candidates(Path::new("/clips"), "SavedClips", files.clone())
+            .unwrap()
+            .is_empty());
+        fs.write_bytes("/clips/event/front.mp4", b"video");
+        assert!(manager
+            .cleanup_candidates(Path::new("/clips"), "SavedClips", files)
+            .unwrap()
+            .is_empty());
+        let confirmed = vec![
+            ArchivedFile {
+                relative_path: "event/event.json".into(),
+                size: 2,
+            },
+            ArchivedFile {
+                relative_path: "event/thumb.png".into(),
+                size: 3,
+            },
+            ArchivedFile {
+                relative_path: "event/front.mp4".into(),
+                size: 5,
+            },
+        ];
+        assert_eq!(
+            manager
+                .cleanup_candidates(Path::new("/clips"), "SavedClips", confirmed)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn events_must_remain_unchanged_for_the_observed_grace_period() {
+        let fs = MockFileSystem::new();
+        fs.write_bytes("/clips/event/front.mp4", b"video");
+        let mut manager = manager(fs.clone());
+        manager.event_stability = Duration::from_secs(600);
+        let files = vec![ArchivedFile {
+            relative_path: "event/front.mp4".into(),
+            size: 5,
+        }];
+        assert!(manager
+            .cleanup_candidates(Path::new("/clips"), "SavedClips", files.clone())
+            .unwrap()
+            .is_empty());
+        manager
+            .events
+            .lock()
+            .unwrap()
+            .get_mut(&("SavedClips".into(), "event".into()))
+            .unwrap()
+            .unchanged_since -= Duration::from_secs(600);
+        assert_eq!(
+            manager
+                .cleanup_candidates(Path::new("/clips"), "SavedClips", files.clone())
+                .unwrap()
+                .len(),
+            1
+        );
+        fs.write_bytes("/clips/event/front.mp4", b"other");
+        assert!(manager
+            .cleanup_candidates(Path::new("/clips"), "SavedClips", files)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn cleanup_preserves_entire_event_changed_since_the_snapshot() {
+        let fs = MockFileSystem::new();
+        fs.write_bytes("/cam/TeslaCam/SavedClips/event/front.mp4", b"video");
+        let manager = manager(fs.clone());
+        let result = result_with_file("SavedClips", "event/front.mp4", 5);
+        fs.write_bytes("/cam/TeslaCam/SavedClips/event/front.mp4", b"other");
+        assert_eq!(
+            manager
+                .delete_archived_files(&result, Path::new("/cam"))
+                .unwrap(),
+            (0, 1)
+        );
+        assert_eq!(
+            fs.read_bytes("/cam/TeslaCam/SavedClips/event/front.mp4")
+                .unwrap(),
+            b"other"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_recent_buffer_and_marker_only_events() {
+        let fs = MockFileSystem::new();
+        fs.write_bytes("/cam/TeslaCam/RecentClips/front.mp4", b"video");
+        fs.write_bytes("/cam/TeslaCam/SavedClips/event/event.json", b"{}");
+        let manager = manager(fs.clone());
+        for (directory, file, size) in [
+            ("RecentClips", "front.mp4", 5),
+            ("SavedClips", "event/event.json", 2),
+        ] {
+            assert_eq!(
+                manager
+                    .delete_archived_files(
+                        &result_with_file(directory, file, size),
+                        Path::new("/cam")
+                    )
+                    .unwrap(),
+                (0, 1)
+            );
+        }
+        assert!(fs.exists(Path::new("/cam/TeslaCam/RecentClips/front.mp4")));
+        assert!(fs.exists(Path::new("/cam/TeslaCam/SavedClips/event/event.json")));
+    }
+
+    #[test]
     fn rclone_destination_building_matches_expected_paths() {
         let fs = MockFileSystem::new();
-        let remote_only = RcloneBackend::new("gdrive".into(), "".into(), Vec::new(), fs.clone());
+        let remote_only = RcloneBackend::new(
+            "gdrive".into(),
+            "".into(),
+            Vec::new(),
+            ArchiveConfig::default().copy_timeout,
+            fs.clone(),
+        );
         assert_eq!(remote_only.destination(""), "gdrive:");
         assert_eq!(remote_only.destination("SavedClips"), "gdrive:SavedClips");
 
@@ -755,6 +1168,7 @@ mod tests {
             "gdrive:".into(),
             "/TeslaCam/archive/".into(),
             Vec::new(),
+            ArchiveConfig::default().copy_timeout,
             fs,
         );
         assert_eq!(with_path.destination(""), "gdrive:TeslaCam/archive");
@@ -772,7 +1186,13 @@ mod tests {
         fs.write_bytes("/clips/event1/back.mp4", &[0; 2000]);
         fs.write_bytes("/clips/event1/event.json", b"{}");
 
-        let backend = RcloneBackend::new("gdrive".into(), "".into(), Vec::new(), fs);
+        let backend = RcloneBackend::new(
+            "gdrive".into(),
+            "".into(),
+            Vec::new(),
+            ArchiveConfig::default().copy_timeout,
+            fs,
+        );
         let files = backend.scan_directory(Path::new("/clips")).unwrap();
         let by_path = files
             .iter()
@@ -787,11 +1207,13 @@ mod tests {
 
     #[test]
     fn rclone_output_parsing_selects_confirmed_files() {
-        let output = "\
-<6>INFO  : event1/front.mp4: Copied (new)\n\
-<6>INFO  : /event1/back.mp4: Unchanged skipping\n\
-unrelated line\n";
-        let paths = parse_rclone_paths(output, &[": Copied (", ": Unchanged skipping"]);
+        let output = r#"{"object":"event1/front.mp4","msg":"Copied (new)"}
+{"object":"event1/back.mp4","msg":"Unchanged skipping"}
+{"object":"../outside.mp4","msg":"Copied (new)"}
+{"object":"/outside.mp4","msg":"Copied (new)"}
+{"msg":"summary"}
+"#;
+        let paths = parse_rclone_paths(output, &["Copied (", "Unchanged skipping"]).unwrap();
         let files = vec![
             ArchivedFile {
                 relative_path: PathBuf::from("event1/front.mp4"),
@@ -878,6 +1300,8 @@ unrelated line\n";
             .unwrap();
         fs.create_dir_all(Path::new("/mnt/TeslaCam/Photobooth"))
             .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", &[0; 1000]);
+        fs.write_bytes("/mnt/TeslaCam/SentryClips/event/front.mp4", &[0; 1000]);
         let backend = MockArchiveBackend::reachable(true);
         let copied_backend = backend.clone();
         let manager = manager_with(
@@ -934,6 +1358,7 @@ unrelated line\n";
             .unwrap();
         fs.create_dir_all(Path::new("/mnt/TeslaCam/SentryClips"))
             .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SentryClips/event/front.mp4", &[0; 1000]);
         let manager = manager_with(
             fs,
             ArchiveConfig::default(),
@@ -958,6 +1383,7 @@ unrelated line\n";
         let fs = MockFileSystem::new();
         fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips"))
             .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", &[0; 1000]);
         let manager = manager_with(
             fs,
             ArchiveConfig::default(),
