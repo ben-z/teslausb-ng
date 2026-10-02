@@ -266,6 +266,12 @@ When enabled, RecentClips uploads go into `RecentClips/YYYY-MM-DD/`. The car
 manages the local RecentClips buffer. TeslaUSB retains those local files so
 saving a recent event can still use them.
 
+If an existing flat `RecentClips` archive has reached the provider's directory
+limit, it cannot accept the new date subfolders. Stop the service and rename the
+old archive folder to an unused name, preserving its files. Verify that the
+destination name is unused before moving it. Restart the service to create a
+new `RecentClips` tree beside the preserved archive.
+
 The FAT32 camera filesystem and XFS backing filesystem have separate space
 limits. Deleting snapshots frees XFS space. Removing confirmed saved events
 frees camera filesystem space.
