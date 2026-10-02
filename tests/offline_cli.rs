@@ -967,7 +967,7 @@ exit 127
 }
 
 fn assert_success(output: &Output) {
-    assert!(output.status.success(), "{}", describe(&output));
+    assert!(output.status.success(), "{}", describe(output));
 }
 
 fn stdout(output: &Output) -> String {
