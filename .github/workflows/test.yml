@@ -44,7 +44,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux integration dependencies
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs dosfstools kpartx parted util-linux
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs dosfstools kpartx parted util-linux rclone
 
       - name: Run Linux integration tests
         run: scripts/run-linux-integration.sh
