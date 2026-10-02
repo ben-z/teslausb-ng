@@ -8,6 +8,7 @@ teslausb-ng is a Python rewrite of [TeslaUSB](https://github.com/marcone/teslaus
 - Dataclasses for data, protocols for abstractions
 - Each module has one clear purpose
 - Tests use `MockFilesystem`, not real filesystem
+- **Always use 1024-based units (KiB/MiB/GiB) for sizes**, not 1000-based (KB/MB/GB). All size constants, parsing, and formatting use powers of 1024.
 
 ## Grammar
 
