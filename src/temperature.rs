@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+
 pub const THERMAL_ZONE_PATH: &str = "/sys/class/thermal/thermal_zone0/temp";
 pub const THERMAL_PATH_ENV: &str = "TESLAUSB_THERMAL_PATH";
-pub const HYSTERESIS_MILLIDEGREES: i64 = 5000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TemperatureReading {
@@ -50,14 +51,16 @@ pub struct TemperatureConfig {
     pub warning_threshold: Option<i64>,
     pub caution_threshold: Option<i64>,
     pub poll_interval: Duration,
+    pub hysteresis_millidegrees: i64,
 }
 
 impl Default for TemperatureConfig {
     fn default() -> Self {
         Self {
-            warning_threshold: None,
-            caution_threshold: None,
+            warning_threshold: Some(80_000),
+            caution_threshold: Some(70_000),
             poll_interval: Duration::from_secs(60),
+            hysteresis_millidegrees: 5000,
         }
     }
 }
@@ -95,17 +98,25 @@ impl SysfsTemperatureMonitor {
         Self::new(thermal_path, config)
     }
 
-    pub fn is_available(&self) -> bool {
-        self.thermal_path.exists()
+    pub fn get_temperature(&self) -> Result<TemperatureReading> {
+        let content = fs::read_to_string(&self.thermal_path).map_err(|error| {
+            Error::new(format!(
+                "cannot read CPU temperature from {}: {}",
+                self.thermal_path.display(),
+                error
+            ))
+        })?;
+        let millidegrees = content.trim().parse::<i64>().map_err(|error| {
+            Error::new(format!(
+                "invalid CPU temperature in {}: {}",
+                self.thermal_path.display(),
+                error
+            ))
+        })?;
+        Ok(TemperatureReading::new(millidegrees))
     }
 
-    pub fn get_temperature(&self) -> Option<TemperatureReading> {
-        let content = fs::read_to_string(&self.thermal_path).ok()?;
-        let millidegrees = content.trim().parse::<i64>().ok()?;
-        Some(TemperatureReading::new(millidegrees))
-    }
-
-    pub fn update(&self) -> Option<TemperatureReading> {
+    pub fn update(&self) -> Result<TemperatureReading> {
         let reading = self.get_temperature()?;
         let mut state = self.state.lock().unwrap();
         state.current = Some(reading);
@@ -119,16 +130,18 @@ impl SysfsTemperatureMonitor {
         update_threshold(
             reading,
             self.config.warning_threshold,
+            self.config.hysteresis_millidegrees,
             &mut state.warning_triggered,
             "warning",
         );
         update_threshold(
             reading,
             self.config.caution_threshold,
+            self.config.hysteresis_millidegrees,
             &mut state.caution_triggered,
             "caution",
         );
-        Some(reading)
+        Ok(reading)
     }
 
     #[cfg(test)]
@@ -148,19 +161,28 @@ impl SysfsTemperatureMonitor {
         state.peak = None;
     }
 
-    pub fn start(&self) -> Option<TemperatureMonitorGuard> {
-        if !self.is_available() {
-            return None;
+    pub fn start(&self) -> Result<TemperatureMonitorGuard> {
+        if self.config.poll_interval.is_zero() {
+            return Err(Error::new("temperature poll interval must be positive"));
         }
+        self.update()?;
         self.stop_requested.store(false, Ordering::SeqCst);
         let monitor = self.clone();
         let handle = thread::spawn(move || {
             while !monitor.stop_requested.load(Ordering::SeqCst) {
-                monitor.update();
                 sleep_interruptible(monitor.config.poll_interval, &monitor.stop_requested);
+                if monitor.stop_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Err(error) = monitor.update() {
+                    eprintln!("error: temperature monitoring failed: {}", error);
+                    crate::coordinator::request_stop();
+                    return Err(error);
+                }
             }
+            Ok(())
         });
-        Some(TemperatureMonitorGuard {
+        Ok(TemperatureMonitorGuard {
             stop_requested: self.stop_requested.clone(),
             handle: Some(handle),
         })
@@ -169,14 +191,29 @@ impl SysfsTemperatureMonitor {
 
 pub struct TemperatureMonitorGuard {
     stop_requested: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<()>>>,
+}
+
+impl TemperatureMonitorGuard {
+    pub fn stop(mut self) -> Result<()> {
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<()> {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::new("temperature monitor thread panicked"))??;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TemperatureMonitorGuard {
     fn drop(&mut self) {
-        self.stop_requested.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Err(error) = self.join() {
+            eprintln!("error: temperature monitor stopped with failure: {}", error);
         }
     }
 }
@@ -184,13 +221,14 @@ impl Drop for TemperatureMonitorGuard {
 fn update_threshold(
     reading: TemperatureReading,
     threshold: Option<i64>,
+    hysteresis_millidegrees: i64,
     triggered: &mut bool,
     name: &str,
 ) {
     let Some(threshold) = threshold else {
         return;
     };
-    let clear_threshold = threshold - HYSTERESIS_MILLIDEGREES;
+    let clear_threshold = threshold - hysteresis_millidegrees;
     if reading.millidegrees < clear_threshold {
         *triggered = false;
     } else if reading.millidegrees > threshold && !*triggered {
@@ -295,13 +333,12 @@ mod tests {
         fs::write(&path, "45000").unwrap();
         let monitor = SysfsTemperatureMonitor::new(path.clone(), TemperatureConfig::default());
 
-        assert!(monitor.is_available());
         assert_eq!(monitor.get_temperature().unwrap().millidegrees, 45_000);
-        monitor.update();
+        monitor.update().unwrap();
         fs::write(&path, "70000").unwrap();
-        monitor.update();
+        monitor.update().unwrap();
         fs::write(&path, "60000").unwrap();
-        monitor.update();
+        monitor.update().unwrap();
 
         let status = monitor.status();
         assert_eq!(status.current.unwrap().millidegrees, 60_000);
@@ -315,26 +352,19 @@ mod tests {
     #[test]
     fn threshold_hysteresis_prevents_flapping() {
         let path = temp_file("threshold", "85000");
-        let monitor = SysfsTemperatureMonitor::new(
-            path.clone(),
-            TemperatureConfig {
-                warning_threshold: Some(80_000),
-                caution_threshold: Some(70_000),
-                poll_interval: Duration::from_secs(60),
-            },
-        );
+        let monitor = SysfsTemperatureMonitor::new(path.clone(), TemperatureConfig::default());
 
-        monitor.update();
+        monitor.update().unwrap();
         assert!(monitor.status().warning_triggered);
         assert!(monitor.status().caution_triggered);
 
         fs::write(&path, "76000").unwrap();
-        monitor.update();
+        monitor.update().unwrap();
         assert!(monitor.status().warning_triggered);
         assert!(monitor.status().caution_triggered);
 
         fs::write(&path, "64000").unwrap();
-        monitor.update();
+        monitor.update().unwrap();
         assert!(!monitor.status().warning_triggered);
         assert!(!monitor.status().caution_triggered);
 
@@ -351,5 +381,36 @@ mod tests {
         assert_eq!(monitor.status().peak.unwrap().millidegrees, 60_000);
         monitor.reset_peak();
         assert_eq!(monitor.status().peak.unwrap().millidegrees, 50_000);
+    }
+
+    #[test]
+    fn missing_or_invalid_temperature_fails_before_monitor_starts() {
+        let path = temp_file("invalid", "unavailable");
+        let monitor = SysfsTemperatureMonitor::new(path.clone(), TemperatureConfig::default());
+        assert!(monitor.start().is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(monitor.start().is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn read_failures_after_success_are_reported() {
+        let path = temp_file("read-failure", "45000");
+        let monitor = SysfsTemperatureMonitor::new(path.clone(), TemperatureConfig::default());
+        monitor.update().unwrap();
+        fs::write(&path, "broken").unwrap();
+        assert!(monitor.update().is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn guard_stops_without_waiting_for_poll_interval() {
+        let path = temp_file("stop", "45000");
+        let monitor = SysfsTemperatureMonitor::new(path.clone(), TemperatureConfig::default());
+        let guard = monitor.start().unwrap();
+        let started = std::time::Instant::now();
+        guard.stop().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

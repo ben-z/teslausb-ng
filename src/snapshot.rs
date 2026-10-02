@@ -91,7 +91,7 @@ impl<F: FileSystem> SnapshotManager<F> {
         };
         manager.fs.create_dir_all(&manager.snapshots_path)?;
         let _catalog_lock = manager.lock_catalog()?;
-        manager.load_snapshots(&mut manager.inner.lock().unwrap())?;
+        manager.load_snapshots(&mut manager.inner.lock().unwrap(), false)?;
         Ok(manager)
     }
 
@@ -103,7 +103,11 @@ impl<F: FileSystem> SnapshotManager<F> {
     }
 
     // The caller holds the catalog lock for the entire scan and any subsequent mutation.
-    fn load_snapshots(&self, inner: &mut SnapshotInner<F::Lock>) -> Result<()> {
+    fn load_snapshots(
+        &self,
+        inner: &mut SnapshotInner<F::Lock>,
+        recover_incomplete: bool,
+    ) -> Result<()> {
         let mut loaded = HashMap::new();
         let mut next_id = inner.next_id;
         let counter_path = self.snapshots_path.join(".next-id");
@@ -133,9 +137,11 @@ impl<F: FileSystem> SnapshotManager<F> {
             );
 
             if !self.fs.exists(&path.join("snap.toc")) {
-                if let Some(_lock) = self.fs.try_lock(&path.join("snap.lock"))? {
-                    eprintln!("warning: cleaning up incomplete snapshot {}", id);
-                    self.fs.remove_dir_all(&path)?;
+                if recover_incomplete {
+                    if let Some(_lock) = self.fs.try_lock(&path.join("snap.lock"))? {
+                        eprintln!("warning: cleaning up incomplete snapshot {}", id);
+                        self.fs.remove_dir_all(&path)?;
+                    }
                 }
                 continue;
             }
@@ -158,9 +164,6 @@ impl<F: FileSystem> SnapshotManager<F> {
                     id
                 )));
             }
-            if !self.fs.exists(&snapshot.metadata_path()) {
-                self.write_metadata(&snapshot)?;
-            }
             snapshot.externally_locked = if inner.process_locks.contains_key(&id) {
                 false
             } else {
@@ -178,10 +181,15 @@ impl<F: FileSystem> SnapshotManager<F> {
         Ok(())
     }
 
+    pub fn recover_incomplete(&self) -> Result<()> {
+        let _catalog_lock = self.lock_catalog()?;
+        self.load_snapshots(&mut self.inner.lock().unwrap(), true)
+    }
+
     pub fn create_snapshot(&self) -> Result<Snapshot> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner)?;
+        self.load_snapshots(&mut inner, true)?;
         let snap_id = inner.next_id;
         let next_id = snap_id
             .checked_add(1)
@@ -234,7 +242,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     pub fn acquire(&self, snapshot_id: u64) -> Result<SnapshotHandle<F>> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner)?;
+        self.load_snapshots(&mut inner, false)?;
         let snapshot = inner
             .snapshots
             .get(&snapshot_id)
@@ -271,7 +279,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     pub fn get_snapshots(&self) -> Result<Vec<Snapshot>> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner)?;
+        self.load_snapshots(&mut inner, false)?;
         let mut snapshots: Vec<_> = inner.snapshots.values().cloned().collect();
         snapshots.sort_by_key(|snapshot| (snapshot.created_secs, snapshot.id));
         Ok(snapshots)
@@ -298,7 +306,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     pub fn delete_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner)?;
+        self.load_snapshots(&mut inner, false)?;
         let Some(snapshot) = inner.snapshots.get(&snapshot_id) else {
             return Ok(false);
         };
@@ -440,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_incomplete_snapshot_without_toc_on_load() {
+    fn inspecting_an_incomplete_snapshot_does_not_remove_it() {
         let fs = MockFileSystem::new();
         fs.create_dir_all(Path::new("/backingfiles/snapshots/snap-000001"))
             .unwrap();
@@ -455,6 +463,8 @@ mod tests {
         .unwrap();
 
         assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(fs.exists(Path::new("/backingfiles/snapshots/snap-000001")));
+        manager.recover_incomplete().unwrap();
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000001")));
     }
 
@@ -487,9 +497,11 @@ mod tests {
         assert!(manager.delete_snapshot(snapshot.id).is_err());
         assert!(!manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.image_path()));
-        assert!(manager.get_snapshots().is_err());
+        assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(manager.recover_incomplete().is_err());
 
         manager.fs.allow_removal(&snapshot.path);
+        manager.recover_incomplete().unwrap();
         assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(!manager.fs.exists(&snapshot.path));
     }
@@ -593,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_deletion_without_toc_is_completed_on_load() {
+    fn interrupted_deletion_without_toc_is_completed_during_recovery() {
         let fs = MockFileSystem::new();
         fs.create_dir_all(Path::new("/backingfiles/snapshots/snap-000002"))
             .unwrap();
@@ -608,6 +620,8 @@ mod tests {
         .unwrap();
 
         assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(fs.exists(Path::new("/backingfiles/snapshots/snap-000002")));
+        manager.recover_incomplete().unwrap();
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000002")));
     }
 
@@ -635,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_without_metadata_is_reconstructed_and_metadata_saved() {
+    fn legacy_snapshot_without_metadata_can_be_inspected_without_writing_metadata() {
         let fs = MockFileSystem::new();
         let snap_path = Path::new("/backingfiles/snapshots/snap-000005");
         fs.create_dir_all(snap_path).unwrap();
@@ -653,11 +667,7 @@ mod tests {
         let snapshots = manager.get_snapshots().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, 5);
-        assert!(fs.exists(&snap_path.join("metadata.json")));
-        assert!(fs
-            .read_text(snap_path.join("metadata.json"))
-            .unwrap()
-            .contains("\"id\":5"));
+        assert!(!fs.exists(&snap_path.join("metadata.json")));
     }
 
     #[test]
@@ -756,6 +766,8 @@ mod tests {
 
         drop(catalog_lock);
         assert!(manager.get_snapshots().unwrap().is_empty());
+        assert!(fs.exists(path));
+        manager.recover_incomplete().unwrap();
         assert!(!fs.exists(path));
         assert_eq!(manager.create_snapshot().unwrap().id, 1);
     }
@@ -773,6 +785,7 @@ mod tests {
         assert!(fs.exists(&path.join("snap.bin")));
         drop(lock);
         assert!(manager.get_snapshots().unwrap().is_empty());
+        manager.recover_incomplete().unwrap();
         assert!(!fs.exists(path));
     }
 

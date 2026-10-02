@@ -40,11 +40,11 @@ pub fn calculate_cam_size(backingfiles_size: u64) -> u64 {
 
 pub fn disk_space(path: &Path) -> Result<SpaceInfo> {
     let runner = CommandRunner;
-    let _ = runner.run(
+    runner.check(
         "sync",
         std::iter::empty::<&str>(),
         Some(Duration::from_secs(30)),
-    );
+    )?;
     let output = runner.check(
         "df",
         ["-Pk", &path.display().to_string()],

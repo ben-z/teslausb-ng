@@ -233,9 +233,16 @@ fn check_dependency(spec: DependencySpec) -> DependencyReport {
         }
     };
 
+    assess_dependency(spec, &output)
+}
+
+fn assess_dependency(
+    spec: DependencySpec,
+    output: &crate::command::CommandOutput,
+) -> DependencyReport {
     let combined_output = format!("{}\n{}", output.stdout, output.stderr);
     let version = first_version(&combined_output);
-    if !output.success() && version.is_none() {
+    if output.timed_out || (!output.success() && version.is_none()) {
         return DependencyReport {
             name: spec.name,
             command: spec.command,
@@ -243,6 +250,17 @@ fn check_dependency(spec: DependencySpec) -> DependencyReport {
             version,
             min_version: spec.min_version,
             detail: format!("version check failed: {}", output.last_error_line()),
+        };
+    }
+
+    if spec.min_version.is_some() && version.is_none() {
+        return DependencyReport {
+            name: spec.name,
+            command: spec.command,
+            ok: false,
+            version,
+            min_version: spec.min_version,
+            detail: "could not determine the required dependency version".to_string(),
         };
     }
 
@@ -356,6 +374,42 @@ mod tests {
     fn compares_versions_numerically() {
         assert!(Version::new(1, 50, 0) >= Version::new(1, 9, 9));
         assert!(Version::new(4, 8, 9) < Version::new(4, 9, 0));
+    }
+
+    #[test]
+    fn minimum_version_requires_a_parseable_version() {
+        let spec = spec(
+            "rclone",
+            "rclone",
+            &["version"],
+            Some(Version::new(1, 50, 0)),
+        );
+        let output = crate::command::CommandOutput {
+            code: Some(0),
+            stdout: "unknown build".into(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        let report = assess_dependency(spec, &output);
+        assert!(!report.ok);
+        assert!(report.detail.contains("could not determine"));
+    }
+
+    #[test]
+    fn timeout_fails_even_when_a_version_was_printed() {
+        let spec = spec(
+            "rclone",
+            "rclone",
+            &["version"],
+            Some(Version::new(1, 50, 0)),
+        );
+        let output = crate::command::CommandOutput {
+            code: None,
+            stdout: "rclone v1.65.2".into(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(!assess_dependency(spec, &output).ok);
     }
 
     #[test]
