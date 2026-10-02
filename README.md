@@ -4,12 +4,12 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 ## Features
 
-- **On-demand snapshots**: Only when WiFi is available (no disk-full errors)
+- **On-demand snapshots**: Archive when the destination is reachable
 - **Reference counting**: Prevents race conditions between archiving and cleanup
 - **Crash-safe**: Uses `.toc` file as single source of truth
 - **rclone support**: Archive to 40+ cloud providers
 - **LED status indicators**: Visual feedback during operation
-- **Temperature monitoring**: Protects against overheating in hot vehicles
+- **Temperature monitoring**: Warns when the CPU is hot
 
 ## Requirements
 
@@ -29,6 +29,8 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 
 ## Set Up WiFi
 
+Use the network manager configured by your Linux image.
+
 ### NetworkManager (nmcli)
 
 ```bash
@@ -36,10 +38,10 @@ A Python rewrite of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam ar
 sudo nmcli device wifi list
 
 # Connect to a network
-sudo nmcli device wifi connect "YourNetworkName" password "YourPassword"
+sudo nmcli --ask device wifi connect "YourNetworkName"
 
 # Verify connection
-nmcli connection show
+nmcli connection show --active
 ```
 
 #### Multiple Networks
@@ -47,38 +49,37 @@ nmcli connection show
 You can save multiple WiFi networks (home, work, mobile hotspot):
 
 ```bash
-sudo nmcli device wifi connect "WorkWiFi" password "WorkPassword"
-sudo nmcli device wifi connect "iPhone" password "HotspotPassword"
+sudo nmcli --ask device wifi connect "WorkWiFi"
+sudo nmcli --ask device wifi connect "iPhone"
 ```
 
 The device will automatically connect to whichever saved network is available.
 
 ### Netplan
 
-```sh
-# List available networks
-iw wlan0 scan
+For images using Netplan with `systemd-networkd`, replace `wlan0` with your
+wireless interface name from `ip link`. Edit the existing WiFi configuration
+under `/etc/netplan/` with `sudoedit`, using this structure:
 
-# Add networks to netplan settings
-cat > /etc/netplan/20-wifi.yaml << 'EOF'
+```yaml
 network:
-   version: 2
-   renderer: networkd
-   wifis:
-   wlan0:
+  version: 2
+  renderer: networkd
+  wifis:
+    wlan0:
       dhcp4: true
       dhcp6: true
       access-points:
-         "YourSSID":
-         password: "YourPassword"
-EOF
+        "YourSSID":
+          password: "YourPassword"
+```
 
-# Apply the configuration
-netplan apply
+Protect the file containing your password, validate it, and try the configuration:
 
-# Show wifi status
-iw wlan0 link
-# or
+```sh
+sudo chmod 600 /etc/netplan/20-wifi.yaml  # Use the filename you edited
+sudo netplan generate
+sudo netplan try
 networkctl status wlan0
 ```
 
@@ -89,10 +90,12 @@ networkctl status wlan0
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install -y python3-pip rclone xfsprogs parted dosfstools kpartx
+sudo apt install -y git python3-venv rclone xfsprogs parted dosfstools kpartx
 
 # Install teslausb-ng
-pip install git+https://github.com/ben-z/teslausb-ng.git
+sudo python3 -m venv /opt/teslausb
+sudo /opt/teslausb/bin/pip install git+https://github.com/ben-z/teslausb-ng.git
+sudo ln -s /opt/teslausb/bin/teslausb /usr/local/bin/teslausb
 ```
 
 ### Updating
@@ -100,11 +103,11 @@ pip install git+https://github.com/ben-z/teslausb-ng.git
 To update to the latest version:
 
 ```bash
-pip install --force-reinstall git+https://github.com/ben-z/teslausb-ng.git
+sudo systemctl stop teslausb
+sudo /opt/teslausb/bin/pip install --force-reinstall git+https://github.com/ben-z/teslausb-ng.git
 
 # If running as a service, reinstall it to pick up any service file changes
-sudo teslausb service uninstall
-sudo teslausb service install
+sudo teslausb service install --force
 sudo systemctl start teslausb
 ```
 
@@ -123,7 +126,8 @@ The Rock 5C requires a device tree overlay to enable USB gadget mode. Without th
    sudo nano /boot/armbianEnv.txt
    ```
 
-2. Add this line:
+2. Add `rk3588-dwc3-peripheral` to the existing `overlays` line, preserving other
+   entries. If there is no `overlays` line, add:
    ```
    overlays=rk3588-dwc3-peripheral
    ```
@@ -139,25 +143,7 @@ The Rock 5C requires a device tree overlay to enable USB gadget mode. Without th
    # Should show: fc000000.usb
    ```
 
-**Note:** The first boot after enabling the overlay may fail with "gave up waiting for root file system device". Simply reboot again and it should work. This is a one-time timing issue during initial overlay application.
-
 **Important:** Once peripheral mode is enabled, the USB-C port used for gadget mode will **only** work as a device port (connecting to Tesla). It will no longer work as a USB host port. Ensure you have another way to connect peripherals if needed.
-
-**Power stability (recommended):**
-
-If your Rock 5C reboots randomly during boot (especially with lower-quality power supplies), you can reduce power draw by limiting the CPU cores. The RK3588S has 4 "big" performance cores and 4 "little" efficiency cores. For teslausb, the 4 little cores are sufficient.
-
-Edit `/boot/armbianEnv.txt` and add to the `extraargs` line:
-
-```
-extraargs=cma=256M cpufreq.default_governor=powersave maxcpus=4
-```
-
-This will:
-- `maxcpus=4` - Only enable the 4 little cores (cpu0-3), disabling the power-hungry big cores
-- `cpufreq.default_governor=powersave` - Run at minimum frequency when idle
-
-This significantly reduces power spikes during boot and is more than enough for teslausb's workload (which is I/O-bound, not CPU-bound).
 
 ### Raspberry Pi
 
@@ -173,19 +159,23 @@ And `/boot/cmdline.txt` includes `modules-load=dwc2` after `rootwait`.
 
 ## rclone Configuration
 
-Configure [rclone](https://rclone.org/) with your cloud provider:
+The service runs as root. Configure [rclone](https://rclone.org/) as root so the
+service can access its remote:
 
 ```bash
-rclone config
+sudo rclone config
 ```
 
-When running headless, rclone provides a URL you can open on another device to authorize.
+For a provider that needs browser authorization on a headless device, follow
+[rclone's headless instructions](https://rclone.org/remote_setup/). Answer `n`
+when asked to authenticate with a local browser, then run the displayed
+`rclone authorize` command on a computer with a browser.
 
 ---
 
 ## Configuration
 
-Create `/etc/teslausb.conf`:
+Create `/etc/teslausb.conf` with `sudoedit`:
 
 ```bash
 ARCHIVE_SYSTEM=rclone
@@ -229,13 +219,13 @@ The cam disk size is **automatically calculated** from available disk space:
 
 ```
 available_disk - reserve = backingfiles size
-backingfiles - 2 GiB (XFS overhead) = usable space
+backingfiles - 3% (XFS overhead) = usable space
 usable space / 2 = cam_size
 ```
 
-For example, on a 128 GiB SD card with 10 GiB reserved:
+For example, with 128 GiB of free disk space and 10 GiB reserved:
 - backingfiles.img = 118 GiB
-- cam_size = 58 GiB (half for cam disk, half for snapshots)
+- cam_size = approximately 57.2 GiB (half for cam disk, half for snapshots)
 
 This creates:
 - `/mutable/backingfiles.img` - XFS disk image (for reflink snapshots)
@@ -381,7 +371,7 @@ sudo teslausb gadget on
 
 2. Test rclone configuration:
    ```bash
-   rclone lsd gdrive:
+   sudo rclone lsd gdrive:
    ```
 
 3. Check service status:
@@ -399,15 +389,21 @@ sudo teslausb gadget on
 
 2. Manually clean old snapshots:
    ```bash
-   teslausb clean --dry-run  # See what would be deleted
-   teslausb clean            # Actually delete
+   sudo teslausb clean --dry-run  # See what would be deleted
+   sudo teslausb clean            # Actually delete
    ```
 
-3. If space is consistently low, reinitialize with a larger reserve to leave more room for the OS (this reduces the cam disk size):
+3. Check the archive logs for failed uploads or camera filesystem errors:
    ```bash
-   sudo teslausb deinit
-   sudo teslausb init --reserve 20G
+   sudo journalctl -u teslausb -n 100 --no-pager
+   sudo journalctl -k -n 100 --no-pager
+   df -h /mutable /backingfiles
    ```
+
+The camera's FAT32 filesystem and its XFS backing filesystem have separate space
+limits. Deleting snapshots frees XFS space; the archive cycle removes confirmed
+uploads from the camera filesystem. `deinit` permanently deletes all local
+recordings, so preserve footage before rebuilding the disk images.
 
 ### Service won't start
 
@@ -442,7 +438,9 @@ sudo teslausb gadget on
 ```bash
 git clone https://github.com/ben-z/teslausb-ng.git
 cd teslausb-ng
-pip install -e .
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[test]'
 pytest tests/ -v
 ```
 
