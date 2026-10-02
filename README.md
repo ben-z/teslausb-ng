@@ -259,8 +259,9 @@ and failed writes are reported as errors.
 
 Saved and Sentry event directories must remain unchanged across snapshots for
 at least ten minutes before removal. Every file must have positive rclone
-confirmation, and live files must still match the archived sizes. Incomplete
-events and events containing only metadata stay on the camera disk.
+confirmation, and live files must still match the archived sizes and modification
+times. Incomplete events and events containing only metadata stay on the camera
+disk.
 
 When enabled, RecentClips videos go into `RecentClips/YYYY-MM-DD/`; the known
 `thumb.png` and `event.json` files go into `RecentClips/metadata/`. The car
@@ -269,9 +270,11 @@ saving a recent event can still use them.
 
 If an existing flat `RecentClips` archive has reached the provider's directory
 limit, it cannot accept the new date subfolders. Stop the service and rename the
-old archive folder to an unused name, preserving its files. Verify that the
-destination name is unused before moving it. Restart the service to create a
-new `RecentClips` tree beside the preserved archive.
+old archive folder to `RecentClips-before-YYYY-MM-DD`, using the migration date
+and preserving its files. Verify that the destination name is unused before
+moving it. Restart the service to create a new `RecentClips` tree beside the
+preserved archive. TeslaCam Replay recognizes both the dated folders and
+preserved archives with this name.
 
 The FAT32 camera filesystem and XFS backing filesystem have separate space
 limits. Deleting snapshots frees XFS space. Removing confirmed saved events
