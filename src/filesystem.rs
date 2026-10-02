@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
     fn remove_dir(&self, path: &Path) -> Result<()>;
     fn read_text(&self, path: &Path) -> Result<String>;
+    fn create_private_file(&self, path: &Path, content: &str) -> Result<()>;
     fn write_text_atomic(&self, path: &Path, content: &str) -> Result<()>;
     fn copy_reflink(&self, src: &Path, dst: &Path) -> Result<()>;
     fn file_size(&self, path: &Path) -> Result<u64>;
@@ -92,6 +94,25 @@ impl FileSystem for RealFileSystem {
         fs::remove_dir(path)?;
         if let Some(parent) = path.parent() {
             self.sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
+    fn create_private_file(&self, path: &Path, content: &str) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        if let Err(error) = file.write_all(content.as_bytes()) {
+            drop(file);
+            fs::remove_file(path).map_err(|cleanup| {
+                Error::new(format!(
+                    "failed to write private file {}: {error}; failed to remove it: {cleanup}",
+                    path.display()
+                ))
+            })?;
+            return Err(error.into());
         }
         Ok(())
     }
@@ -437,6 +458,24 @@ impl FileSystem for MockFileSystem {
         Ok(())
     }
 
+    fn create_private_file(&self, path: &Path, content: &str) -> Result<()> {
+        let path = normalize(path);
+        let mut state = self.inner.lock().unwrap();
+        if state.files.contains_key(&path) || state.dirs.contains(&path) {
+            return Err(Error::new(format!(
+                "file already exists: {}",
+                path.display()
+            )));
+        }
+        state.tick += 1;
+        let tick = state.tick;
+        state
+            .files
+            .insert(path.clone(), content.as_bytes().to_vec());
+        state.mtimes.insert(path, tick);
+        Ok(())
+    }
+
     fn write_text_atomic(&self, path: &Path, content: &str) -> Result<()> {
         let path = normalize(path);
         let mut state = self.inner.lock().unwrap();
@@ -670,6 +709,28 @@ mod tests {
         drop(guard);
         assert!(RealFileSystem.try_lock(&path).unwrap().is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_files_are_exclusive_and_owner_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("private");
+        let path = root.join("log");
+        let fs = RealFileSystem;
+        fs.create_private_file(&path, "private log").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs.create_private_file(&path, "replacement").is_err());
+        assert_eq!(fs.read_text(&path).unwrap(), "private log");
+        fs::remove_dir_all(root).unwrap();
+
+        let mock = MockFileSystem::new();
+        mock.create_private_file(&path, "private log").unwrap();
+        assert!(mock.create_private_file(&path, "replacement").is_err());
+        assert_eq!(mock.read_text(&path).unwrap(), "private log");
     }
 
     #[test]
