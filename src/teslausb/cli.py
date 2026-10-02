@@ -29,6 +29,7 @@ from .config import Config, ConfigError, GB, load_from_env, load_from_file, pars
 from .coordinator import Coordinator, CoordinatorConfig
 from .filesystem import RealFilesystem
 from .gadget import GadgetError, LunConfig, UsbGadget
+from .idle import ProcIdleDetector
 from .led import SysfsLedController
 from .mount import mount_image
 from .snapshot import SnapshotInUseError, SnapshotManager
@@ -502,6 +503,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             mount_fn=mount_image,
             led_controller=led_controller,
             temperature_monitor=temp_monitor,
+            idle_detector=ProcIdleDetector(),
             gadget=gadget,
         ),
     )
@@ -527,7 +529,11 @@ def cmd_archive(args: argparse.Namespace) -> int:
         archive_manager=archive_manager,
         space_manager=space_manager,
         backend=backend,
-        config=CoordinatorConfig(mount_fn=mount_image),
+        config=CoordinatorConfig(
+            mount_fn=mount_image,
+            idle_detector=ProcIdleDetector(),
+            gadget=UsbGadget(),
+        ),
     )
 
     success = coordinator.run_once()

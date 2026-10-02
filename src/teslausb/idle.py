@@ -18,7 +18,6 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from threading import Event
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -81,19 +80,24 @@ class ProcIdleDetector:
         self,
         proc_path: Path = Path("/proc"),
         process_name: str = "file-storage",
-        stop_event: Event | None = None,
+        write_threshold: int = WRITE_THRESHOLD,
+        idle_confirm_seconds: int = IDLE_CONFIRM_SECONDS,
+        poll_interval: float = 1.0,
     ):
         """Initialize the idle detector.
 
         Args:
             proc_path: Path to /proc filesystem
             process_name: Name of the mass storage process to monitor
-            stop_event: Optional threading event for interruptible waits.
-                        When set, wait_for_idle returns False immediately.
+            write_threshold: Bytes per second considered active writing
+            idle_confirm_seconds: Seconds of quiet before declaring idle
+            poll_interval: Seconds between write counter samples
         """
         self.proc_path = proc_path
         self.process_name = process_name
-        self.stop_event = stop_event
+        self.write_threshold = write_threshold
+        self.idle_confirm_seconds = idle_confirm_seconds
+        self.poll_interval = poll_interval
         self._state = IdleState.UNDETERMINED
         self._prev_written = -1
         self._burst_size = 0
@@ -142,14 +146,10 @@ class ProcIdleDetector:
     def wait_for_idle(self, timeout: float = DEFAULT_TIMEOUT) -> bool:
         """Wait for the car to become idle.
 
-        Uses a state machine with three states:
-        - UNDETERMINED: Initial, waiting for baseline sample
-        - WRITING: Active writes detected (>500KB/sec)
-        - IDLE: Below threshold; confirmed after IDLE_CONFIRM_SECONDS quiet samples
-
-        UNDETERMINED and IDLE share identical transition logic: accumulate
-        quiet samples toward the confirmation threshold, or enter WRITING
-        on a large delta.
+        Uses a state machine to detect idle:
+        1. UNDETERMINED: Wait for first significant write
+        2. WRITING: Car is actively writing
+        3. IDLE: No writes for IDLE_CONFIRM_SECONDS
 
         Args:
             timeout: Maximum seconds to wait
@@ -166,12 +166,7 @@ class ProcIdleDetector:
 
         start_time = time.monotonic()
         while (time.monotonic() - start_time) < timeout:
-            if self.stop_event:
-                if self.stop_event.wait(timeout=1):
-                    logger.info("Stop requested, aborting idle wait")
-                    return False
-            else:
-                time.sleep(1)
+            time.sleep(self.poll_interval)
 
             pid = self._find_process_pid()
             if pid is None:
@@ -190,32 +185,28 @@ class ProcIdleDetector:
             delta = written - self._prev_written
             self._prev_written = written
 
-            if self._state == IdleState.WRITING:
-                if delta < WRITE_THRESHOLD:
+            if delta > self.write_threshold:
+                if self._state != IdleState.WRITING:
+                    logger.info("Write in progress")
+                self._state = IdleState.WRITING
+                self._burst_size = delta
+                self._idle_count = 0
+            else:
+                if self._state == IdleState.WRITING:
                     logger.info(f"No longer writing, wrote {self._burst_size} bytes")
                     self._state = IdleState.IDLE
                     self._burst_size = 0
                     self._idle_count = 0
-                else:
-                    self._burst_size += delta
+                elif self._state == IdleState.UNDETERMINED:
+                    logger.info("No writes observed, checking idle interval")
+                    self._state = IdleState.IDLE
 
-            else:
-                # UNDETERMINED and IDLE share the same transition logic:
-                # accumulate quiet samples, return on confirmation threshold,
-                # or enter WRITING on a big delta.
-                if delta > WRITE_THRESHOLD:
-                    logger.info("Write in progress")
-                    self._state = IdleState.WRITING
-                    self._burst_size = delta
-                    self._idle_count = 0
-                else:
-                    self._idle_count += 1
-                    if self._idle_count >= IDLE_CONFIRM_SECONDS:
-                        logger.info(
-                            f"No writes seen in the last {IDLE_CONFIRM_SECONDS} seconds"
-                        )
-                        self._state = IdleState.IDLE
-                        return True
+                self._idle_count += 1
+                if self._idle_count >= self.idle_confirm_seconds:
+                    logger.info(
+                        f"No writes seen in the last {self.idle_confirm_seconds} seconds"
+                    )
+                    return True
 
         logger.warning("Couldn't determine idle interval")
         return False
