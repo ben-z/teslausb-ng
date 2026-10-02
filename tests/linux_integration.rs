@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -11,13 +12,19 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+unsafe extern "C" {
+    fn umount(target: *const std::ffi::c_char) -> std::ffi::c_int;
+}
 
 struct Harness {
     root: PathBuf,
     fake_bin: PathBuf,
     mutable: PathBuf,
     backingfiles: PathBuf,
-    _mutable_mount: MountGuard,
+    mutable_mount: MountGuard,
+    cleaned: bool,
     config: PathBuf,
     old_path: OsString,
 }
@@ -27,6 +34,8 @@ impl Harness {
         require_linux_integration();
 
         let root = temp_path("teslausb-linux");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
         let fake_bin = root.join("bin");
         let mutable = root.join("mutable");
         let backingfiles = root.join("backingfiles");
@@ -54,7 +63,8 @@ impl Harness {
             fake_bin,
             mutable,
             backingfiles,
-            _mutable_mount: mutable_mount,
+            mutable_mount,
+            cleaned: false,
             config,
             old_path: env::var_os("PATH").unwrap_or_default(),
         }
@@ -97,13 +107,91 @@ impl Harness {
     fn cam_disk(&self) -> PathBuf {
         self.backingfiles.join("cam_disk.bin")
     }
+
+    fn clean_up(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        unmount_fixture(&self.backingfiles)?;
+        self.mutable_mount.clean_up()?;
+        fs::remove_dir_all(&self.root)
+            .map_err(|err| format!("remove {}: {err}", self.root.display()))?;
+        self.cleaned = true;
+        Ok(())
+    }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = run_status("umount", [&self.backingfiles]);
-        let _ = fs::remove_dir_all(&self.root);
+        let result = self.clean_up();
+        report_cleanup_result(&self.root, result);
     }
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+fn linux_fixture_cleanup_waits_for_open_loop_references() {
+    let harness = Harness::new("none");
+    let root = harness.root.clone();
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+
+    let cam = PartitionMount::mount(&harness.cam_disk(), &root.join("cam-held"), "rw");
+    let loop_reference = fs::File::open(&cam.loop_dev).unwrap();
+    let loop_name = Path::new(&cam.loop_dev).file_name().unwrap();
+    let autoclear = Path::new("/sys/block")
+        .join(loop_name)
+        .join("loop/autoclear");
+    let cleanup = thread::spawn(move || drop(cam));
+    let detach_requested = wait_until(
+        || fs::read_to_string(&autoclear).unwrap().trim() == "1",
+        Duration::from_secs(5),
+    );
+    let cleanup_waited = !wait_until(|| cleanup.is_finished(), Duration::from_millis(200));
+    drop(loop_reference);
+    cleanup.join().unwrap();
+
+    assert!(detach_requested, "cleanup must request loop detach");
+    assert!(
+        cleanup_waited,
+        "cleanup returned while the loop image was still held open"
+    );
+    assert!(loops_backed_under(&harness.cam_disk()).unwrap().is_empty());
+    drop(harness);
+    assert!(!root.exists(), "fully detached fixture should be removed");
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+fn linux_fixture_cleanup_retains_data_when_unmount_fails() {
+    let mut harness = Harness::new("none");
+    let root = harness.root.clone();
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    let open_image = fs::File::open(harness.cam_disk()).unwrap();
+
+    let error = harness.clean_up().unwrap_err();
+
+    assert!(error.contains("umount"), "{error}");
+    assert!(
+        harness.cam_disk().is_file(),
+        "busy fixture must retain its camera image"
+    );
+    assert!(harness.mutable.join("backingfiles.img").is_file());
+    assert_success(&run(
+        "mountpoint",
+        ["-q", harness.backingfiles.to_str().unwrap()],
+    ));
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        drop(open_image);
+    });
+    harness.clean_up().unwrap();
+    release.join().unwrap();
+    assert!(
+        !root.exists(),
+        "fixture should be removed once it can be unmounted"
+    );
 }
 
 #[test]
@@ -592,7 +680,10 @@ fn linux_snapshot_inspection_preserves_incomplete_data_until_recovery() {
 }
 
 struct MountGuard {
+    image: PathBuf,
     mount_point: PathBuf,
+    loop_dev: Option<String>,
+    cleaned: bool,
 }
 
 impl MountGuard {
@@ -603,28 +694,53 @@ impl MountGuard {
         ));
         assert_success(&run("mkfs.xfs", [OsStr::new("-f"), image.as_os_str()]));
         fs::create_dir_all(mount_point).unwrap();
+        let output = run(
+            "losetup",
+            [OsStr::new("-f"), OsStr::new("--show"), image.as_os_str()],
+        );
+        assert_success(&output);
+        let loop_dev = stdout(&output).trim().to_string();
+        assert!(!loop_dev.is_empty(), "losetup produced no loop device");
+        let guard = Self {
+            image,
+            mount_point: mount_point.to_path_buf(),
+            loop_dev: Some(loop_dev),
+            cleaned: false,
+        };
         assert_success(&run(
             "mount",
             [
-                OsStr::new("-o"),
-                OsStr::new("loop"),
-                image.as_os_str(),
+                OsStr::new(guard.loop_dev.as_ref().unwrap()),
                 mount_point.as_os_str(),
             ],
         ));
-        Self {
-            mount_point: mount_point.to_path_buf(),
+        guard
+    }
+
+    fn clean_up(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
         }
+        unmount_fixture(&self.mount_point)?;
+        if let Some(loop_dev) = &self.loop_dev {
+            checked_run("losetup", ["-d", loop_dev])?;
+            self.loop_dev = None;
+        }
+        wait_for_detached_loops(&self.image)?;
+        self.cleaned = true;
+        Ok(())
     }
 }
 
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        let _ = run_status("umount", [&self.mount_point]);
+        let result = self.clean_up();
+        report_cleanup_result(&self.image, result);
     }
 }
 
 struct PartitionMount {
+    image: PathBuf,
     loop_dev: String,
     mount_point: PathBuf,
     kpartx_used: bool,
@@ -674,6 +790,7 @@ impl PartitionMount {
         ));
 
         Self {
+            image: image.to_path_buf(),
             loop_dev,
             mount_point: mount_point.to_path_buf(),
             kpartx_used,
@@ -683,16 +800,142 @@ impl PartitionMount {
     fn path(&self) -> &Path {
         &self.mount_point
     }
+
+    fn clean_up(&self) -> Result<(), String> {
+        unmount_fixture(&self.mount_point)?;
+        if self.kpartx_used {
+            checked_run("kpartx", ["-d", &self.loop_dev])?;
+        }
+        checked_run("losetup", ["-d", &self.loop_dev])?;
+        wait_for_detached_loops(&self.image)
+    }
 }
 
 impl Drop for PartitionMount {
     fn drop(&mut self) {
-        let _ = run_status("sync", std::iter::empty::<&OsStr>());
-        let _ = run_status("umount", [&self.mount_point]);
-        if self.kpartx_used {
-            let _ = run_status("kpartx", [OsStr::new("-d"), OsStr::new(&self.loop_dev)]);
+        report_cleanup_result(&self.image, self.clean_up());
+    }
+}
+
+fn report_cleanup_result(fixture: &Path, result: Result<(), String>) {
+    if let Err(err) = result {
+        let message = format!(
+            "failed to clean up {}; fixture retained: {err}",
+            fixture.display()
+        );
+        if thread::panicking() {
+            eprintln!("{message}");
+        } else {
+            panic!("{message}");
         }
-        let _ = run_status("losetup", [OsStr::new("-d"), OsStr::new(&self.loop_dev)]);
+    }
+}
+
+fn unmount_fixture(mount_point: &Path) -> Result<(), String> {
+    // Inner loops can keep this filesystem busy after their own mounts are gone.
+    wait_for_detached_loops(mount_point)?;
+    if !mount_point
+        .try_exists()
+        .map_err(|err| format!("stat {}: {err}", mount_point.display()))?
+    {
+        return Ok(());
+    }
+    let output = checked_output("mountpoint", [OsStr::new("-q"), mount_point.as_os_str()])?;
+    match output.status.code() {
+        Some(0) => unmount_when_unused(mount_point),
+        Some(32) => Ok(()),
+        _ => Err(format!(
+            "mountpoint {}: {}",
+            mount_point.display(),
+            describe(&output)
+        )),
+    }
+}
+
+fn unmount_when_unused(mount_point: &Path) -> Result<(), String> {
+    let target = CString::new(mount_point.as_os_str().as_bytes())
+        .map_err(|err| format!("invalid mount path {}: {err}", mount_point.display()))?;
+    let started = Instant::now();
+    loop {
+        // The CString is alive for the call; umount does not retain its pointer.
+        if unsafe { umount(target.as_ptr()) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::ResourceBusy || started.elapsed() >= CLEANUP_TIMEOUT {
+            return Err(format!("umount {}: {err}", mount_point.display()));
+        }
+        // Loop sysfs removal can precede the kernel's final backing-file release.
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_detached_loops(scope: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let attached = loops_backed_under(scope)?;
+        if attached.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= CLEANUP_TIMEOUT {
+            return Err(format!(
+                "loop devices still hold {}: {}",
+                scope.display(),
+                attached.join(", ")
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn loops_backed_under(scope: &Path) -> Result<Vec<String>, String> {
+    let mut attached = Vec::new();
+    for entry in fs::read_dir("/sys/block").map_err(|err| format!("read /sys/block: {err}"))? {
+        let entry = entry.map_err(|err| format!("read /sys/block entry: {err}"))?;
+        if !entry.file_name().as_encoded_bytes().starts_with(b"loop") {
+            continue;
+        }
+        let path = entry.path().join("loop/backing_file");
+        let backing = match fs::read_to_string(&path) {
+            Ok(backing) => backing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("read {}: {err}", path.display())),
+        };
+        let backing = backing
+            .trim()
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\134", "\\");
+        let backing = backing.strip_suffix(" (deleted)").unwrap_or(&backing);
+        if Path::new(backing).starts_with(scope) {
+            attached.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(attached)
+}
+
+fn checked_output<I, S>(program: &str, args: I) -> Result<Output, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("run {program}: {err}"))
+}
+
+fn checked_run<I, S>(program: &str, args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = checked_output(program, args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program}: {}", describe(&output)))
     }
 }
 
