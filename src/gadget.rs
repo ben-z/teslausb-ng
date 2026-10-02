@@ -349,7 +349,7 @@ fn device_backs_image(device: &Path, image: &Path) -> Result<bool> {
             .replace("\\040", " ")
             .replace("\\011", "\t")
             .replace("\\134", "\\");
-        return Ok(Path::new(&backing) == image);
+        return Ok(fs::canonicalize(backing)? == image);
     }
     let slaves = device.join("slaves");
     if slaves.exists() {
