@@ -43,6 +43,7 @@ src/
 - No `snap.toc` means the snapshot is incomplete; explicit runtime recovery removes it.
 - Delete `snap.toc` before deleting snapshot data.
 - Disable the USB gadget before mounting `cam_disk.bin` read-write.
+- Require ext4 camera partitions; reject other formats without repair or conversion.
 - Re-enable the USB gadget only after checked unmount and successful filesystem verification.
 - Require positive rclone confirmations and revalidate the whole Saved/Sentry event file set, sizes, and modification times before deletion.
 - Require five consecutive samples with no USB `wchar` writes before snapshots and cleanup; skip the cycle on timeout.
@@ -57,7 +58,7 @@ Use `MockFileSystem` for snapshot and archive behavior tests.
 `tests/offline_cli.rs` validates the compiled binary against fake Unix tools for
 offline coverage of init, mount, `run`, archive, clean, status, doctor, and
 service flows. `tests/linux_integration.rs` validates real loop-device, XFS,
-FAT32, mount, reflink, archive cleanup, and `run` signal handling through
+ext4, mount, reflink, archive cleanup, and `run` signal handling through
 `scripts/run-linux-integration.sh` on a privileged Linux host, VM, or QEMU guest.
 Add hardware-specific tests for configfs and USB gadget behavior.
 

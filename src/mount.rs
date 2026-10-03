@@ -1,14 +1,15 @@
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command::{CommandOutput, CommandRunner};
-use crate::config::CameraFilesystem;
 use crate::error::{Error, Result};
-use crate::snapshot::RECOVERY_DIRECTORY;
+use crate::filesystem::RealFileSystem;
+use crate::snapshot::{
+    begin_recovery, latch_recovery_failure, prepare_recovery, release_recovery, RECOVERY_DIRECTORY,
+};
 
 static MOUNT_COUNTER: Mutex<u64> = Mutex::new(0);
 
@@ -160,9 +161,11 @@ impl MountedImage {
             Err(error) => return Err(error.into()),
         }
         if let Some(path) = &self.recovery_dir {
-            fs::remove_file(path.join("recovered.bin"))?;
-            fs::remove_file(path.join("raw.bin"))?;
-            fs::remove_dir(path)?;
+            release_recovery(
+                &RealFileSystem,
+                path.parent()
+                    .ok_or_else(|| Error::new("recovery directory has no catalog"))?,
+            )?;
             self.recovery_dir = None;
         }
         Ok(())
@@ -233,34 +236,33 @@ pub fn setup_loop_device(image_path: &Path, readonly: bool) -> Result<LoopDevice
     )))
 }
 
-fn parse_filesystem(value: &str) -> Result<CameraFilesystem> {
+fn validate_filesystem(value: &str) -> Result<()> {
     match value.trim() {
-        "vfat" => Ok(CameraFilesystem::Fat32),
-        "ext4" => Ok(CameraFilesystem::Ext4),
+        "ext4" => Ok(()),
         value => Err(Error::new(format!(
-            "unsupported camera filesystem {value:?}; expected vfat or ext4"
+            "unsupported camera filesystem {value:?}; ext4 is required; preserve the existing image and migrate it before using TeslaUSB"
         ))),
     }
 }
 
-fn detect_filesystem(partition: &str) -> Result<CameraFilesystem> {
+fn ensure_ext4(partition: &str) -> Result<()> {
     let output = CommandRunner.check(
         "blkid",
         ["-p", "-s", "TYPE", "-o", "value", partition],
         Some(Duration::from_secs(30)),
     )?;
-    parse_filesystem(&output.stdout)
+    validate_filesystem(&output.stdout)
 }
 
-fn check_partition(program: &str, args: &[&str], repair: bool) -> Result<()> {
-    let output = CommandRunner.run(program, args, Some(Duration::from_secs(120)))?;
-    assess_check(program, &output, repair)
+fn check_partition(args: &[&str], repair: bool) -> Result<()> {
+    let output = CommandRunner.run("e2fsck", args, Some(Duration::from_secs(120)))?;
+    assess_check(&output, repair)
 }
 
-fn assess_check(program: &str, output: &CommandOutput, repair: bool) -> Result<()> {
+fn assess_check(output: &CommandOutput, repair: bool) -> Result<()> {
     let details = format!("{}\n{}", output.stdout.trim(), output.stderr.trim());
     if !details.trim().is_empty() {
-        eprintln!("{program}: {}", details.trim());
+        eprintln!("e2fsck: {}", details.trim());
     }
     if output.timed_out || !(output.code == Some(0) || repair && output.code == Some(1)) {
         let reason = if repair {
@@ -286,42 +288,27 @@ pub fn fsck_image(image_path: &Path) -> Result<()> {
         Path::new("/proc/self/mountinfo"),
     )?;
     let mut device = setup_loop_device(image_path, false)?;
-    match detect_filesystem(device.partition())? {
-        CameraFilesystem::Fat32 => {
-            check_partition("fsck", &["-p", device.partition()], true)?;
-            check_partition("fsck", &["-n", device.partition()], false)?;
-        }
-        CameraFilesystem::Ext4 => {
-            check_partition("e2fsck", &["-p", device.partition()], true)?;
-            check_partition("e2fsck", &["-f", "-n", device.partition()], false)?;
-        }
-    }
+    ensure_ext4(device.partition())?;
+    check_partition(&["-p", device.partition()], true)?;
+    check_partition(&["-f", "-n", device.partition()], false)?;
     device.detach()
 }
 
 pub fn mount_image(image_path: &Path, readonly: bool) -> Result<MountedImage> {
     let device = setup_loop_device(image_path, readonly)?;
-    let filesystem = detect_filesystem(device.partition())?;
-    if readonly && filesystem == CameraFilesystem::Ext4 {
+    ensure_ext4(device.partition())?;
+    if readonly {
         return Err(Error::new(
             "ext4 read-only mounts require a recovered snapshot",
         ));
     }
-    mount_partition(device, filesystem, readonly)
+    mount_partition(device, readonly)
 }
 
-fn mount_partition(
-    device: LoopDevice,
-    filesystem: CameraFilesystem,
-    readonly: bool,
-) -> Result<MountedImage> {
+fn mount_partition(device: LoopDevice, readonly: bool) -> Result<MountedImage> {
     let mount_point = temp_mount_point(SystemTime::now())?;
     fs::create_dir(&mount_point)?;
-    let opts = match (filesystem, readonly) {
-        (CameraFilesystem::Ext4, true) => "ro,noload",
-        (_, true) => "ro",
-        (_, false) => "rw",
-    };
+    let opts = if readonly { "ro,noload" } else { "rw" };
     let partition = device.partition().to_string();
     let mut mounted = MountedImage {
         mount_point,
@@ -383,74 +370,41 @@ fn mount_partition(
 
 pub fn mount_snapshot(image_path: &Path) -> Result<MountedImage> {
     let mut device = setup_loop_device(image_path, true)?;
-    let filesystem = detect_filesystem(device.partition())?;
-    if filesystem == CameraFilesystem::Fat32 {
-        return mount_partition(device, filesystem, true);
-    }
+    ensure_ext4(device.partition())?;
     device.detach()?;
     let snapshots = image_path
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| Error::new("snapshot image has no catalog directory"))?;
     let recovery = snapshots.join(RECOVERY_DIRECTORY);
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&recovery)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::new(format!(
-                    "snapshot recovery evidence already exists at {}; inspect retained files before archiving again",
-                    recovery.display()
-                ))
-            } else {
-                Error::new(format!(
-                    "failed to create recovery directory {}: {error}",
-                    recovery.display()
-                ))
-            }
-        })?;
-    let recovered = recovery.join("recovered.bin");
+    let mut record = begin_recovery(&RealFileSystem, image_path)?;
+    prepare_recovery(&RealFileSystem, snapshots, &mut record)?;
     let result = (|| -> Result<MountedImage> {
-        fs::hard_link(image_path, recovery.join("raw.bin"))?;
-        fs::File::open(&recovery)?.sync_all()?;
-        fs::File::open(snapshots)?.sync_all()?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&recovered)?;
-        CommandRunner.check(
-            "cp",
-            [
-                "--reflink=always",
-                "--",
-                &image_path.display().to_string(),
-                &recovered.display().to_string(),
-            ],
-            Some(Duration::from_secs(120)),
-        )?;
-        let mut writable = setup_loop_device(&recovered, false)?;
-        check_partition(
-            "e2fsck",
-            &["-p", "-E", "journal_only", writable.partition()],
-            true,
-        )?;
-        check_partition("e2fsck", &["-f", "-n", writable.partition()], false)?;
-        writable.detach()?;
-        fs::File::open(&recovered)?.sync_all()?;
-        let readonly = setup_loop_device(&recovered, true)?;
-        mount_partition(readonly, CameraFilesystem::Ext4, true)
+        let readonly = setup_loop_device(&recovery.join("recovered.bin"), true)?;
+        mount_partition(readonly, true)
     })();
     match result {
         Ok(mut mounted) => {
             mounted.recovery_dir = Some(recovery);
             Ok(mounted)
         }
-        Err(error) => Err(error.context(format!(
-            "snapshot recovery failed; raw input and recovery copy retained at {}",
-            recovery.display()
-        ))),
+        Err(error) => Err(latch_recovery_failure(
+            &RealFileSystem,
+            snapshots,
+            &mut record,
+            error,
+        )),
     }
+}
+
+pub(crate) fn recover_ext4_image(image_path: &Path) -> Result<()> {
+    let mut writable = setup_loop_device(image_path, false)?;
+    ensure_ext4(writable.partition())?;
+    check_partition(&["-p", "-E", "journal_only", writable.partition()], true)?;
+    check_partition(&["-f", "-n", writable.partition()], false)?;
+    writable.detach()?;
+    fs::File::open(image_path)?.sync_all()?;
+    Ok(())
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> bool {
@@ -504,11 +458,20 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_probe_rejects_unknown_and_ambiguous_types() {
-        assert_eq!(parse_filesystem("vfat\n").unwrap(), CameraFilesystem::Fat32);
-        assert_eq!(parse_filesystem("ext4\n").unwrap(), CameraFilesystem::Ext4);
-        for value in ["", "exfat", "ext3", "vfat\next4"] {
-            assert!(parse_filesystem(value).is_err());
+    fn filesystem_probe_requires_ext4_and_rejects_ambiguous_types() {
+        validate_filesystem("ext4\n").unwrap();
+        for value in [
+            "",
+            "vfat",
+            "fat32",
+            "exfat",
+            "ext3",
+            "vfat\next4",
+            "ext4\nvfat",
+        ] {
+            let error = validate_filesystem(value).unwrap_err().to_string();
+            assert!(error.contains("ext4 is required"));
+            assert!(error.contains("preserve the existing image"));
         }
     }
 
@@ -521,13 +484,10 @@ mod tests {
                 stderr: String::new(),
                 timed_out: false,
             };
-            assert_eq!(
-                assess_check("e2fsck", &output, true).is_ok(),
-                matches!(code, 0 | 1)
-            );
-            assert_eq!(assess_check("e2fsck", &output, false).is_ok(), code == 0);
+            assert_eq!(assess_check(&output, true).is_ok(), matches!(code, 0 | 1));
+            assert_eq!(assess_check(&output, false).is_ok(), code == 0);
             if code > 1 {
-                assert!(assess_check("e2fsck", &output, true)
+                assert!(assess_check(&output, true)
                     .unwrap_err()
                     .to_string()
                     .contains("specific filesystem problem"));
@@ -539,8 +499,8 @@ mod tests {
             stderr: String::new(),
             timed_out: true,
         };
-        assert!(assess_check("e2fsck", &timeout, true).is_err());
-        assert!(assess_check("e2fsck", &timeout, false).is_err());
+        assert!(assess_check(&timeout, true).is_err());
+        assert!(assess_check(&timeout, false).is_err());
     }
 
     #[test]

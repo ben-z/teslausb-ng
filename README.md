@@ -1,14 +1,14 @@
 # teslausb-ng
 
 A Rust implementation of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam
-archiving system. It presents a FAT32 or ext4 camera disk over USB, copies XFS reflink
+archiving system. It presents an ext4 camera disk over USB, copies XFS reflink
 snapshots to an rclone remote, and removes saved events only after their files
 have been verified in the archive.
 
 ## Requirements
 
 - Linux board with a USB peripheral port and configfs gadget support
-- XFS with reflink support, plus the system tools listed below
+- Ext4 support, XFS with reflink support, and the system tools listed below
 - Network access to an rclone archive destination
 - Readable `/proc`, a CPU temperature sensor, and a status LED with timer and
   heartbeat triggers in sysfs
@@ -88,7 +88,7 @@ On a Debian or Ubuntu board, install the system dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y git rclone xfsprogs parted dosfstools e2fsprogs kpartx util-linux kmod
+sudo apt install -y git rclone xfsprogs parted e2fsprogs kpartx util-linux kmod
 ```
 
 With Rust and Cargo installed, build on the board:
@@ -104,9 +104,11 @@ A binary built elsewhere must target the board's Linux architecture.
 
 ### Update an Existing Installation
 
-The Python and Rust implementations use the same disk image paths and
-`/etc/teslausb.conf`. Keep those images and the root user's rclone configuration
-when updating. Existing snapshots with `snap.toc` remain readable.
+Keep existing ext4 disk images, complete ext4 snapshots with `snap.toc`, and the
+root user's rclone configuration when updating. Check the
+[filesystem requirements](#initialize) before updating an installation with a
+FAT32 camera image. Remove `CAM_FILESYSTEM` from the configuration and process
+environment; this key is rejected because the camera filesystem is always ext4.
 
 From the source checkout:
 
@@ -196,7 +198,6 @@ Required minimum versions are rclone 1.50.0, XFS tools 4.9.0, and GNU coreutils
 | `ARCHIVE_RECENTCLIPS` | Archive the car's rolling buffer | `false` |
 | `ARCHIVE_TRACKMODECLIPS` | Archive TrackMode clips | `true` |
 | `ARCHIVE_PHOTOBOOTH` | Archive Photobooth files | `true` |
-| `CAM_FILESYSTEM` | Filesystem for a new camera image: `fat32` or `ext4` | `fat32` |
 | `MUTABLE_PATH` | Directory containing `backingfiles.img` | `/mutable` |
 | `BACKINGFILES_PATH` | Mount point for the backing filesystem | `/backingfiles` |
 
@@ -212,10 +213,12 @@ For a new installation, create the XFS backing image and camera disk:
 sudo teslausb init --reserve 10G
 ```
 
-Set `CAM_FILESYSTEM=ext4` in the configuration before initialization to use an
-ext4 camera disk. Initialization never converts or reformats an existing image.
-Archiving detects the filesystem stored in the image independently of this
-setting. The XFS backing filesystem remains the same for either choice.
+The camera filesystem is ext4. Existing FAT32 and other unsupported images are
+rejected without repair or conversion. Initialization never reformats an
+existing image. Before migrating a FAT32 installation, preserve its recordings
+in the archive and verify file hashes and restore reads, then prepare a separate
+ext4 camera image. Keep the old image until preservation is verified. The XFS
+backing filesystem remains unchanged.
 
 Ext4 journals metadata to support recovery after interrupted writes. It cannot
 recover video that the car has not written or made durable. Camera images use
@@ -354,13 +357,15 @@ scripts/run-linux-integration.sh
 
 Install the coverage tool with `cargo install cargo-llvm-cov --locked`.
 Snapshot and archive unit tests use `MockFileSystem`. Offline CLI tests use fake
-Unix tools. Linux integration tests exercise real loop devices, XFS, FAT32, and ext4
+Unix tools. Linux integration tests exercise real loop devices, XFS, and ext4
 on a privileged Linux host or VM; the integration script requires those
 capabilities. The test fixtures use `TESLAUSB_LED_PATH`, `TESLAUSB_THERMAL_PATH`,
 `TESLAUSB_PROC_PATH`, and `TESLAUSB_IDLE_TIMEOUT_SECS` for monitor inputs.
 
-Filesystem failure experiments require a disposable Linux VM with root access,
-loop devices, FAT32, ext4, Python 3, and the `dm-log-writes` kernel target. Build
+The separate filesystem failure experiments compare ext4 with an unsupported
+FAT32 reference filesystem. They require a disposable Linux VM with root access,
+loop devices, ext4, Python 3, `dosfstools` for the FAT32 comparison, and the
+`dm-log-writes` kernel target. Build
 `replay-log` from [log-writes](https://github.com/josefbacik/log-writes) at commit
 `7b70d8a6863c5de30933d42a7672d35d01d2dc6c` and install it on `PATH`. Run:
 
@@ -394,9 +399,12 @@ the car's firmware, USB cache behavior, or every possible storage failure.
   preserve them.
 - Snapshot loops are read-only. Ext4 journals are replayed and independently
   checked on a private reflink copy before that copy is mounted read-only.
-- A failed ext4 recovery retains `raw.bin` and `recovered.bin` in the `snapshots/recovery/`
-  directory. Archiving stops until retained evidence is inspected and this directory
-  is explicitly removed. Normal snapshot cleanup preserves it.
+- `snapshots/recovery.state` records recovery as pending, ready, or failed. At
+  startup, pending preparation is rebuilt from the preserved raw snapshot and
+  verified; a ready workspace can be released once its images have no loop owners.
+- Failed recovery keeps its images and state for inspection. Malformed state and
+  recovery directories without a state record also block archiving. Normal
+  snapshot cleanup preserves this evidence.
 - Live camera cleanup disables the gadget, checks its filesystem, mounts the image,
   removes verified files, and unmounts it before reconnecting.
 

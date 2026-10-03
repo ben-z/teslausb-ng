@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::archive::{ArchiveBackend, ArchiveManager};
 use crate::command::CommandRunner;
-use crate::config::{load_config, parse_size, CameraFilesystem, Config, GB};
+use crate::config::{load_config, parse_size, Config, GB};
 use crate::coordinator::Coordinator;
 use crate::dependencies::{
     check_dependencies, dependency_detail, ensure_dependencies, DependencySet,
@@ -161,6 +161,7 @@ fn create_components(
     validate_camera_image(&fs, &config.cam_disk_path())?;
     let snapshot_manager =
         SnapshotManager::new(fs, config.cam_disk_path(), config.snapshots_path())?;
+    snapshot_manager.recover_archive_workspace()?;
     snapshot_manager.recover_incomplete()?;
     let backend = ArchiveBackend::from_config(&config.archive, fs);
     let archive_manager = ArchiveManager::new(
@@ -228,7 +229,7 @@ fn cmd_init(args: &GlobalArgs) -> Result<i32> {
     mount_backingfiles(&backingfiles_img, &config.backingfiles_path)?;
     verify_xfs(&config.backingfiles_path)?;
     fs::create_dir_all(config.snapshots_path())?;
-    create_cam_disk(&config.cam_disk_path(), cam_size, config.cam_filesystem)?;
+    create_cam_disk(&config.cam_disk_path(), cam_size)?;
 
     println!("\nInitialization complete");
     println!("  Backingfiles image: {}", backingfiles_img.display());
@@ -704,11 +705,7 @@ fn verify_xfs(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_cam_disk(
-    cam_disk_path: &Path,
-    cam_size: u64,
-    filesystem: CameraFilesystem,
-) -> Result<()> {
+fn create_cam_disk(cam_disk_path: &Path, cam_size: u64) -> Result<()> {
     println!(
         "  Creating {:.1} GiB cam disk...",
         cam_size as f64 / GB as f64
@@ -740,7 +737,7 @@ fn create_cam_disk(
             &cam_disk_path.display().to_string(),
             "mkpart",
             "primary",
-            filesystem.name(),
+            "ext4",
             "0%",
             "100%",
         ],
@@ -748,33 +745,20 @@ fn create_cam_disk(
     )?;
 
     let mut loop_device = setup_loop_device(cam_disk_path, false)?;
-    match filesystem {
-        CameraFilesystem::Fat32 => {
-            CommandRunner.check(
-                "mkfs.vfat",
-                ["-F", "32", "-n", "TESLAUSB", loop_device.partition()],
-                Some(Duration::from_secs(300)),
-            )?;
-        }
-        CameraFilesystem::Ext4 => {
-            CommandRunner.check(
-                "mkfs.ext4",
-                ["-F", "-b", "4096", "-I", "256", "-m", "0", "-L", "TESLAUSB",
-                 "-O", "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize",
-                 "-E", "lazy_itable_init=0,lazy_journal_init=0", loop_device.partition()],
-                Some(Duration::from_secs(300)),
-            )?;
-        }
-    }
+    CommandRunner.check(
+        "mkfs.ext4",
+        ["-F", "-b", "4096", "-I", "256", "-m", "0", "-L", "TESLAUSB",
+         "-O", "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize",
+         "-E", "lazy_itable_init=0,lazy_journal_init=0", loop_device.partition()],
+        Some(Duration::from_secs(300)),
+    )?;
     loop_device.detach()?;
     let mounted = mount_image(cam_disk_path, false)?;
     let camera = mounted.path().join("TeslaCam");
     fs::create_dir_all(&camera)?;
-    if filesystem == CameraFilesystem::Ext4 {
-        // The car's recording process may use a different Unix identity.
-        fs::set_permissions(mounted.path(), fs::Permissions::from_mode(0o777))?;
-        fs::set_permissions(&camera, fs::Permissions::from_mode(0o777))?;
-    }
+    // The car's recording process may use a different Unix identity.
+    fs::set_permissions(mounted.path(), fs::Permissions::from_mode(0o777))?;
+    fs::set_permissions(&camera, fs::Permissions::from_mode(0o777))?;
     mounted.unmount()
 }
 

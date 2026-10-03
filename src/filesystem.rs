@@ -17,8 +17,12 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
 
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
+    fn require_regular_file(&self, path: &Path) -> Result<()>;
+    fn require_directory(&self, path: &Path) -> Result<()>;
     fn list_dir_names(&self, path: &Path) -> Result<Vec<String>>;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
+    fn create_private_dir(&self, path: &Path) -> Result<()>;
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
     fn remove_dir_all(&self, path: &Path) -> Result<()>;
     fn remove_dir(&self, path: &Path) -> Result<()>;
@@ -26,6 +30,8 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn create_private_file(&self, path: &Path, content: &str) -> Result<()>;
     fn write_text_atomic(&self, path: &Path, content: &str) -> Result<()>;
     fn copy_reflink(&self, src: &Path, dst: &Path) -> Result<()>;
+    fn ensure_image_detached(&self, path: &Path) -> Result<()>;
+    fn recover_ext4_image(&self, path: &Path) -> Result<()>;
     fn file_size(&self, path: &Path) -> Result<u64>;
     fn mtime_secs(&self, path: &Path) -> Result<u64>;
     fn walk_files(&self, path: &Path) -> Result<Vec<PathBuf>>;
@@ -59,6 +65,26 @@ impl FileSystem for RealFileSystem {
         path.is_dir()
     }
 
+    fn require_regular_file(&self, path: &Path) -> Result<()> {
+        if !fs::symlink_metadata(path)?.is_file() {
+            return Err(Error::new(format!(
+                "expected a regular file without symlinks: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_directory(&self, path: &Path) -> Result<()> {
+        if !fs::symlink_metadata(path)?.is_dir() {
+            return Err(Error::new(format!(
+                "expected a directory without symlinks: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn list_dir_names(&self, path: &Path) -> Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in fs::read_dir(path)? {
@@ -72,6 +98,44 @@ impl FileSystem for RealFileSystem {
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         Ok(())
+    }
+
+    fn create_private_dir(&self, path: &Path) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)?;
+        Ok(())
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()> {
+        fs::hard_link(src, dst)?;
+        Ok(())
+    }
+
+    fn ensure_image_detached(&self, path: &Path) -> Result<()> {
+        self.require_regular_file(path)?;
+        let output = CommandRunner.check(
+            "losetup",
+            [
+                "--associated",
+                &path.display().to_string(),
+                "--noheadings",
+                "--output",
+                "NAME",
+            ],
+            Some(Duration::from_secs(30)),
+        )?;
+        if !output.stdout.trim().is_empty() {
+            return Err(Error::new(format!(
+                "recovery image {} still has loop owners: {}",
+                path.display(),
+                output.stdout.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn recover_ext4_image(&self, path: &Path) -> Result<()> {
+        crate::mount::recover_ext4_image(path)
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
@@ -290,6 +354,9 @@ struct MockState {
     locks: HashSet<PathBuf>,
     removal_failures: HashSet<PathBuf>,
     fail_next_reflink: bool,
+    attached_images: HashSet<PathBuf>,
+    recovery_failures: HashSet<PathBuf>,
+    recovery_inputs: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -352,6 +419,27 @@ impl MockFileSystem {
         self.inner.lock().unwrap().fail_next_reflink = true;
     }
 
+    pub fn set_image_attached(&self, path: &Path, attached: bool) {
+        let mut state = self.inner.lock().unwrap();
+        if attached {
+            state.attached_images.insert(normalize(path));
+        } else {
+            state.attached_images.remove(&normalize(path));
+        }
+    }
+
+    pub fn fail_recovery(&self, path: &Path) {
+        self.inner
+            .lock()
+            .unwrap()
+            .recovery_failures
+            .insert(normalize(path));
+    }
+
+    pub fn recovery_inputs(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().unwrap().recovery_inputs.clone()
+    }
+
     pub fn allow_removal(&self, path: &Path) {
         self.inner
             .lock()
@@ -377,6 +465,20 @@ impl FileSystem for MockFileSystem {
 
     fn is_dir(&self, path: &Path) -> bool {
         self.inner.lock().unwrap().dirs.contains(&normalize(path))
+    }
+
+    fn require_regular_file(&self, path: &Path) -> Result<()> {
+        self.file_size(path).map(|_| ())
+    }
+
+    fn require_directory(&self, path: &Path) -> Result<()> {
+        if !self.is_dir(path) {
+            return Err(Error::new(format!(
+                "expected a directory: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn list_dir_names(&self, path: &Path) -> Result<Vec<String>> {
@@ -405,6 +507,48 @@ impl FileSystem for MockFileSystem {
         for component in normalize(path).components() {
             current.push(component);
             state.dirs.insert(current.clone());
+        }
+        Ok(())
+    }
+
+    fn create_private_dir(&self, path: &Path) -> Result<()> {
+        if self.exists(path) {
+            return Err(Error::new("private directory already exists"));
+        }
+        self.create_dir_all(path)
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()> {
+        if self.exists(dst) {
+            return Err(Error::new("hard link destination already exists"));
+        }
+        let content = self.read_bytes(src)?;
+        self.write_bytes(dst, &content);
+        Ok(())
+    }
+
+    fn ensure_image_detached(&self, path: &Path) -> Result<()> {
+        if self
+            .inner
+            .lock()
+            .unwrap()
+            .attached_images
+            .contains(&normalize(path))
+        {
+            return Err(Error::new(format!(
+                "recovery image {} still has loop owners",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn recover_ext4_image(&self, path: &Path) -> Result<()> {
+        let content = self.read_bytes(path)?;
+        let mut state = self.inner.lock().unwrap();
+        state.recovery_inputs.push(content);
+        if state.recovery_failures.contains(&normalize(path)) {
+            return Err(Error::new("injected recovery failure"));
         }
         Ok(())
     }
@@ -600,6 +744,26 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn file_kind_checks_reject_symlinks_and_wrong_types() {
+        let root = temp_dir("types");
+        let file = root.join("regular");
+        fs::write(&file, b"data").unwrap();
+        let file_link = root.join("file-link");
+        let dir_link = root.join("dir-link");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        std::os::unix::fs::symlink(&root, &dir_link).unwrap();
+        RealFileSystem.require_regular_file(&file).unwrap();
+        RealFileSystem.require_directory(&root).unwrap();
+        for path in [&file_link, &dir_link] {
+            assert!(RealFileSystem.require_regular_file(path).is_err());
+            assert!(RealFileSystem.require_directory(path).is_err());
+        }
+        assert!(RealFileSystem.require_regular_file(&root).is_err());
+        assert!(RealFileSystem.require_directory(&file).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

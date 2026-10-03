@@ -93,17 +93,28 @@ set status LED to heartbeat after a successful cycle
 repeat
 ```
 
-Archive readers detect the filesystem from the snapshot partition. FAT32 uses
-the raw snapshot through a read-only loop. Ext4 uses a private reflink copy for
-journal-only replay followed by a forced read-only filesystem check. A successful
-check permits a read-only loop and `ro,noload` mount, so mounting cannot replay the
-journal or modify the raw snapshot. A failed check stops the archive and retains
-both raw and recovered images in `snapshots/recovery/`, outside the normal
-`snap-*` cleanup namespace. Exclusive creation prevents another recovery attempt
-while that directory exists. Snapshot creation also refuses retained recovery
-evidence before cloning the camera image, preserving the single-snapshot space
-bound across retries.
-Successful recovery copies are removed after checked unmount and loop detach.
+Archive readers require an ext4 snapshot partition and reject other formats.
+A private reflink copy receives journal-only replay followed by a forced
+read-only filesystem check. A successful check permits a read-only loop and
+`ro,noload` mount, so mounting cannot replay the journal or modify the raw
+snapshot.
+
+The durable `snapshots/recovery.state` record names the source snapshot, image
+size, and phase: pending, ready, or failed. Pending state is written before
+creating `snapshots/recovery/`. The raw snapshot is preserved there as `raw.bin`;
+journal recovery runs on a separate `recovered.bin` reflink copy. Ready state is
+written after successful recovery, verification, and image synchronization.
+Observed preparation or mount failures are recorded as failed.
+
+Startup reconciles this workspace before removing incomplete or stale snapshots.
+Pending preparation is rebuilt from the preserved raw image, or from the named
+complete snapshot if the raw link was not yet created. A ready workspace is
+released only after its images have no loop owners. The state record remains
+until workspace removal finishes, so an interrupted cleanup can resume.
+Failed or malformed state and unmarked recovery directories require inspection;
+their evidence is preserved. New snapshots are blocked while either recovery
+path exists, maintaining the single-snapshot space bound. Normal archive cleanup
+releases a successful workspace after checked unmount and loop detach.
 
 The live camera disk is never mounted read-write while it is exposed to the car
 through the USB gadget.
@@ -124,7 +135,7 @@ lock prevents concurrent processes from maintaining the live camera disk.
 ```text
 /mutable/backingfiles.img  (XFS, reflink-capable)
   mounted at /backingfiles
-    cam_disk.bin           (FAT32 or ext4 disk image exposed to Tesla)
+    cam_disk.bin           (ext4 disk image exposed to Tesla)
     snapshots/
       snap-000000/
         snap.bin           (reflink copy of cam_disk.bin)

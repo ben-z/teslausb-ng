@@ -7,6 +7,240 @@ use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 
 pub const RECOVERY_DIRECTORY: &str = "recovery";
+pub const RECOVERY_STATE: &str = "recovery.state";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryPhase {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveryRecord {
+    source: String,
+    size: u64,
+    phase: RecoveryPhase,
+}
+
+impl RecoveryRecord {
+    pub(crate) fn write(
+        &mut self,
+        fs: &impl FileSystem,
+        catalog: &Path,
+        phase: RecoveryPhase,
+    ) -> Result<()> {
+        let phase_name = match phase {
+            RecoveryPhase::Pending => "pending",
+            RecoveryPhase::Ready => "ready",
+            RecoveryPhase::Failed => "failed",
+        };
+        fs.write_text_atomic(
+            &catalog.join(RECOVERY_STATE),
+            &serde_json::json!({
+                "version": 1, "source": self.source, "size": self.size, "phase": phase_name,
+            })
+            .to_string(),
+        )?;
+        self.phase = phase;
+        Ok(())
+    }
+
+    fn read(fs: &impl FileSystem, catalog: &Path) -> Result<Self> {
+        fs.require_regular_file(&catalog.join(RECOVERY_STATE))?;
+        let value: serde_json::Value = serde_json::from_str(
+            &fs.read_text(&catalog.join(RECOVERY_STATE))?,
+        )
+        .map_err(|error| {
+            Error::new(format!(
+                "invalid recovery state: {error}; retained evidence requires inspection"
+            ))
+        })?;
+        let source = value["source"]
+            .as_str()
+            .ok_or_else(|| Error::new("recovery state has no source snapshot"))?;
+        let id = source
+            .strip_prefix("snap-")
+            .and_then(|id| id.parse::<u64>().ok());
+        if value["version"] != 1
+            || value.as_object().map(|object| object.len()) != Some(4)
+            || id.is_none_or(|id| source != format!("snap-{id:06}"))
+        {
+            return Err(Error::new(
+                "invalid recovery state; retained evidence requires inspection",
+            ));
+        }
+        let size = value["size"]
+            .as_u64()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| Error::new("invalid recovery image size"))?;
+        let phase = match value["phase"].as_str() {
+            Some("pending") => RecoveryPhase::Pending,
+            Some("ready") => RecoveryPhase::Ready,
+            Some("failed") => RecoveryPhase::Failed,
+            _ => {
+                return Err(Error::new(
+                    "invalid recovery phase; retained evidence requires inspection",
+                ))
+            }
+        };
+        Ok(Self {
+            source: source.to_string(),
+            size,
+            phase,
+        })
+    }
+}
+
+fn retained_recovery(catalog: &Path) -> Error {
+    Error::new(format!(
+        "snapshot recovery evidence already exists at {}; inspect retained files before archiving again",
+        catalog.join(RECOVERY_DIRECTORY).display()
+    ))
+}
+
+pub(crate) fn begin_recovery(fs: &impl FileSystem, image: &Path) -> Result<RecoveryRecord> {
+    let snapshot = image
+        .parent()
+        .ok_or_else(|| Error::new("snapshot image has no directory"))?;
+    let catalog = snapshot
+        .parent()
+        .ok_or_else(|| Error::new("snapshot image has no catalog"))?;
+    if fs.exists(&catalog.join(RECOVERY_DIRECTORY)) || fs.exists(&catalog.join(RECOVERY_STATE)) {
+        return Err(retained_recovery(catalog));
+    }
+    let source = snapshot
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::new("invalid source snapshot path"))?;
+    if source
+        .strip_prefix("snap-")
+        .and_then(|id| id.parse::<u64>().ok())
+        .is_none_or(|id| source != format!("snap-{id:06}"))
+        || image.file_name().and_then(|name| name.to_str()) != Some("snap.bin")
+    {
+        return Err(Error::new("invalid source snapshot path"));
+    }
+    fs.require_directory(snapshot)?;
+    fs.require_regular_file(&snapshot.join("snap.toc"))?;
+    fs.require_regular_file(image)?;
+    let mut record = RecoveryRecord {
+        source: source.to_string(),
+        size: fs.file_size(image)?,
+        phase: RecoveryPhase::Pending,
+    };
+    record.write(fs, catalog, RecoveryPhase::Pending)?;
+    Ok(record)
+}
+
+fn check_recovery_owners(fs: &impl FileSystem, catalog: &Path) -> Result<()> {
+    let recovery = catalog.join(RECOVERY_DIRECTORY);
+    if !fs.exists(&recovery) {
+        return Ok(());
+    }
+    fs.require_directory(&recovery)?;
+    for name in fs.list_dir_names(&recovery)? {
+        if !matches!(name.as_str(), "raw.bin" | "recovered.bin") {
+            return Err(Error::new(format!(
+                "unexpected recovery entry {name:?}; retained evidence requires inspection"
+            )));
+        }
+        let image = recovery.join(name);
+        fs.require_regular_file(&image)?;
+        fs.ensure_image_detached(&image)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_recovery(
+    fs: &impl FileSystem,
+    catalog: &Path,
+    record: &mut RecoveryRecord,
+) -> Result<()> {
+    check_recovery_owners(fs, catalog)?;
+    let recovery = catalog.join(RECOVERY_DIRECTORY);
+    let result = (|| -> Result<()> {
+        if !fs.exists(&recovery) {
+            fs.create_private_dir(&recovery)?;
+            fs.sync_dir(catalog)?;
+        }
+        let raw = recovery.join("raw.bin");
+        if !fs.exists(&raw) {
+            let source = catalog.join(&record.source);
+            if !fs.exists(&source.join("snap.toc")) {
+                return Err(Error::new(
+                    "pending recovery has no preserved raw image or complete source snapshot",
+                ));
+            }
+            fs.require_directory(&source)?;
+            fs.require_regular_file(&source.join("snap.toc"))?;
+            fs.require_regular_file(&source.join("snap.bin"))?;
+            fs.hard_link(&source.join("snap.bin"), &raw)?;
+            fs.sync_dir(&recovery)?;
+        }
+        if fs.file_size(&raw)? != record.size {
+            return Err(Error::new("preserved raw image size changed"));
+        }
+        fs.ensure_image_detached(&raw)?;
+        let recovered = recovery.join("recovered.bin");
+        if fs.exists(&recovered) {
+            fs.remove_file(&recovered)?;
+        }
+        fs.create_private_file(&recovered, "")?;
+        fs.copy_reflink(&raw, &recovered)?;
+        fs.recover_ext4_image(&recovered)?;
+        record.write(fs, catalog, RecoveryPhase::Ready)
+    })();
+    if let Err(error) = result {
+        return Err(latch_recovery_failure(fs, catalog, record, error));
+    }
+    Ok(())
+}
+
+pub(crate) fn latch_recovery_failure(
+    fs: &impl FileSystem,
+    catalog: &Path,
+    record: &mut RecoveryRecord,
+    error: Error,
+) -> Error {
+    match record.write(fs, catalog, RecoveryPhase::Failed) {
+        Ok(()) => error.context(format!(
+            "snapshot recovery failed; raw input and recovery copy retained at {}",
+            catalog.join(RECOVERY_DIRECTORY).display()
+        )),
+        Err(marker) => Error::new(format!(
+            "{error}; failed to persist recovery failure: {marker}"
+        )),
+    }
+}
+
+pub(crate) fn release_recovery(fs: &impl FileSystem, catalog: &Path) -> Result<()> {
+    let record = RecoveryRecord::read(fs, catalog)?;
+    if record.phase != RecoveryPhase::Ready {
+        return Err(retained_recovery(catalog));
+    }
+    check_recovery_owners(fs, catalog)?;
+    let recovery = catalog.join(RECOVERY_DIRECTORY);
+    if fs.exists(&recovery) {
+        for name in ["recovered.bin", "raw.bin"] {
+            let image = recovery.join(name);
+            if fs.exists(&image) && fs.file_size(&image)? != record.size {
+                return Err(Error::new(format!(
+                    "verified recovery image size changed: {}",
+                    image.display()
+                )));
+            }
+        }
+        for name in ["recovered.bin", "raw.bin"] {
+            let image = recovery.join(name);
+            if fs.exists(&image) {
+                fs.remove_file(&image)?;
+            }
+        }
+        fs.remove_dir(&recovery)?;
+    }
+    fs.remove_file(&catalog.join(RECOVERY_STATE))
+}
 
 pub fn validate_camera_image(fs: &impl FileSystem, path: &Path) -> Result<()> {
     if !fs.exists(path) {
@@ -210,13 +444,44 @@ impl<F: FileSystem> SnapshotManager<F> {
         self.load_snapshots(&mut self.inner.lock().unwrap(), true)
     }
 
+    pub fn recover_archive_workspace(&self) -> Result<()> {
+        let _catalog_lock = self.lock_catalog()?;
+        let catalog = &self.snapshots_path;
+        if !self.fs.exists(&catalog.join(RECOVERY_STATE)) {
+            if self.fs.exists(&catalog.join(RECOVERY_DIRECTORY)) {
+                return Err(retained_recovery(catalog));
+            }
+            return Ok(());
+        }
+        let mut record = RecoveryRecord::read(&self.fs, catalog)?;
+        let source = catalog.join(&record.source);
+        let _source_lock = if self.fs.exists(&source) {
+            self.fs.require_directory(&source)?;
+            Some(
+                self.fs
+                    .try_lock(&source.join("snap.lock"))?
+                    .ok_or_else(|| Error::new("recovery source snapshot is still in use"))?,
+            )
+        } else {
+            None
+        };
+        match record.phase {
+            RecoveryPhase::Failed => return Err(retained_recovery(catalog)),
+            RecoveryPhase::Pending => prepare_recovery(&self.fs, catalog, &mut record)?,
+            RecoveryPhase::Ready => {}
+        }
+        release_recovery(&self.fs, catalog)?;
+        eprintln!("released verified archive recovery workspace after interruption");
+        Ok(())
+    }
+
     pub fn create_snapshot(&self) -> Result<Snapshot> {
         let _catalog_lock = self.lock_catalog()?;
         if self
             .fs
             .list_dir_names(&self.snapshots_path)?
             .iter()
-            .any(|name| name == RECOVERY_DIRECTORY)
+            .any(|name| name == RECOVERY_DIRECTORY || name == RECOVERY_STATE)
         {
             return Err(Error::new(format!(
                 "snapshot recovery evidence already exists at {}; inspect retained files before archiving again",
@@ -442,6 +707,254 @@ mod tests {
         assert!(manager.fs.exists(&snapshot.image_path()));
         assert!(manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.metadata_path()));
+    }
+
+    #[test]
+    fn pending_recovery_resumes_from_each_interruption_without_copying_the_camera() {
+        for stage in 0..4 {
+            let manager = manager();
+            let snapshot = manager.create_snapshot().unwrap();
+            begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+            let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+            if stage >= 1 {
+                manager.fs.create_private_dir(&recovery).unwrap();
+            }
+            if stage >= 2 {
+                manager
+                    .fs
+                    .hard_link(&snapshot.image_path(), &recovery.join("raw.bin"))
+                    .unwrap();
+                manager.delete_snapshot(snapshot.id).unwrap();
+            }
+            if stage >= 3 {
+                manager
+                    .fs
+                    .write_bytes(recovery.join("recovered.bin"), b"interrupted copy");
+            }
+            manager
+                .fs
+                .write_bytes(&manager.cam_disk_path, b"new car recording");
+            assert!(manager
+                .create_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery evidence already exists"));
+            manager.recover_archive_workspace().unwrap();
+            assert_eq!(manager.fs.recovery_inputs(), vec![b"cam".to_vec()]);
+            assert_eq!(
+                manager.fs.read_bytes(&manager.cam_disk_path).unwrap(),
+                b"new car recording"
+            );
+            assert!(!manager.fs.exists(&recovery));
+            assert!(!manager
+                .fs
+                .exists(&manager.snapshots_path.join(RECOVERY_STATE)));
+            assert_eq!(
+                manager
+                    .fs
+                    .read_text(manager.snapshots_path.join(".next-id"))
+                    .unwrap(),
+                "1"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_recovery_cleanup_can_resume_after_each_unlink() {
+        for stage in 0..4 {
+            let manager = manager();
+            let snapshot = manager.create_snapshot().unwrap();
+            let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+            prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
+            let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+            if stage >= 1 {
+                manager
+                    .fs
+                    .remove_file(&recovery.join("recovered.bin"))
+                    .unwrap();
+            }
+            if stage >= 2 {
+                manager.fs.remove_file(&recovery.join("raw.bin")).unwrap();
+            }
+            if stage >= 3 {
+                manager.fs.remove_dir(&recovery).unwrap();
+            }
+            manager.recover_archive_workspace().unwrap();
+            assert_eq!(
+                manager.fs.recovery_inputs().len(),
+                1,
+                "ready images must not be replayed again"
+            );
+            assert!(!manager.fs.exists(&recovery));
+            assert!(!manager
+                .fs
+                .exists(&manager.snapshots_path.join(RECOVERY_STATE)));
+        }
+    }
+
+    #[test]
+    fn attached_recovery_images_block_reconciliation_without_changing_state() {
+        for ready in [false, true] {
+            for name in ["raw.bin", "recovered.bin"] {
+                let manager = manager();
+                let snapshot = manager.create_snapshot().unwrap();
+                let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+                prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
+                if !ready {
+                    record
+                        .write(&manager.fs, &manager.snapshots_path, RecoveryPhase::Pending)
+                        .unwrap();
+                }
+                let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+                let state = manager.snapshots_path.join(RECOVERY_STATE);
+                let state_before = manager.fs.read_bytes(&state).unwrap();
+                manager.fs.set_image_attached(&recovery.join(name), true);
+                assert!(manager
+                    .recover_archive_workspace()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("still has loop owners"));
+                assert_eq!(manager.fs.read_bytes(&state).unwrap(), state_before);
+                assert_eq!(
+                    manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
+                    b"cam"
+                );
+                assert_eq!(
+                    manager
+                        .fs
+                        .read_bytes(recovery.join("recovered.bin"))
+                        .unwrap(),
+                    b"cam"
+                );
+                manager.fs.set_image_attached(&recovery.join(name), false);
+                manager.recover_archive_workspace().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn observed_recovery_failure_is_durable_and_never_retried_automatically() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot().unwrap();
+        begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+        let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+        manager.fs.fail_recovery(&recovery.join("recovered.bin"));
+        assert!(manager
+            .recover_archive_workspace()
+            .unwrap_err()
+            .to_string()
+            .contains("injected recovery failure"));
+        assert_eq!(
+            RecoveryRecord::read(&manager.fs, &manager.snapshots_path)
+                .unwrap()
+                .phase,
+            RecoveryPhase::Failed
+        );
+        for _ in 0..2 {
+            assert!(manager
+                .recover_archive_workspace()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery evidence already exists"));
+            assert!(manager.create_snapshot().is_err());
+        }
+        assert_eq!(manager.fs.recovery_inputs().len(), 1);
+        assert_eq!(
+            manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
+            b"cam"
+        );
+        assert_eq!(
+            manager
+                .fs
+                .read_bytes(recovery.join("recovered.bin"))
+                .unwrap(),
+            b"cam"
+        );
+    }
+
+    #[test]
+    fn malformed_and_legacy_recovery_evidence_is_never_removed() {
+        for state in [
+            None,
+            Some("broken JSON"),
+            Some(r#"{"version":1,"source":"../cam_disk.bin","size":3,"phase":"ready"}"#),
+            Some(r#"{"version":2,"source":"snap-000000","size":3,"phase":"ready"}"#),
+        ] {
+            let manager = manager();
+            let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+            manager.fs.create_private_dir(&recovery).unwrap();
+            manager
+                .fs
+                .write_bytes(recovery.join("raw.bin"), b"evidence");
+            if let Some(state) = state {
+                manager
+                    .fs
+                    .write_text_atomic(&manager.snapshots_path.join(RECOVERY_STATE), state)
+                    .unwrap();
+            }
+            assert!(manager.recover_archive_workspace().is_err());
+            assert_eq!(
+                manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
+                b"evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_reconciliation_requires_catalog_lock_and_preserves_unexpected_files() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot().unwrap();
+        let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+        prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
+        let lock = manager.lock_catalog().unwrap();
+        assert!(manager.recover_archive_workspace().is_err());
+        drop(lock);
+        let extra = manager
+            .snapshots_path
+            .join(RECOVERY_DIRECTORY)
+            .join("unexpected");
+        manager.fs.write_bytes(&extra, b"keep");
+        assert!(manager
+            .recover_archive_workspace()
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected recovery entry"));
+        assert_eq!(manager.fs.read_bytes(extra).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn recovery_reconciliation_respects_source_handle_and_recorded_sizes() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot().unwrap();
+        let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+        prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
+        let handle = manager.acquire(snapshot.id).unwrap();
+        assert!(manager
+            .recover_archive_workspace()
+            .unwrap_err()
+            .to_string()
+            .contains("source snapshot is still in use"));
+        drop(handle);
+        let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
+        manager
+            .fs
+            .write_bytes(recovery.join("raw.bin"), b"different image");
+        assert!(manager
+            .recover_archive_workspace()
+            .unwrap_err()
+            .to_string()
+            .contains("image size changed"));
+        assert_eq!(
+            manager
+                .fs
+                .read_bytes(recovery.join("recovered.bin"))
+                .unwrap(),
+            b"cam"
+        );
+        assert_eq!(
+            manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
+            b"different image"
+        );
     }
 
     #[test]
