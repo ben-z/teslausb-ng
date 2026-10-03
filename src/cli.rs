@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use crate::filesystem::{FileSystem, RealFileSystem};
 use crate::gadget::{LunConfig, UsbGadget};
 use crate::idle::ProcIdleDetector;
 use crate::led::SysfsLedController;
-use crate::mount::setup_loop_device;
+use crate::mount::{mount_image, setup_loop_device};
 use crate::snapshot::{validate_camera_image, SnapshotManager};
 use crate::space::{calculate_cam_size, disk_space, DEFAULT_RESERVE, MIN_CAM_SIZE};
 use crate::temperature::{SysfsTemperatureMonitor, TemperatureConfig};
@@ -160,6 +161,7 @@ fn create_components(
     validate_camera_image(&fs, &config.cam_disk_path())?;
     let snapshot_manager =
         SnapshotManager::new(fs, config.cam_disk_path(), config.snapshots_path())?;
+    snapshot_manager.recover_archive_workspace()?;
     snapshot_manager.recover_incomplete()?;
     let backend = ArchiveBackend::from_config(&config.archive, fs);
     let archive_manager = ArchiveManager::new(
@@ -735,40 +737,29 @@ fn create_cam_disk(cam_disk_path: &Path, cam_size: u64) -> Result<()> {
             &cam_disk_path.display().to_string(),
             "mkpart",
             "primary",
-            "fat32",
+            "ext4",
             "0%",
             "100%",
         ],
         Some(Duration::from_secs(60)),
     )?;
 
-    let loop_device = setup_loop_device(cam_disk_path)?;
+    let mut loop_device = setup_loop_device(cam_disk_path, false)?;
     CommandRunner.check(
-        "mkfs.vfat",
-        ["-F", "32", "-n", "TESLAUSB", loop_device.partition()],
+        "mkfs.ext4",
+        ["-F", "-b", "4096", "-I", "256", "-m", "0", "-L", "TESLAUSB",
+         "-O", "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize",
+         "-E", "lazy_itable_init=0,lazy_journal_init=0", loop_device.partition()],
         Some(Duration::from_secs(300)),
     )?;
-
-    let mount_point =
-        std::env::temp_dir().join(format!("teslausb-cam-mount-{}", std::process::id()));
-    fs::create_dir_all(&mount_point)?;
-    CommandRunner.check(
-        "mount",
-        [loop_device.partition(), &mount_point.display().to_string()],
-        Some(Duration::from_secs(60)),
-    )?;
-    let create_result = fs::create_dir_all(mount_point.join("TeslaCam"));
-    let umount_result = CommandRunner.run(
-        "umount",
-        [&mount_point.display().to_string()],
-        Some(Duration::from_secs(60)),
-    );
-    let _ = fs::remove_dir(&mount_point);
-    create_result?;
-    if !umount_result?.success() {
-        return Err(Error::new("failed to unmount temporary cam disk mount"));
-    }
-    Ok(())
+    loop_device.detach()?;
+    let mounted = mount_image(cam_disk_path, false)?;
+    let camera = mounted.path().join("TeslaCam");
+    fs::create_dir_all(&camera)?;
+    // The car's recording process may use a different Unix identity.
+    fs::set_permissions(mounted.path(), fs::Permissions::from_mode(0o777))?;
+    fs::set_permissions(&camera, fs::Permissions::from_mode(0o777))?;
+    mounted.unmount()
 }
 
 fn is_mounted(path: &Path) -> Result<bool> {

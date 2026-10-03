@@ -1,14 +1,14 @@
 # teslausb-ng
 
 A Rust implementation of [TeslaUSB](https://github.com/marcone/teslausb)'s dashcam
-archiving system. It presents a FAT32 camera disk over USB, copies XFS reflink
+archiving system. It presents an ext4 camera disk over USB, copies XFS reflink
 snapshots to an rclone remote, and removes saved events only after their files
 have been verified in the archive.
 
 ## Requirements
 
 - Linux board with a USB peripheral port and configfs gadget support
-- XFS with reflink support, plus the system tools listed below
+- Ext4 support, XFS with reflink support, and the system tools listed below
 - Network access to an rclone archive destination
 - Readable `/proc`, a CPU temperature sensor, and a status LED with timer and
   heartbeat triggers in sysfs
@@ -88,7 +88,7 @@ On a Debian or Ubuntu board, install the system dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y git rclone xfsprogs parted dosfstools kpartx util-linux kmod
+sudo apt install -y git rclone xfsprogs parted e2fsprogs kpartx util-linux kmod
 ```
 
 With Rust and Cargo installed, build on the board:
@@ -104,9 +104,11 @@ A binary built elsewhere must target the board's Linux architecture.
 
 ### Update an Existing Installation
 
-The Python and Rust implementations use the same disk image paths and
-`/etc/teslausb.conf`. Keep those images and the root user's rclone configuration
-when updating. Existing snapshots with `snap.toc` remain readable.
+Keep existing ext4 disk images, complete ext4 snapshots with `snap.toc`, and the
+root user's rclone configuration when updating. Check the
+[filesystem requirements](#initialize) before updating an installation with a
+FAT32 camera image. Remove `CAM_FILESYSTEM` from the configuration and process
+environment; this key is rejected because the camera filesystem is always ext4.
 
 From the source checkout:
 
@@ -205,11 +207,24 @@ use `sudo teslausb --config /absolute/path/teslausb.conf service install --force
 
 ## Initialize
 
-For a new installation, create the XFS backing image and FAT32 camera disk:
+For a new installation, create the XFS backing image and camera disk:
 
 ```bash
 sudo teslausb init --reserve 10G
 ```
+
+The camera filesystem is ext4. Existing FAT32 and other unsupported images are
+rejected without repair or conversion. Initialization never reformats an
+existing image. Before migrating a FAT32 installation, preserve its recordings
+in the archive and verify file hashes and restore reads, then prepare a separate
+ext4 camera image. Keep the old image until preservation is verified. The XFS
+backing filesystem remains unchanged.
+
+Ext4 journals metadata to support recovery after interrupted writes. It cannot
+recover video that the car has not written or made durable. Camera images use
+an explicit feature set without newer ext4 extensions such as metadata checksums,
+fast commits, or orphan files; compatibility still requires validation with the
+car's firmware.
 
 This creates `/mutable/backingfiles.img`, `/backingfiles/cam_disk.bin`, and
 `/backingfiles/snapshots/`. Sizing uses the free space available when initialized:
@@ -276,7 +291,7 @@ moving it. Restart the service to create a new `RecentClips` tree beside the
 preserved archive. TeslaCam Replay recognizes both the dated folders and
 preserved archives with this name.
 
-The FAT32 camera filesystem and XFS backing filesystem have separate space
+The camera filesystem and XFS backing filesystem have separate space
 limits. Deleting snapshots frees XFS space. Removing confirmed saved events
 frees camera filesystem space.
 
@@ -321,7 +336,7 @@ sudo teslausb clean --dry-run
 sudo teslausb clean
 ```
 
-For FAT errors or missing Saved/Sentry recordings, preserve the disk image and
+For filesystem errors or missing Saved/Sentry recordings, preserve the disk image and
 inspect the logs before attempting repair. Keep the service stopped and the
 USB gadget disabled during manual filesystem repair. Mounting the live camera
 filesystem read-write while the car is connected can corrupt recordings.
@@ -342,10 +357,37 @@ scripts/run-linux-integration.sh
 
 Install the coverage tool with `cargo install cargo-llvm-cov --locked`.
 Snapshot and archive unit tests use `MockFileSystem`. Offline CLI tests use fake
-Unix tools. Linux integration tests exercise real loop devices, XFS, and FAT32
+Unix tools. Linux integration tests exercise real loop devices, XFS, and ext4
 on a privileged Linux host or VM; the integration script requires those
 capabilities. The test fixtures use `TESLAUSB_LED_PATH`, `TESLAUSB_THERMAL_PATH`,
 `TESLAUSB_PROC_PATH`, and `TESLAUSB_IDLE_TIMEOUT_SECS` for monitor inputs.
+
+The separate filesystem failure experiments compare ext4 with an unsupported
+FAT32 reference filesystem. They require a disposable Linux VM with root access,
+loop devices, ext4, Python 3, `dosfstools` for the FAT32 comparison, and the
+`dm-log-writes` kernel target. Build
+`replay-log` from [log-writes](https://github.com/josefbacik/log-writes) at commit
+`7b70d8a6863c5de30933d42a7672d35d01d2dc6c` and install it on `PATH`. Run:
+
+```bash
+export TESLAUSB_RUN_FILESYSTEM_FAILURES=1
+export TESLAUSB_FAILURE_ARTIFACT_DIR=/var/tmp/teslausb-filesystem-artifacts
+cargo test --locked --test filesystem_failures -- --ignored --test-threads=1
+for promotion in rename copy; do
+    python3 scripts/filesystem-replay.py --filesystem fat32 --promotion "$promotion"
+    python3 scripts/filesystem-replay.py --filesystem ext4 --promotion "$promotion"
+done
+```
+
+These experiments retain raw images, write logs, file hashes, and JSON reports.
+They cover premature clip deletion, disk exhaustion, every recorded write prefix,
+and first-sector-only persistence of multi-sector writes. File contents and both
+affected directories are synced before each acknowledged save. Both rename-based
+and copy-based promotions are tested. Zero-write,
+fully-written, and acknowledged-save controls must preserve exact bytes.
+Experiment completion means every cut was evaluated; `summary.json` records
+losses, read errors, and rejected recovery separately. This model does not emulate
+the car's firmware, USB cache behavior, or every possible storage failure.
 
 ## Safety Model
 
@@ -355,7 +397,15 @@ capabilities. The test fixtures use `TESLAUSB_LED_PATH`, `TESLAUSB_THERMAL_PATH`
 - Deletion keeps both locks, removes `snap.toc` first, then removes the data.
 - Runtime recovery removes incomplete snapshots; status and dry-run inspection
   preserve them.
-- Live camera cleanup disables the gadget, checks FAT, mounts the image,
+- Snapshot loops are read-only. Ext4 journals are replayed and independently
+  checked on a private reflink copy before that copy is mounted read-only.
+- `snapshots/recovery.state` records recovery as pending, ready, or failed. At
+  startup, pending preparation is rebuilt from the preserved raw snapshot and
+  verified; a ready workspace can be released once its images have no loop owners.
+- Failed recovery keeps its images and state for inspection. Malformed state and
+  recovery directories without a state record also block archiving. Normal
+  snapshot cleanup preserves this evidence.
+- Live camera cleanup disables the gadget, checks its filesystem, mounts the image,
   removes verified files, and unmounts it before reconnecting.
 
 See [DESIGN.md](DESIGN.md) for architecture and [AGENTS.md](AGENTS.md) for coding

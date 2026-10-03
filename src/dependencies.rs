@@ -127,6 +127,7 @@ fn specs_for(config: &Config, set: DependencySet) -> Vec<DependencySpec> {
 }
 
 fn add_init_specs(specs: &mut Vec<DependencySpec>) {
+    add(specs, spec("blkid", "blkid", &["--version"], None));
     add(specs, spec("df", "df", &["--version"], None));
     add(specs, spec("truncate", "truncate", &["--version"], None));
     add(
@@ -137,7 +138,7 @@ fn add_init_specs(specs: &mut Vec<DependencySpec>) {
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
     add(specs, spec("kpartx", "kpartx", &["-V"], None));
-    add(specs, spec("mkfs.vfat", "mkfs.vfat", &["--version"], None));
+    add(specs, spec("mkfs.ext4", "mkfs.ext4", &["-V"], None));
     add_mount_specs(specs);
     add_reflink_cp(specs);
     add(specs, spec("sync", "sync", &["--version"], None));
@@ -157,7 +158,8 @@ fn add_runtime_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
     add_mount_specs(specs);
     add(specs, spec("df", "df", &["--version"], None));
     add(specs, spec("sync", "sync", &["--version"], None));
-    add(specs, spec("fsck", "fsck", &["--version"], None));
+    add(specs, spec("blkid", "blkid", &["--version"], None));
+    add(specs, spec("e2fsck", "e2fsck", &["-V"], None));
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
     add(specs, spec("kpartx", "kpartx", &["-V"], None));
@@ -415,15 +417,32 @@ mod tests {
     #[test]
     fn dependency_detail_can_report_nonzero_version_status() {
         let report = DependencyReport {
-            name: "mkfs.vfat",
-            command: "mkfs.vfat",
+            name: "mkfs.ext4",
+            command: "mkfs.ext4",
             ok: true,
-            version: Some(Version::new(4, 2, 0)),
+            version: Some(Version::new(1, 47, 2)),
             min_version: None,
             detail: "ok; version reported with nonzero status".to_string(),
         };
 
         assert!(dependency_detail(&report).contains("nonzero status"));
-        assert!(dependency_detail(&report).contains("version 4.2.0"));
+        assert!(dependency_detail(&report).contains("version 1.47.2"));
+    }
+
+    #[test]
+    fn camera_dependencies_require_ext4_tools_only() {
+        let config = Config::default();
+        let init = specs_for(&config, DependencySet::Init);
+        assert!(init.iter().any(|item| item.command == "mkfs.ext4"));
+        let runtime = specs_for(&config, DependencySet::Runtime);
+        for command in ["blkid", "e2fsck"] {
+            assert!(
+                runtime.iter().any(|item| item.command == command),
+                "missing {command}"
+            );
+        }
+        for item in specs_for(&config, DependencySet::Full) {
+            assert!(!matches!(item.command, "mkfs.vfat" | "fsck.fat" | "fsck"));
+        }
     }
 }

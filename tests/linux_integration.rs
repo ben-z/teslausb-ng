@@ -5,6 +5,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,7 +130,7 @@ impl Drop for Harness {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS, ext4, and mount support"]
 fn linux_fixture_cleanup_waits_for_open_loop_references() {
     let harness = Harness::new("none");
     let root = harness.root.clone();
@@ -162,7 +163,7 @@ fn linux_fixture_cleanup_waits_for_open_loop_references() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS, ext4, and mount support"]
 fn linux_fixture_cleanup_retains_data_when_unmount_fails() {
     let mut harness = Harness::new("none");
     let root = harness.root.clone();
@@ -195,7 +196,7 @@ fn linux_fixture_cleanup_retains_data_when_unmount_fails() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS, ext4, and mount support"]
 fn linux_init_mount_status_and_deinit_with_real_images() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
@@ -204,6 +205,51 @@ fn linux_init_mount_status_and_deinit_with_real_images() {
     assert!(harness.mutable.join("backingfiles.img").is_file());
     assert!(harness.backingfiles.join("cam_disk.bin").is_file());
     assert!(harness.backingfiles.join("snapshots").is_dir());
+
+    {
+        let cam =
+            PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-format"), "rw");
+        let source = run(
+            "findmnt",
+            [
+                "-n",
+                "-o",
+                "SOURCE",
+                "--target",
+                cam.path().to_str().unwrap(),
+            ],
+        );
+        assert_success(&source);
+        let partition = stdout(&source);
+        let actual = run(
+            "blkid",
+            ["-p", "-s", "TYPE", "-o", "value", partition.trim()],
+        );
+        assert_success(&actual);
+        assert_eq!(stdout(&actual).trim(), "ext4");
+        let nonroot = Command::new("mkdir")
+            .arg(cam.path().join("TeslaCam/SavedClips"))
+            .uid(65534)
+            .gid(65534)
+            .output()
+            .unwrap();
+        assert_success(&nonroot);
+        let superblock = run("dumpe2fs", ["-h", partition.trim()]);
+        assert_success(&superblock);
+        let header = stdout(&superblock);
+        assert!(header.contains("has_journal"));
+        for feature in ["metadata_csum", "orphan_file", "fast_commit", "64bit"] {
+            assert!(
+                !header.contains(feature),
+                "unexpected compatibility feature {feature}"
+            );
+        }
+        let reserved = header
+            .lines()
+            .find(|line| line.starts_with("Reserved block count:"))
+            .unwrap();
+        assert_eq!(reserved.split(':').nth(1).unwrap().trim(), "0");
+    }
 
     let status = harness.run(&["--config", &config, "status", "--json"]);
     assert_success(&status);
@@ -217,7 +263,7 @@ fn linux_init_mount_status_and_deinit_with_real_images() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS, ext4, and mount support"]
 fn linux_doctor_startup_reports_real_dependency_versions() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -230,7 +276,7 @@ fn linux_doctor_startup_reports_real_dependency_versions() {
         "Dependency",
         "rclone",
         "mkfs.xfs",
-        "mkfs.vfat",
+        "mkfs.ext4",
         "mount",
         "cp",
     ] {
@@ -262,7 +308,7 @@ fn linux_init_dependency_failure_stops_before_creating_images() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
 fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -299,7 +345,7 @@ fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
 }
 
 #[test]
-#[ignore = "requires root, real rclone, Linux loop devices, XFS reflinks, and FAT32 mounts"]
+#[ignore = "requires root, real rclone, Linux loop devices, XFS reflinks, and ext4 mounts"]
 fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -468,7 +514,7 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
 fn linux_archive_refuses_to_repair_an_already_mounted_camera_image() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -484,19 +530,25 @@ fn linux_archive_refuses_to_repair_an_already_mounted_camera_image() {
     write_cam_fixture(cam.path());
     assert_success(&run("sync", std::iter::empty::<&str>()));
 
-    let fsck = harness.fake_bin.join("fsck");
+    let fsck = harness.fake_bin.join("e2fsck");
     fs::write(
         &fsck,
         r#"#!/bin/sh
 set -eu
 case "${1:-}" in
-    -p|-n)
-        : > "$TESLAUSB_FSCK_MARKER"
-        printf 'fsck must not run while the camera image is mounted\n' >&2
-        exit 97
+    -p|-f)
+        for argument in "$@"; do partition="$argument"; done
+        loop="${partition%p1}"
+        loop="/dev/$(basename "$loop")"
+        image=$(losetup -n -O BACK-FILE "$loop")
+        if [ "$image" = "$TESLAUSB_CAMERA_IMAGE" ]; then
+            : > "$TESLAUSB_FSCK_MARKER"
+            printf 'e2fsck must not run while the camera image is mounted\n' >&2
+            exit 97
+        fi
         ;;
 esac
-exec /usr/sbin/fsck "$@"
+exec /usr/sbin/e2fsck "$@"
 "#,
     )
     .unwrap();
@@ -507,6 +559,7 @@ exec /usr/sbin/fsck "$@"
         &[
             ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
             ("TESLAUSB_FSCK_MARKER", &fsck_marker),
+            ("TESLAUSB_CAMERA_IMAGE", &harness.cam_disk()),
         ],
     );
     assert!(!archive.status.success(), "{}", describe(&archive));
@@ -531,7 +584,7 @@ exec /usr/sbin/fsck "$@"
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
 fn linux_failed_archive_cleans_files_confirmed_before_rclone_error() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -576,7 +629,7 @@ fn linux_failed_archive_cleans_files_confirmed_before_rclone_error() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS reflinks, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
 fn linux_run_loop_uses_real_mounts_and_stops_cleanly_on_sigterm() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -653,7 +706,7 @@ fn linux_run_loop_uses_real_mounts_and_stops_cleanly_on_sigterm() {
 }
 
 #[test]
-#[ignore = "requires root, Linux loop devices, XFS, FAT32, and mount support"]
+#[ignore = "requires root, Linux loop devices, XFS, ext4, and mount support"]
 fn linux_snapshot_inspection_preserves_incomplete_data_until_recovery() {
     let harness = Harness::new("none");
     let config = harness.config_arg();
@@ -677,6 +730,330 @@ fn linux_snapshot_inspection_preserves_incomplete_data_until_recovery() {
         !incomplete.exists(),
         "archive start should recover incomplete snapshots"
     );
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
+fn linux_dirty_ext4_snapshot_replays_privately_and_preserves_camera_bytes() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let mut contents = fs::read_to_string(&harness.config).unwrap();
+    contents.push_str("ARCHIVE_RECENTCLIPS=true\n");
+    fs::write(&harness.config, contents).unwrap();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    let dirty = harness.backingfiles.join("dirty-fixture.bin");
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-dirty"), "rw");
+        let recent = cam.path().join("TeslaCam/RecentClips");
+        fs::create_dir_all(&recent).unwrap();
+        for camera in [
+            "front",
+            "back",
+            "left_repeater",
+            "right_repeater",
+            "left_pillar",
+            "right_pillar",
+        ] {
+            let path = recent.join(format!("2026-10-02_12-34-56-{camera}.mp4"));
+            fs::write(&path, format!("durable-{camera}")).unwrap();
+            fs::File::open(path).unwrap().sync_all().unwrap();
+        }
+        fs::File::open(&recent).unwrap().sync_all().unwrap();
+        fs::File::open(cam.path().join("TeslaCam"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        assert_success(&run(
+            "cp",
+            [
+                OsStr::new("--reflink=always"),
+                harness.cam_disk().as_os_str(),
+                dirty.as_os_str(),
+            ],
+        ));
+    }
+    // The source was copied while mounted. Its journal still requires recovery,
+    // unlike the original camera image after the checked unmount above.
+    assert_success(&run(
+        "cp",
+        [
+            OsStr::new("--reflink=always"),
+            dirty.as_os_str(),
+            harness.cam_disk().as_os_str(),
+        ],
+    ));
+    let before = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&before);
+    let archive_root = harness.root.join("archive-dirty");
+    let archive = harness
+        .command(&["--config", &config, "archive"])
+        .env("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)
+        .env(
+            "TESLAUSB_RAW_SNAPSHOT_SHA256",
+            stdout(&before).split_whitespace().next().unwrap(),
+        )
+        .env(
+            "TESLAUSB_SNAPSHOT_CATALOG",
+            harness.backingfiles.join("snapshots"),
+        )
+        .output()
+        .unwrap();
+    assert_success(&archive);
+    assert!(
+        stderr(&archive).contains("recovering journal"),
+        "{}",
+        describe(&archive)
+    );
+    let after = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&after);
+    assert_eq!(
+        stdout(&before),
+        stdout(&after),
+        "archive changed dirty camera bytes"
+    );
+    for camera in [
+        "front",
+        "back",
+        "left_repeater",
+        "right_repeater",
+        "left_pillar",
+        "right_pillar",
+    ] {
+        let path = archive_root.join(format!(
+            "fake:TeslaArchive/RecentClips/2026-10-02/2026-10-02_12-34-56-{camera}.mp4"
+        ));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("durable-{camera}")
+        );
+    }
+    assert!(fs::read_dir(harness.backingfiles.join("snapshots"))
+        .unwrap()
+        .all(|entry| { !entry.unwrap().file_name().to_string_lossy().eq("recovery") }));
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
+fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gone() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let contents = fs::read_to_string(&harness.config).unwrap();
+    fs::write(
+        &harness.config,
+        format!("{contents}ARCHIVE_RECENTCLIPS=true\n"),
+    )
+    .unwrap();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-write"), "rw");
+        write_file(
+            cam.path()
+                .join("TeslaCam/RecentClips/2026-10-02_12-34-56-front.mp4"),
+            "durable-camera-recording",
+        );
+    }
+    let camera_before = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&camera_before);
+    let archive_root = harness.root.join("archive-restarted");
+    let marker = harness.root.join("copy-held");
+    let mut child = harness.spawn_with_env(
+        &["--config", &config, "archive"],
+        &[
+            ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
+            ("TESLAUSB_FAKE_RCLONE_HOLD", &marker),
+        ],
+    );
+    if !wait_until(
+        || marker.is_file() && fs::read_to_string(&marker).unwrap().lines().count() == 2,
+        Duration::from_secs(30),
+    ) {
+        terminate_child(&mut child);
+        panic!(
+            "copy did not start: {}",
+            describe(&child.wait_with_output().unwrap())
+        );
+    }
+    let held = fs::read_to_string(&marker).unwrap();
+    let mut held_lines = held.lines();
+    let copy_pid: i32 = held_lines.next().unwrap().parse().unwrap();
+    let source = PathBuf::from(held_lines.next().unwrap());
+    child.kill().unwrap();
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    assert_eq!(unsafe { kill(-copy_pid, 9) }, 0);
+    assert!(!child.wait_with_output().unwrap().status.success());
+
+    let mount_point = source.parent().unwrap().parent().unwrap().to_path_buf();
+    let partition = run(
+        "findmnt",
+        ["-n", "-o", "SOURCE", "--target", source.to_str().unwrap()],
+    );
+    assert_success(&partition);
+    let partition = stdout(&partition).trim().to_string();
+    let loop_name = Path::new(&partition).file_name().unwrap().to_str().unwrap();
+    let loop_dev = format!("/dev/{}", loop_name.strip_suffix("p1").unwrap());
+    let backing = run("losetup", ["-n", "-O", "BACK-FILE", &loop_dev]);
+    assert_success(&backing);
+    let recovered = PathBuf::from(stdout(&backing).trim());
+    assert!(recovered.starts_with(harness.backingfiles.join("snapshots")));
+    assert_eq!(recovered.file_name().unwrap(), "recovered.bin");
+    let recovery = recovered.parent().unwrap().to_path_buf();
+    let stale_mount = PartitionMount {
+        image: recovered.clone(),
+        loop_dev,
+        mount_point,
+        kpartx_used: partition.starts_with("/dev/mapper/"),
+    };
+    let raw = recovery.join("raw.bin");
+    let state_path = harness.backingfiles.join("snapshots/recovery.state");
+    let ready_state = fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&ready_state).unwrap();
+    assert_eq!(state["phase"], "ready");
+    let retained_before = run("sha256sum", [raw.as_os_str(), recovered.as_os_str()]);
+    assert_success(&retained_before);
+    let loops_before = loops_backed_under(&harness.backingfiles).unwrap();
+    assert!(!loops_before.is_empty());
+
+    let retry = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert!(!retry.status.success(), "{}", describe(&retry));
+    assert!(stderr(&retry).contains("recovery"), "{}", describe(&retry));
+    assert_eq!(
+        loops_backed_under(&harness.backingfiles).unwrap(),
+        loops_before
+    );
+    assert_success(&run(
+        "mountpoint",
+        ["-q", stale_mount.path().to_str().unwrap()],
+    ));
+    let retained_after = run("sha256sum", [raw.as_os_str(), recovered.as_os_str()]);
+    assert_success(&retained_after);
+    assert_eq!(stdout(&retained_before), stdout(&retained_after));
+    assert_eq!(fs::read(&state_path).unwrap(), ready_state);
+    assert!(!archive_root.exists());
+
+    // A reboot removes these kernel resources. Release only this test's mount and loop.
+    drop(stale_mount);
+    assert!(loops_backed_under(&harness.backingfiles)
+        .unwrap()
+        .is_empty());
+    let restarted = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert_success(&restarted);
+    assert_eq!(
+        fs::read_to_string(
+            archive_root
+                .join("fake:TeslaArchive/RecentClips/2026-10-02/2026-10-02_12-34-56-front.mp4")
+        )
+        .unwrap(),
+        "durable-camera-recording"
+    );
+    assert!(!recovery.exists());
+    assert!(!state_path.exists());
+    assert!(loops_backed_under(&harness.backingfiles)
+        .unwrap()
+        .is_empty());
+    let camera_after = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&camera_after);
+    assert_eq!(stdout(&camera_before), stdout(&camera_after));
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
+fn linux_ext4_corruption_stops_archive_and_preserves_recovery_evidence() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    {
+        let cam =
+            PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-corrupt"), "rw");
+        write_cam_fixture(cam.path());
+        let source = run(
+            "findmnt",
+            [
+                "-n",
+                "-o",
+                "SOURCE",
+                "--target",
+                cam.path().to_str().unwrap(),
+            ],
+        );
+        assert_success(&source);
+        assert_success(&run("umount", [cam.path().as_os_str()]));
+        assert_success(&run(
+            "debugfs",
+            [
+                "-w",
+                "-R",
+                "set_inode_field /TeslaCam/SavedClips/event/front.mp4 links_count 2",
+                stdout(&source).trim(),
+            ],
+        ));
+    }
+    let before = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&before);
+    let archive_root = harness.root.join("archive-corrupt");
+    let archive = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert!(!archive.status.success(), "{}", describe(&archive));
+    assert!(
+        stderr(&archive).contains("filesystem remains inconsistent"),
+        "{}",
+        describe(&archive)
+    );
+    assert!(!archive_root.exists());
+    let after = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&after);
+    assert_eq!(stdout(&before), stdout(&after));
+    let recovery: Vec<_> = fs::read_dir(harness.backingfiles.join("snapshots"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().eq("recovery"))
+        .collect();
+    assert_eq!(recovery.len(), 1);
+    let raw = run("sha256sum", [recovery[0].join("raw.bin").as_os_str()]);
+    assert_success(&raw);
+    assert_eq!(
+        stdout(&raw).split_whitespace().next(),
+        stdout(&before).split_whitespace().next()
+    );
+    assert_success(&harness.run(&["--config", &config, "clean"]));
+    assert!(recovery[0].join("raw.bin").is_file());
+    assert!(recovery[0].join("recovered.bin").is_file());
+    let retained_before = run(
+        "sha256sum",
+        [
+            recovery[0].join("raw.bin"),
+            recovery[0].join("recovered.bin"),
+        ],
+    );
+    assert_success(&retained_before);
+    let retry = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert!(!retry.status.success(), "{}", describe(&retry));
+    assert!(stderr(&retry).contains("recovery evidence already exists"));
+    assert!(!archive_root.exists());
+    let retained_after = run(
+        "sha256sum",
+        [
+            recovery[0].join("raw.bin"),
+            recovery[0].join("recovered.bin"),
+        ],
+    );
+    assert_success(&retained_after);
+    assert_eq!(stdout(&retained_before), stdout(&retained_after));
+    assert!(loops_backed_under(&harness.backingfiles)
+        .unwrap()
+        .is_empty());
 }
 
 struct MountGuard {
@@ -953,19 +1330,24 @@ fn require_linux_integration() {
     );
 
     for command in [
+        "blkid",
         "blockdev",
         "cp",
+        "debugfs",
         "df",
-        "fsck",
+        "dumpe2fs",
+        "findmnt",
+        "e2fsck",
         "kpartx",
         "losetup",
-        "mkfs.vfat",
+        "mkfs.ext4",
         "mkfs.xfs",
         "mount",
         "mountpoint",
         "modprobe",
         "parted",
         "rclone",
+        "sha256sum",
         "stat",
         "sync",
         "truncate",
@@ -1114,6 +1496,15 @@ case "${1:-}" in
     copy)
         src="$2"
         dst="$3"
+        device=$(findmnt -n -o SOURCE --target "$src")
+        test "$(blockdev --getro "$device")" = 1
+        if [ -n "${TESLAUSB_RAW_SNAPSHOT_SHA256:-}" ]; then
+            for snapshot in "$TESLAUSB_SNAPSHOT_CATALOG"/snap-*/snap.bin; do
+                actual=$(sha256sum "$snapshot")
+                test "${actual%% *}" = "$TESLAUSB_RAW_SNAPSHOT_SHA256"
+            done
+        fi
+
         log_file=''
         previous=''
         for arg in "$@"; do
@@ -1122,6 +1513,10 @@ case "${1:-}" in
         done
         : "${log_file:?rclone copy requires a JSON log file}"
         exec 2>"$log_file"
+        if [ -n "${TESLAUSB_FAKE_RCLONE_HOLD:-}" ]; then
+            printf '%s\n%s\n' "$$" "$src" > "$TESLAUSB_FAKE_RCLONE_HOLD"
+            while :; do sleep 1; done
+        fi
         archive="${TESLAUSB_FAKE_RCLONE_ARCHIVE:?}"
         mkdir -p "$archive/$dst"
         /bin/cp -R "$src"/. "$archive/$dst"/
@@ -1177,6 +1572,9 @@ where
 
 fn assert_success(output: &Output) {
     assert!(output.status.success(), "{}", describe(output));
+    for error in ["error: failed to detach", "error: failed to release mount"] {
+        assert!(!stderr(output).contains(error), "{}", describe(output));
+    }
 }
 
 fn stdout(output: &Output) -> String {

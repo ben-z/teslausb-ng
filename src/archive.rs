@@ -7,7 +7,7 @@ use crate::command::CommandRunner;
 use crate::config::ArchiveConfig;
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
-use crate::mount::mount_image;
+use crate::mount::mount_snapshot;
 use crate::snapshot::{SnapshotHandle, SnapshotManager};
 
 pub fn format_size(bytes: u64) -> String {
@@ -587,7 +587,7 @@ impl<F: FileSystem> ArchiveManager<F> {
     pub fn archive_new_snapshot(&self) -> Result<ArchiveResult> {
         let snapshot = self.snapshot_manager.create_snapshot()?;
         let handle = self.snapshot_manager.acquire(snapshot.id)?;
-        let mounted = mount_image(&snapshot.image_path(), true)?;
+        let mounted = mount_snapshot(&snapshot.image_path())?;
         let result = self.archive_snapshot(&handle, mounted.path())?;
         mounted.unmount()?;
 

@@ -174,6 +174,11 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 }
 
 fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
+    if file_values.contains_key("CAM_FILESYSTEM") || env::var_os("CAM_FILESYSTEM").is_some() {
+        return Err(Error::new(
+            "CAM_FILESYSTEM is no longer supported; remove it from the configuration and environment. TeslaUSB requires an ext4 camera image; preserve and migrate any existing FAT32 image before use",
+        ));
+    }
     let mut config = Config::default();
     let mut archive = ArchiveConfig::default();
 
@@ -365,6 +370,17 @@ mod tests {
         assert!(config.archive.archive_saved);
         assert!(config.archive.archive_sentry);
         assert!(!config.archive.archive_recent);
+    }
+
+    #[test]
+    fn camera_filesystem_option_requires_explicit_removal() {
+        for value in ["", "fat32", "ext4", "exfat", "vfat", "EXT4"] {
+            let values = HashMap::from([("CAM_FILESYSTEM".to_string(), value.to_string())]);
+            assert!(load_from_sources(&values)
+                .unwrap_err()
+                .to_string()
+                .contains("CAM_FILESYSTEM is no longer supported; remove it"));
+        }
     }
 
     #[test]

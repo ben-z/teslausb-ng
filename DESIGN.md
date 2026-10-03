@@ -75,7 +75,8 @@ set status LED to fast blink while the archive cycle runs
 delete all stale/deletable snapshots
 wait for USB writes to become idle; skip on timeout
 create reflink snapshot
-mount snapshot read-only
+recover ext4 journal on a private reflink copy, then verify it
+mount snapshot through a read-only loop device
 copy enabled clip directories with rclone JSON confirmations
 select complete, stable Saved/Sentry events for cleanup
 wait for USB writes to become idle again; skip cleanup on timeout
@@ -91,6 +92,29 @@ delete snapshot
 set status LED to heartbeat after a successful cycle
 repeat
 ```
+
+Archive readers require an ext4 snapshot partition and reject other formats.
+A private reflink copy receives journal-only replay followed by a forced
+read-only filesystem check. A successful check permits a read-only loop and
+`ro,noload` mount, so mounting cannot replay the journal or modify the raw
+snapshot.
+
+The durable `snapshots/recovery.state` record names the source snapshot, image
+size, and phase: pending, ready, or failed. Pending state is written before
+creating `snapshots/recovery/`. The raw snapshot is preserved there as `raw.bin`;
+journal recovery runs on a separate `recovered.bin` reflink copy. Ready state is
+written after successful recovery, verification, and image synchronization.
+Observed preparation or mount failures are recorded as failed.
+
+Startup reconciles this workspace before removing incomplete or stale snapshots.
+Pending preparation is rebuilt from the preserved raw image, or from the named
+complete snapshot if the raw link was not yet created. A ready workspace is
+released only after its images have no loop owners. The state record remains
+until workspace removal finishes, so an interrupted cleanup can resume.
+Failed or malformed state and unmarked recovery directories require inspection;
+their evidence is preserved. New snapshots are blocked while either recovery
+path exists, maintaining the single-snapshot space bound. Normal archive cleanup
+releases a successful workspace after checked unmount and loop detach.
 
 The live camera disk is never mounted read-write while it is exposed to the car
 through the USB gadget.
@@ -111,7 +135,7 @@ lock prevents concurrent processes from maintaining the live camera disk.
 ```text
 /mutable/backingfiles.img  (XFS, reflink-capable)
   mounted at /backingfiles
-    cam_disk.bin           (FAT32 disk image exposed to Tesla)
+    cam_disk.bin           (ext4 disk image exposed to Tesla)
     snapshots/
       snap-000000/
         snap.bin           (reflink copy of cam_disk.bin)

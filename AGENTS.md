@@ -69,7 +69,7 @@ scripts/run-linux-integration.sh
 `cargo test` includes offline CLI integration tests with fake Unix tools. Keep
 those tests current when changing deployment, service, mount, `run`, or archive
 flows. `scripts/run-linux-integration.sh` runs ignored Linux tests that use real
-loop devices, XFS, FAT32, and mounts; use a privileged Linux host, VM, or QEMU
+loop devices, XFS, ext4, and mounts; use a privileged Linux host, VM, or QEMU
 guest.
 
 ## Common Tasks
