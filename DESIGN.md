@@ -42,16 +42,20 @@ CLI
 
 ## Crash Safety
 
-The snapshot completion marker is the source of truth.
+A complete snapshot owns pending archive data until every intended file has a
+positive upload or unchanged confirmation. The `snap.toc` marker is the source
+of truth for this ownership; being unlocked does not make a snapshot disposable.
 
 | Operation | Order | Recovery |
 | --- | --- | --- |
-| Create | reflink `snap.bin`, write metadata, atomically write `snap.toc` | no `snap.toc` means remove during explicit recovery |
-| Delete | remove `snap.toc`, sync directory, remove snapshot directory | no `snap.toc` means remove during explicit recovery |
+| Create | reflink `snap.bin`, write metadata and archive plan, atomically write `snap.toc` | no `snap.toc` means remove during explicit recovery |
+| Retire after confirmed upload | remove `snap.toc`, sync directory, remove snapshot directory | before marker removal, retry; after it, remove during explicit recovery |
 | Load | scan `snap-*` directories and require `snap.toc` | inspection preserves incomplete directories; runtime recovery removes them |
 
 Metadata is useful but not trusted. If metadata is missing or stale, the snapshot
-can be reconstructed from the directory name and `snap.bin` mtime.
+can be reconstructed from the directory name and `snap.bin` mtime. The archive
+plan is required: it pins the destination and enabled clip directories. Missing
+or incompatible plans stop archiving and preserve the pending snapshot.
 
 ## Resource Safety
 
@@ -72,13 +76,13 @@ still matters.
 wait until archive is reachable
 set status LED to slow blink
 set status LED to fast blink while the archive cycle runs
-delete all stale/deletable snapshots
-wait for USB writes to become idle; skip on timeout
-create reflink snapshot
+reuse the oldest pending snapshot, if any
+otherwise wait for USB writes to become idle and create a snapshot with its archive plan
 recover ext4 journal on a private reflink copy, then verify it
 mount snapshot through a read-only loop device
 copy enabled clip directories with rclone JSON confirmations
-select complete, stable Saved/Sentry events for cleanup
+require confirmations for every intended file before marking the upload complete
+for a fresh snapshot, select complete, stable Saved/Sentry events for cleanup
 wait for USB writes to become idle again; skip cleanup on timeout
 set status LED to heartbeat while cleaning up
 disable USB gadget if it is enabled
@@ -88,7 +92,7 @@ revalidate whole event file sets, sizes, and modification times
 delete only confirmed files in unchanged events
 check cam disk unmount succeeds
 verify cam filesystem and re-enable USB gadget
-delete snapshot
+retire the snapshot only after its upload is complete
 set status LED to heartbeat after a successful cycle
 repeat
 ```
@@ -106,15 +110,18 @@ journal recovery runs on a separate `recovered.bin` reflink copy. Ready state is
 written after successful recovery, verification, and image synchronization.
 Observed preparation or mount failures are recorded as failed.
 
-Startup reconciles this workspace before removing incomplete or stale snapshots.
+Startup reconciles this workspace under the catalog lock before removing
+incomplete snapshots. Complete snapshots remain pending and are retried first.
 Pending preparation is rebuilt from the preserved raw image, or from the named
 complete snapshot if the raw link was not yet created. A ready workspace is
 released only after its images have no loop owners. The state record remains
 until workspace removal finishes, so an interrupted cleanup can resume.
-Failed or malformed state and unmarked recovery directories require inspection;
-their evidence is preserved. New snapshots are blocked while either recovery
+Failed or malformed state, incomplete source snapshots, and unmarked recovery
+directories require inspection; their evidence is preserved. New snapshots are blocked while either recovery
 path exists, maintaining the single-snapshot space bound. Normal archive cleanup
-releases a successful workspace after checked unmount and loop detach.
+releases a successful workspace after checked unmount and loop detach. This
+workspace is temporary filesystem recovery state; releasing it does not retire
+the pending archive snapshot.
 
 The live camera disk is never mounted read-write while it is exposed to the car
 through the USB gadget.
@@ -123,10 +130,15 @@ RecentClips uploads are partitioned by date, with the known metadata files in a
 separate metadata directory. Local RecentClips files remain owned by the car.
 Saved/Sentry events must remain unchanged across snapshots for the configured
 grace period and every event file must have a positive rclone confirmation.
-Metadata-only events remain on the camera disk.
+Metadata-only events remain on the camera disk. Retrying an immutable pending
+snapshot never advances event stability or deletes live camera files; only fresh
+snapshots can establish that the car has stopped changing an event. Transfer
+filters and dry runs cannot acknowledge omitted files as archived.
 
 A catalog lock serializes snapshot creation, inspection, recovery, and deletion.
-Per-snapshot locks remain held through use or deletion, and a persistent ID
+The `clean` command removes only incomplete snapshots and refuses to run while
+a filesystem recovery workspace exists. Per-snapshot locks remain held through
+use or retirement, and a persistent ID
 counter prevents stale processes from reusing snapshot IDs. A separate archive
 lock prevents concurrent processes from maintaining the live camera disk.
 

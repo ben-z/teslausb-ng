@@ -266,7 +266,7 @@ pub fn validate_camera_image(fs: &impl FileSystem, path: &Path) -> Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotState {
-    Ready,
+    Pending,
     Archiving,
 }
 
@@ -292,6 +292,10 @@ impl Snapshot {
         self.path.join("metadata.json")
     }
 
+    pub fn archive_plan_path(&self) -> PathBuf {
+        self.path.join("archive-plan.json")
+    }
+
     pub fn lock_path(&self) -> PathBuf {
         self.path.join("snap.lock")
     }
@@ -300,12 +304,8 @@ impl Snapshot {
         if self.refcount > 0 || self.externally_locked {
             SnapshotState::Archiving
         } else {
-            SnapshotState::Ready
+            SnapshotState::Pending
         }
-    }
-
-    pub fn is_deletable(&self) -> bool {
-        self.refcount == 0 && !self.externally_locked
     }
 }
 
@@ -349,7 +349,7 @@ impl<F: FileSystem> SnapshotManager<F> {
         };
         manager.fs.create_dir_all(&manager.snapshots_path)?;
         let _catalog_lock = manager.lock_catalog()?;
-        manager.load_snapshots(&mut manager.inner.lock().unwrap(), false)?;
+        manager.load_snapshots(&mut manager.inner.lock().unwrap())?;
         Ok(manager)
     }
 
@@ -361,11 +361,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     }
 
     // The caller holds the catalog lock for the entire scan and any subsequent mutation.
-    fn load_snapshots(
-        &self,
-        inner: &mut SnapshotInner<F::Lock>,
-        recover_incomplete: bool,
-    ) -> Result<()> {
+    fn load_snapshots(&self, inner: &mut SnapshotInner<F::Lock>) -> Result<()> {
         let mut loaded = HashMap::new();
         let mut next_id = inner.next_id;
         let counter_path = self.snapshots_path.join(".next-id");
@@ -395,12 +391,6 @@ impl<F: FileSystem> SnapshotManager<F> {
             );
 
             if !self.fs.exists(&path.join("snap.toc")) {
-                if recover_incomplete {
-                    if let Some(_lock) = self.fs.try_lock(&path.join("snap.lock"))? {
-                        eprintln!("warning: cleaning up incomplete snapshot {}", id);
-                        self.fs.remove_dir_all(&path)?;
-                    }
-                }
                 continue;
             }
 
@@ -425,7 +415,7 @@ impl<F: FileSystem> SnapshotManager<F> {
             snapshot.externally_locked = if inner.process_locks.contains_key(&id) {
                 false
             } else {
-                self.fs.try_lock(&snapshot.lock_path())?.is_none()
+                self.fs.is_locked(&snapshot.lock_path())?
             };
             loaded.insert(id, snapshot);
         }
@@ -439,13 +429,63 @@ impl<F: FileSystem> SnapshotManager<F> {
         Ok(())
     }
 
-    pub fn recover_incomplete(&self) -> Result<()> {
+    pub fn recover(&self) -> Result<()> {
         let _catalog_lock = self.lock_catalog()?;
-        self.load_snapshots(&mut self.inner.lock().unwrap(), true)
+        self.recover_archive_workspace()?;
+        self.load_snapshots(&mut self.inner.lock().unwrap())?;
+        self.clean_incomplete_locked(false)?;
+        Ok(())
     }
 
-    pub fn recover_archive_workspace(&self) -> Result<()> {
+    pub fn clean_incomplete(&self, dry_run: bool) -> Result<Vec<PathBuf>> {
         let _catalog_lock = self.lock_catalog()?;
+        self.require_no_recovery_workspace()?;
+        self.load_snapshots(&mut self.inner.lock().unwrap())?;
+        self.clean_incomplete_locked(dry_run)
+    }
+
+    fn require_no_recovery_workspace(&self) -> Result<()> {
+        if self
+            .fs
+            .list_dir_names(&self.snapshots_path)?
+            .iter()
+            .any(|name| name == RECOVERY_DIRECTORY || name == RECOVERY_STATE)
+        {
+            return Err(retained_recovery(&self.snapshots_path));
+        }
+        Ok(())
+    }
+
+    fn clean_incomplete_locked(&self, dry_run: bool) -> Result<Vec<PathBuf>> {
+        let mut cleaned = Vec::new();
+        for name in self.fs.list_dir_names(&self.snapshots_path)? {
+            if name
+                .strip_prefix("snap-")
+                .and_then(|id| id.parse::<u64>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            let path = self.snapshots_path.join(name);
+            if !self.fs.is_dir(&path) || self.fs.exists(&path.join("snap.toc")) {
+                continue;
+            }
+            self.fs.require_directory(&path)?;
+            let lock_path = path.join("snap.lock");
+            if dry_run {
+                if !self.fs.is_locked(&lock_path)? {
+                    cleaned.push(path);
+                }
+            } else if let Some(_lock) = self.fs.try_lock(&lock_path)? {
+                self.fs.remove_dir_all(&path)?;
+                cleaned.push(path);
+            }
+        }
+        Ok(cleaned)
+    }
+
+    // The caller holds the catalog lock until recovery and incomplete cleanup finish.
+    fn recover_archive_workspace(&self) -> Result<()> {
         let catalog = &self.snapshots_path;
         if !self.fs.exists(&catalog.join(RECOVERY_STATE)) {
             if self.fs.exists(&catalog.join(RECOVERY_DIRECTORY)) {
@@ -455,16 +495,25 @@ impl<F: FileSystem> SnapshotManager<F> {
         }
         let mut record = RecoveryRecord::read(&self.fs, catalog)?;
         let source = catalog.join(&record.source);
-        let _source_lock = if self.fs.exists(&source) {
+        let source_check = (|| -> Result<()> {
             self.fs.require_directory(&source)?;
-            Some(
-                self.fs
-                    .try_lock(&source.join("snap.lock"))?
-                    .ok_or_else(|| Error::new("recovery source snapshot is still in use"))?,
-            )
-        } else {
-            None
-        };
+            self.fs.require_regular_file(&source.join("snap.toc"))?;
+            self.fs.require_regular_file(&source.join("snap.bin"))?;
+            if self.fs.file_size(&source.join("snap.bin"))? != record.size {
+                return Err(Error::new("source image size changed"));
+            }
+            Ok(())
+        })();
+        source_check.map_err(|error| {
+            error.context(format!(
+                "recovery source snapshot {} is incomplete; retained evidence requires inspection",
+                source.display()
+            ))
+        })?;
+        let _source_lock = self
+            .fs
+            .try_lock(&source.join("snap.lock"))?
+            .ok_or_else(|| Error::new("recovery source snapshot is still in use"))?;
         match record.phase {
             RecoveryPhase::Failed => return Err(retained_recovery(catalog)),
             RecoveryPhase::Pending => prepare_recovery(&self.fs, catalog, &mut record)?,
@@ -475,22 +524,12 @@ impl<F: FileSystem> SnapshotManager<F> {
         Ok(())
     }
 
-    pub fn create_snapshot(&self) -> Result<Snapshot> {
+    pub fn create_snapshot(&self, archive_plan_json: &str) -> Result<Snapshot> {
         let _catalog_lock = self.lock_catalog()?;
-        if self
-            .fs
-            .list_dir_names(&self.snapshots_path)?
-            .iter()
-            .any(|name| name == RECOVERY_DIRECTORY || name == RECOVERY_STATE)
-        {
-            return Err(Error::new(format!(
-                "snapshot recovery evidence already exists at {}; inspect retained files before archiving again",
-                self.snapshots_path.join(RECOVERY_DIRECTORY).display()
-            )));
-        }
+        self.require_no_recovery_workspace()?;
         validate_camera_image(&self.fs, &self.cam_disk_path)?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner, true)?;
+        self.load_snapshots(&mut inner)?;
         let snap_id = inner.next_id;
         let next_id = snap_id
             .checked_add(1)
@@ -522,6 +561,8 @@ impl<F: FileSystem> SnapshotManager<F> {
             return Err(error.context("failed to copy cam disk"));
         }
         self.write_metadata(&snapshot)?;
+        self.fs
+            .write_text_atomic(&snapshot.archive_plan_path(), archive_plan_json)?;
         self.fs.write_text_atomic(&snapshot.toc_path(), "")?;
         self.fs.sync_dir(&snapshot.path)?;
         self.fs.sync_dir(&self.snapshots_path)?;
@@ -543,7 +584,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     pub fn acquire(&self, snapshot_id: u64) -> Result<SnapshotHandle<F>> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner, false)?;
+        self.load_snapshots(&mut inner)?;
         let snapshot = inner
             .snapshots
             .get(&snapshot_id)
@@ -580,7 +621,7 @@ impl<F: FileSystem> SnapshotManager<F> {
     pub fn get_snapshots(&self) -> Result<Vec<Snapshot>> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner, false)?;
+        self.load_snapshots(&mut inner)?;
         let mut snapshots: Vec<_> = inner.snapshots.values().cloned().collect();
         snapshots.sort_by_key(|snapshot| (snapshot.created_secs, snapshot.id));
         Ok(snapshots)
@@ -596,18 +637,11 @@ impl<F: FileSystem> SnapshotManager<F> {
             .cloned()
     }
 
-    pub fn get_deletable_snapshots(&self) -> Result<Vec<Snapshot>> {
-        Ok(self
-            .get_snapshots()?
-            .into_iter()
-            .filter(Snapshot::is_deletable)
-            .collect())
-    }
-
-    pub fn delete_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+    // Called only after the archive confirms every file required by the snapshot plan.
+    pub fn retire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         let _catalog_lock = self.lock_catalog()?;
         let mut inner = self.inner.lock().unwrap();
-        self.load_snapshots(&mut inner, false)?;
+        self.load_snapshots(&mut inner)?;
         let Some(snapshot) = inner.snapshots.get(&snapshot_id) else {
             return Ok(false);
         };
@@ -625,13 +659,6 @@ impl<F: FileSystem> SnapshotManager<F> {
         self.fs.sync_dir(&self.snapshots_path)?;
         inner.snapshots.remove(&snapshot_id);
         Ok(true)
-    }
-
-    pub fn delete_oldest_if_deletable(&self) -> Result<bool> {
-        let Some(oldest) = self.get_deletable_snapshots()?.into_iter().next() else {
-            return Ok(false);
-        };
-        self.delete_snapshot(oldest.id)
     }
 }
 
@@ -680,6 +707,8 @@ mod tests {
 
     use super::*;
 
+    const ARCHIVE_PLAN: &str = r#"{"version":1,"archive":"test"}"#;
+
     fn manager() -> SnapshotManager<MockFileSystem> {
         let fs = MockFileSystem::new();
         manager_with_fs(fs)
@@ -700,20 +729,161 @@ mod tests {
     #[test]
     fn creates_complete_snapshot_with_toc() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         assert_eq!(snapshot.id, 0);
-        assert_eq!(snapshot.state(), SnapshotState::Ready);
-        assert!(snapshot.is_deletable());
+        assert_eq!(snapshot.state(), SnapshotState::Pending);
         assert!(manager.fs.exists(&snapshot.image_path()));
         assert!(manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.metadata_path()));
+        assert_eq!(
+            manager.fs.read_text(snapshot.archive_plan_path()).unwrap(),
+            ARCHIVE_PLAN
+        );
+        assert!(
+            manager
+                .fs
+                .mtime_secs(&snapshot.archive_plan_path())
+                .unwrap()
+                < manager.fs.mtime_secs(&snapshot.toc_path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn recovery_and_clean_preserve_pending_uploads_and_their_plans() {
+        let manager = manager();
+        let first = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
+        let second = manager
+            .create_snapshot("opaque plan owned by archive")
+            .unwrap();
+        let _handle = manager.acquire(second.id).unwrap();
+        let incomplete = manager.snapshots_path.join("snap-000002");
+        manager.fs.create_dir_all(&incomplete).unwrap();
+        manager
+            .fs
+            .write_bytes(incomplete.join("snap.bin"), b"partial");
+        let before = catalog_files(&manager);
+
+        assert_eq!(
+            manager.clean_incomplete(true).unwrap(),
+            vec![incomplete.clone()]
+        );
+        assert_eq!(
+            catalog_files(&manager),
+            before,
+            "dry run must not write lock files"
+        );
+        assert_eq!(manager.clean_incomplete(false).unwrap(), vec![incomplete]);
+        manager.recover().unwrap();
+        assert_eq!(manager.get_snapshots().unwrap().len(), 2);
+        for snapshot in [&first, &second] {
+            assert!(manager.fs.exists(&snapshot.toc_path()));
+            assert_eq!(
+                manager.fs.read_bytes(snapshot.image_path()).unwrap(),
+                b"cam"
+            );
+        }
+        assert_eq!(
+            manager.fs.read_text(first.archive_plan_path()).unwrap(),
+            ARCHIVE_PLAN
+        );
+        assert_eq!(
+            manager.fs.read_text(second.archive_plan_path()).unwrap(),
+            "opaque plan owned by archive"
+        );
+    }
+
+    fn catalog_files(manager: &SnapshotManager<MockFileSystem>) -> Vec<(PathBuf, Vec<u8>)> {
+        manager
+            .fs
+            .walk_files(&manager.snapshots_path)
+            .unwrap()
+            .into_iter()
+            .map(|path| {
+                let bytes = manager.fs.read_bytes(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clean_preserves_locked_incomplete_snapshots_without_mutating_during_dry_run() {
+        let manager = manager();
+        let path = manager.snapshots_path.join("snap-000000");
+        manager.fs.create_dir_all(&path).unwrap();
+        manager.fs.write_bytes(path.join("snap.bin"), b"partial");
+        let lock = manager
+            .fs
+            .try_lock(&path.join("snap.lock"))
+            .unwrap()
+            .unwrap();
+        let before = catalog_files(&manager);
+        for dry_run in [true, false] {
+            assert!(manager.clean_incomplete(dry_run).unwrap().is_empty());
+            assert_eq!(catalog_files(&manager), before);
+        }
+        drop(lock);
+        assert_eq!(manager.clean_incomplete(true).unwrap(), vec![path.clone()]);
+        assert_eq!(catalog_files(&manager), before);
+        assert_eq!(manager.clean_incomplete(false).unwrap(), vec![path]);
+    }
+
+    #[test]
+    fn failed_recovery_prevents_cleanup_of_its_incomplete_source() {
+        let manager = manager();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
+        begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+        manager.fs.remove_file(&snapshot.toc_path()).unwrap();
+        assert!(manager
+            .recover()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery source snapshot"));
+        assert_eq!(
+            manager.fs.read_bytes(snapshot.image_path()).unwrap(),
+            b"cam"
+        );
+        assert!(manager.fs.exists(&snapshot.archive_plan_path()));
+        let before = catalog_files(&manager);
+        for dry_run in [true, false] {
+            assert!(manager.clean_incomplete(dry_run).is_err());
+            assert_eq!(catalog_files(&manager), before);
+        }
+    }
+
+    #[test]
+    fn recovery_failure_preserves_unrelated_incomplete_snapshots() {
+        for state in [None, Some("invalid JSON")] {
+            let manager = manager();
+            let incomplete = manager.snapshots_path.join("snap-000000");
+            manager.fs.create_dir_all(&incomplete).unwrap();
+            manager
+                .fs
+                .write_bytes(incomplete.join("snap.bin"), b"partial");
+            manager
+                .fs
+                .create_private_dir(&manager.snapshots_path.join(RECOVERY_DIRECTORY))
+                .unwrap();
+            if let Some(state) = state {
+                manager
+                    .fs
+                    .write_text_atomic(&manager.snapshots_path.join(RECOVERY_STATE), state)
+                    .unwrap();
+            }
+            let before = catalog_files(&manager);
+            assert!(manager.recover().is_err());
+            assert_eq!(catalog_files(&manager), before);
+            for dry_run in [true, false] {
+                assert!(manager.clean_incomplete(dry_run).is_err());
+                assert_eq!(catalog_files(&manager), before);
+            }
+        }
     }
 
     #[test]
     fn pending_recovery_resumes_from_each_interruption_without_copying_the_camera() {
         for stage in 0..4 {
             let manager = manager();
-            let snapshot = manager.create_snapshot().unwrap();
+            let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
             begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
             let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
             if stage >= 1 {
@@ -724,7 +894,6 @@ mod tests {
                     .fs
                     .hard_link(&snapshot.image_path(), &recovery.join("raw.bin"))
                     .unwrap();
-                manager.delete_snapshot(snapshot.id).unwrap();
             }
             if stage >= 3 {
                 manager
@@ -735,11 +904,11 @@ mod tests {
                 .fs
                 .write_bytes(&manager.cam_disk_path, b"new car recording");
             assert!(manager
-                .create_snapshot()
+                .create_snapshot(ARCHIVE_PLAN)
                 .unwrap_err()
                 .to_string()
                 .contains("recovery evidence already exists"));
-            manager.recover_archive_workspace().unwrap();
+            manager.recover().unwrap();
             assert_eq!(manager.fs.recovery_inputs(), vec![b"cam".to_vec()]);
             assert_eq!(
                 manager.fs.read_bytes(&manager.cam_disk_path).unwrap(),
@@ -763,7 +932,7 @@ mod tests {
     fn ready_recovery_cleanup_can_resume_after_each_unlink() {
         for stage in 0..4 {
             let manager = manager();
-            let snapshot = manager.create_snapshot().unwrap();
+            let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
             let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
             prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
             let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
@@ -779,7 +948,7 @@ mod tests {
             if stage >= 3 {
                 manager.fs.remove_dir(&recovery).unwrap();
             }
-            manager.recover_archive_workspace().unwrap();
+            manager.recover().unwrap();
             assert_eq!(
                 manager.fs.recovery_inputs().len(),
                 1,
@@ -793,11 +962,42 @@ mod tests {
     }
 
     #[test]
+    fn recovery_preserves_sole_evidence_when_the_complete_source_is_unavailable() {
+        for phase in [RecoveryPhase::Pending, RecoveryPhase::Ready] {
+            for missing in ["directory", "snap.toc", "snap.bin", "image size"] {
+                let manager = manager();
+                let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
+                let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
+                prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
+                record
+                    .write(&manager.fs, &manager.snapshots_path, phase)
+                    .unwrap();
+                match missing {
+                    "directory" => manager.fs.remove_dir_all(&snapshot.path).unwrap(),
+                    "image size" => manager.fs.write_bytes(snapshot.image_path(), b"changed"),
+                    name => manager.fs.remove_file(&snapshot.path.join(name)).unwrap(),
+                }
+                let before = catalog_files(&manager);
+                assert!(manager
+                    .recover()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("recovery source snapshot"));
+                assert_eq!(catalog_files(&manager), before, "{phase:?}: {missing}");
+                for dry_run in [true, false] {
+                    assert!(manager.clean_incomplete(dry_run).is_err());
+                    assert_eq!(catalog_files(&manager), before);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn attached_recovery_images_block_reconciliation_without_changing_state() {
         for ready in [false, true] {
             for name in ["raw.bin", "recovered.bin"] {
                 let manager = manager();
-                let snapshot = manager.create_snapshot().unwrap();
+                let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
                 let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
                 prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
                 if !ready {
@@ -810,7 +1010,7 @@ mod tests {
                 let state_before = manager.fs.read_bytes(&state).unwrap();
                 manager.fs.set_image_attached(&recovery.join(name), true);
                 assert!(manager
-                    .recover_archive_workspace()
+                    .recover()
                     .unwrap_err()
                     .to_string()
                     .contains("still has loop owners"));
@@ -827,7 +1027,7 @@ mod tests {
                     b"cam"
                 );
                 manager.fs.set_image_attached(&recovery.join(name), false);
-                manager.recover_archive_workspace().unwrap();
+                manager.recover().unwrap();
             }
         }
     }
@@ -835,12 +1035,12 @@ mod tests {
     #[test]
     fn observed_recovery_failure_is_durable_and_never_retried_automatically() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
         let recovery = manager.snapshots_path.join(RECOVERY_DIRECTORY);
         manager.fs.fail_recovery(&recovery.join("recovered.bin"));
         assert!(manager
-            .recover_archive_workspace()
+            .recover()
             .unwrap_err()
             .to_string()
             .contains("injected recovery failure"));
@@ -852,11 +1052,11 @@ mod tests {
         );
         for _ in 0..2 {
             assert!(manager
-                .recover_archive_workspace()
+                .recover()
                 .unwrap_err()
                 .to_string()
                 .contains("recovery evidence already exists"));
-            assert!(manager.create_snapshot().is_err());
+            assert!(manager.create_snapshot(ARCHIVE_PLAN).is_err());
         }
         assert_eq!(manager.fs.recovery_inputs().len(), 1);
         assert_eq!(
@@ -892,7 +1092,7 @@ mod tests {
                     .write_text_atomic(&manager.snapshots_path.join(RECOVERY_STATE), state)
                     .unwrap();
             }
-            assert!(manager.recover_archive_workspace().is_err());
+            assert!(manager.recover().is_err());
             assert_eq!(
                 manager.fs.read_bytes(recovery.join("raw.bin")).unwrap(),
                 b"evidence"
@@ -903,11 +1103,11 @@ mod tests {
     #[test]
     fn recovery_reconciliation_requires_catalog_lock_and_preserves_unexpected_files() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
         prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
         let lock = manager.lock_catalog().unwrap();
-        assert!(manager.recover_archive_workspace().is_err());
+        assert!(manager.recover().is_err());
         drop(lock);
         let extra = manager
             .snapshots_path
@@ -915,7 +1115,7 @@ mod tests {
             .join("unexpected");
         manager.fs.write_bytes(&extra, b"keep");
         assert!(manager
-            .recover_archive_workspace()
+            .recover()
             .unwrap_err()
             .to_string()
             .contains("unexpected recovery entry"));
@@ -925,12 +1125,12 @@ mod tests {
     #[test]
     fn recovery_reconciliation_respects_source_handle_and_recorded_sizes() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         let mut record = begin_recovery(&manager.fs, &snapshot.image_path()).unwrap();
         prepare_recovery(&manager.fs, &manager.snapshots_path, &mut record).unwrap();
         let handle = manager.acquire(snapshot.id).unwrap();
         assert!(manager
-            .recover_archive_workspace()
+            .recover()
             .unwrap_err()
             .to_string()
             .contains("source snapshot is still in use"));
@@ -940,7 +1140,7 @@ mod tests {
             .fs
             .write_bytes(recovery.join("raw.bin"), b"different image");
         assert!(manager
-            .recover_archive_workspace()
+            .recover()
             .unwrap_err()
             .to_string()
             .contains("image size changed"));
@@ -974,7 +1174,10 @@ mod tests {
             manager
                 .fs
                 .write_bytes(&manager.cam_disk_path, b"new recording");
-            let error = manager.create_snapshot().unwrap_err().to_string();
+            let error = manager
+                .create_snapshot(ARCHIVE_PLAN)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("recovery evidence already exists"));
             assert!(error.contains(recovery.to_str().unwrap()));
             assert_eq!(
@@ -996,7 +1199,7 @@ mod tests {
         }
 
         manager.fs.remove_dir_all(&recovery).unwrap();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         assert_eq!(snapshot.id, 0);
         assert_eq!(
             manager.fs.read_bytes(snapshot.image_path()).unwrap(),
@@ -1020,7 +1223,10 @@ mod tests {
                 .fs
                 .write_bytes(incomplete.join("snap.bin"), b"recoverable");
 
-            let error = manager.create_snapshot().unwrap_err().to_string();
+            let error = manager
+                .create_snapshot(ARCHIVE_PLAN)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("camera disk"), "{condition}: {error}");
             assert!(manager.fs.exists(&incomplete.join("snap.bin")));
             assert!(!manager.fs.exists(&incomplete.join("snap.toc")));
@@ -1051,6 +1257,10 @@ mod tests {
             PathBuf::from("/backingfiles/snapshots/snap-000001/metadata.json")
         );
         assert_eq!(
+            snapshot.archive_plan_path(),
+            PathBuf::from("/backingfiles/snapshots/snap-000001/archive-plan.json")
+        );
+        assert_eq!(
             snapshot.lock_path(),
             PathBuf::from("/backingfiles/snapshots/snap-000001/snap.lock")
         );
@@ -1059,9 +1269,9 @@ mod tests {
     #[test]
     fn creates_multiple_snapshots_with_monotonic_ids() {
         let manager = manager();
-        let first = manager.create_snapshot().unwrap();
-        let second = manager.create_snapshot().unwrap();
-        let third = manager.create_snapshot().unwrap();
+        let first = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
+        let second = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
+        let third = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
 
         assert_eq!((first.id, second.id, third.id), (0, 1, 2));
         assert_eq!(manager.get_snapshots().unwrap().len(), 3);
@@ -1084,26 +1294,26 @@ mod tests {
 
         assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(fs.exists(Path::new("/backingfiles/snapshots/snap-000001")));
-        manager.recover_incomplete().unwrap();
+        manager.recover().unwrap();
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000001")));
     }
 
     #[test]
     fn handle_prevents_delete_until_drop() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         let handle = manager.acquire(snapshot.id).unwrap();
-        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(manager.retire_snapshot(snapshot.id).is_err());
         drop(handle);
-        assert!(manager.delete_snapshot(snapshot.id).unwrap());
+        assert!(manager.retire_snapshot(snapshot.id).unwrap());
     }
 
     #[test]
     fn failure_to_remove_completion_marker_preserves_the_snapshot() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         manager.fs.fail_removal(&snapshot.toc_path());
-        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(manager.retire_snapshot(snapshot.id).is_err());
         assert!(manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.image_path()));
         assert_eq!(manager.get_snapshots().unwrap().len(), 1);
@@ -1112,16 +1322,16 @@ mod tests {
     #[test]
     fn failed_snapshot_removal_is_reported_and_recovered() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         manager.fs.fail_removal(&snapshot.path);
-        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(manager.retire_snapshot(snapshot.id).is_err());
         assert!(!manager.fs.exists(&snapshot.toc_path()));
         assert!(manager.fs.exists(&snapshot.image_path()));
         assert!(manager.get_snapshots().unwrap().is_empty());
-        assert!(manager.recover_incomplete().is_err());
+        assert!(manager.recover().is_err());
 
         manager.fs.allow_removal(&snapshot.path);
-        manager.recover_incomplete().unwrap();
+        manager.recover().unwrap();
         assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(!manager.fs.exists(&snapshot.path));
     }
@@ -1131,12 +1341,12 @@ mod tests {
         let manager = manager();
         manager.fs.fail_next_reflink();
         assert!(manager
-            .create_snapshot()
+            .create_snapshot(ARCHIVE_PLAN)
             .unwrap_err()
             .to_string()
             .contains("injected reflink failure"));
         assert!(manager.get_snapshots().unwrap().is_empty());
-        assert_eq!(manager.create_snapshot().unwrap().id, 1);
+        assert_eq!(manager.create_snapshot(ARCHIVE_PLAN).unwrap().id, 1);
     }
 
     #[test]
@@ -1148,7 +1358,7 @@ mod tests {
     #[test]
     fn multiple_acquires_increment_refcount_and_release_on_drop() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
 
         let handle1 = manager.acquire(snapshot.id).unwrap();
         assert_eq!(manager.get_snapshot(snapshot.id).unwrap().refcount, 1);
@@ -1157,18 +1367,18 @@ mod tests {
 
         drop(handle1);
         assert_eq!(manager.get_snapshot(snapshot.id).unwrap().refcount, 1);
-        assert!(manager.delete_snapshot(snapshot.id).is_err());
+        assert!(manager.retire_snapshot(snapshot.id).is_err());
 
         handle2.release();
         handle2.release();
         assert_eq!(manager.get_snapshot(snapshot.id).unwrap().refcount, 0);
-        assert!(manager.delete_snapshot(snapshot.id).unwrap());
+        assert!(manager.retire_snapshot(snapshot.id).unwrap());
     }
 
     #[test]
     fn handle_access_after_release_returns_error() {
         let manager = manager();
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         let mut handle = manager.acquire(snapshot.id).unwrap();
 
         handle.release();
@@ -1177,44 +1387,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_oldest_skips_in_use_snapshots() {
-        let manager = manager();
-        let snap1 = manager.create_snapshot().unwrap();
-        let snap2 = manager.create_snapshot().unwrap();
-        let snap3 = manager.create_snapshot().unwrap();
-        let _handle = manager.acquire(snap1.id).unwrap();
-
-        assert!(manager.delete_oldest_if_deletable().unwrap());
-
-        assert!(manager.get_snapshot(snap1.id).is_some());
-        assert!(manager.get_snapshot(snap2.id).is_none());
-        assert!(manager.get_snapshot(snap3.id).is_some());
-    }
-
-    #[test]
-    fn get_deletable_snapshots_excludes_acquired_snapshots() {
-        let manager = manager();
-        let snap1 = manager.create_snapshot().unwrap();
-        let snap2 = manager.create_snapshot().unwrap();
-        let snap3 = manager.create_snapshot().unwrap();
-        let _handle = manager.acquire(snap2.id).unwrap();
-
-        let ids = manager
-            .get_deletable_snapshots()
-            .unwrap()
-            .into_iter()
-            .map(|snapshot| snapshot.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec![snap1.id, snap3.id]);
-    }
-
-    #[test]
     fn load_existing_snapshots_and_continue_id_sequence() {
         let fs = MockFileSystem::new();
         let manager1 = manager_with_fs(fs.clone());
-        manager1.create_snapshot().unwrap();
-        manager1.create_snapshot().unwrap();
+        manager1.create_snapshot(ARCHIVE_PLAN).unwrap();
+        manager1.create_snapshot(ARCHIVE_PLAN).unwrap();
 
         let manager2 = SnapshotManager::new(
             fs,
@@ -1224,7 +1401,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(manager2.get_snapshots().unwrap().len(), 2);
-        assert_eq!(manager2.create_snapshot().unwrap().id, 2);
+        assert_eq!(manager2.create_snapshot(ARCHIVE_PLAN).unwrap().id, 2);
     }
 
     #[test]
@@ -1244,7 +1421,7 @@ mod tests {
 
         assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(fs.exists(Path::new("/backingfiles/snapshots/snap-000002")));
-        manager.recover_incomplete().unwrap();
+        manager.recover().unwrap();
         assert!(!fs.exists(Path::new("/backingfiles/snapshots/snap-000002")));
     }
 
@@ -1267,7 +1444,7 @@ mod tests {
         let snapshots = manager.get_snapshots().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, 3);
-        assert_eq!(snapshots[0].state(), SnapshotState::Ready);
+        assert_eq!(snapshots[0].state(), SnapshotState::Pending);
         assert_eq!(snapshots[0].refcount, 0);
     }
 
@@ -1315,19 +1492,21 @@ mod tests {
     fn process_lock_blocks_other_managers_until_handle_release() {
         let fs = MockFileSystem::new();
         let manager1 = manager_with_fs(fs.clone());
-        manager1.create_snapshot().unwrap();
+        manager1.create_snapshot(ARCHIVE_PLAN).unwrap();
         let mut handle = manager1.acquire(0).unwrap();
         let manager2 = manager_with_fs(fs);
 
         let snapshot = manager2.get_snapshots().unwrap().pop().unwrap();
         assert_eq!(snapshot.state(), SnapshotState::Archiving);
-        assert!(manager2.get_deletable_snapshots().unwrap().is_empty());
         assert!(manager2.acquire(0).is_err());
-        assert!(manager2.delete_snapshot(0).is_err());
+        assert!(manager2.retire_snapshot(0).is_err());
 
         handle.release();
-        assert_eq!(manager2.get_deletable_snapshots().unwrap()[0].id, 0);
-        assert!(manager2.delete_snapshot(0).unwrap());
+        assert_eq!(
+            manager2.get_snapshots().unwrap()[0].state(),
+            SnapshotState::Pending
+        );
+        assert!(manager2.retire_snapshot(0).unwrap());
         assert!(manager1.acquire(0).is_err());
         assert!(manager1.get_snapshots().unwrap().is_empty());
     }
@@ -1337,9 +1516,9 @@ mod tests {
         let fs = MockFileSystem::new();
         let manager1 = manager_with_fs(fs.clone());
         let manager2 = manager_with_fs(fs);
-        assert_eq!(manager1.create_snapshot().unwrap().id, 0);
-        assert_eq!(manager2.create_snapshot().unwrap().id, 1);
-        assert_eq!(manager1.create_snapshot().unwrap().id, 2);
+        assert_eq!(manager1.create_snapshot(ARCHIVE_PLAN).unwrap().id, 0);
+        assert_eq!(manager2.create_snapshot(ARCHIVE_PLAN).unwrap().id, 1);
+        assert_eq!(manager1.create_snapshot(ARCHIVE_PLAN).unwrap().id, 2);
         assert_eq!(manager2.get_snapshots().unwrap().len(), 3);
     }
 
@@ -1348,12 +1527,18 @@ mod tests {
         let fs = MockFileSystem::new();
         let first = manager_with_fs(fs.clone());
         let stale = manager_with_fs(fs.clone());
-        let snapshot = first.create_snapshot().unwrap();
-        first.delete_snapshot(snapshot.id).unwrap();
-        assert_eq!(stale.create_snapshot().unwrap().id, 1);
+        let snapshot = first.create_snapshot(ARCHIVE_PLAN).unwrap();
+        first.retire_snapshot(snapshot.id).unwrap();
+        assert_eq!(stale.create_snapshot(ARCHIVE_PLAN).unwrap().id, 1);
         assert!(first.acquire(snapshot.id).is_err());
-        stale.delete_snapshot(1).unwrap();
-        assert_eq!(manager_with_fs(fs).create_snapshot().unwrap().id, 2);
+        stale.retire_snapshot(1).unwrap();
+        assert_eq!(
+            manager_with_fs(fs)
+                .create_snapshot(ARCHIVE_PLAN)
+                .unwrap()
+                .id,
+            2
+        );
     }
 
     #[test]
@@ -1362,7 +1547,7 @@ mod tests {
         manager
             .fs
             .write_bytes(manager.snapshots_path.join(".next-id"), b"broken");
-        assert!(manager.create_snapshot().is_err());
+        assert!(manager.create_snapshot(ARCHIVE_PLAN).is_err());
         assert!(manager.get_snapshots().is_err());
     }
 
@@ -1382,17 +1567,17 @@ mod tests {
         )
         .is_err());
         assert!(manager.get_snapshots().is_err());
-        assert!(manager.create_snapshot().is_err());
-        assert!(manager.delete_snapshot(0).is_err());
+        assert!(manager.create_snapshot(ARCHIVE_PLAN).is_err());
+        assert!(manager.retire_snapshot(0).is_err());
         assert!(manager.acquire(0).is_err());
         assert!(fs.exists(&path.join("snap.bin")));
 
         drop(catalog_lock);
         assert!(manager.get_snapshots().unwrap().is_empty());
         assert!(fs.exists(path));
-        manager.recover_incomplete().unwrap();
+        manager.recover().unwrap();
         assert!(!fs.exists(path));
-        assert_eq!(manager.create_snapshot().unwrap().id, 1);
+        assert_eq!(manager.create_snapshot(ARCHIVE_PLAN).unwrap().id, 1);
     }
 
     #[test]
@@ -1408,7 +1593,7 @@ mod tests {
         assert!(fs.exists(&path.join("snap.bin")));
         drop(lock);
         assert!(manager.get_snapshots().unwrap().is_empty());
-        manager.recover_incomplete().unwrap();
+        manager.recover().unwrap();
         assert!(!fs.exists(path));
     }
 
@@ -1416,7 +1601,7 @@ mod tests {
     fn complete_snapshot_missing_image_fails_loudly() {
         let fs = MockFileSystem::new();
         let manager = manager_with_fs(fs.clone());
-        let snapshot = manager.create_snapshot().unwrap();
+        let snapshot = manager.create_snapshot(ARCHIVE_PLAN).unwrap();
         fs.remove_file(&snapshot.image_path()).unwrap();
         assert!(manager.get_snapshots().is_err());
         assert!(manager.acquire(snapshot.id).is_err());

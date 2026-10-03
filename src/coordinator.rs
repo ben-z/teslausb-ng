@@ -11,7 +11,6 @@ use crate::gadget::{GadgetDisableGuard, UsbGadget};
 use crate::idle::ProcIdleDetector;
 use crate::led::{LedPattern, SysfsLedController};
 use crate::mount::{fsck_image, mount_image};
-use crate::snapshot::SnapshotManager;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -25,7 +24,6 @@ pub fn request_stop() {
 
 #[derive(Debug, Clone)]
 pub struct Coordinator<F: FileSystem> {
-    snapshot_manager: SnapshotManager<F>,
     archive_manager: ArchiveManager<F>,
     gadget: Option<UsbGadget>,
     led: Option<SysfsLedController>,
@@ -38,13 +36,11 @@ pub struct Coordinator<F: FileSystem> {
 
 impl<F: FileSystem> Coordinator<F> {
     pub fn new(
-        snapshot_manager: SnapshotManager<F>,
         archive_manager: ArchiveManager<F>,
         gadget: Option<UsbGadget>,
         config: &RuntimeConfig,
     ) -> Self {
         Self {
-            snapshot_manager,
             archive_manager,
             gadget,
             led: None,
@@ -133,27 +129,14 @@ impl<F: FileSystem> Coordinator<F> {
 
     fn do_archive_cycle(&mut self) -> Result<ArchiveCycle> {
         self.set_led(LedPattern::FastBlink)?;
-        let mut stale = 0;
-        while self.snapshot_manager.delete_oldest_if_deletable()? {
-            stale += 1;
-        }
-        if stale == 1 {
-            eprintln!("warning: deleted 1 stale snapshot, likely from an unclean stop");
-        } else if stale > 1 {
-            eprintln!(
-                "error: deleted {} stale snapshots; expected at most 1 under eager clean up",
-                stale
-            );
-        }
-
-        if !self.wait_for_usb_idle() {
+        if !self.archive_manager.has_pending_snapshot()? && !self.wait_for_usb_idle() {
             return Ok(ArchiveCycle {
                 success: false,
                 files_transferred: 0,
             });
         }
 
-        let result = self.archive_manager.archive_new_snapshot()?;
+        let result = self.archive_manager.archive_pending_or_new_snapshot()?;
         if result.success() {
             eprintln!(
                 "archive complete: {} files transferred, {}",
@@ -180,10 +163,12 @@ impl<F: FileSystem> Coordinator<F> {
             self.delete_archived_files(&result)?;
         }
 
-        if let Err(err) = self.snapshot_manager.delete_snapshot(result.snapshot_id) {
+        if result.success() {
+            self.archive_manager.retire_snapshot(&result)?;
+        } else {
             eprintln!(
-                "warning: failed to delete snapshot {}: {}",
-                result.snapshot_id, err
+                "retained pending archive snapshot {} for retry",
+                result.snapshot_id
             );
         }
 
@@ -209,7 +194,7 @@ impl<F: FileSystem> Coordinator<F> {
 
         let cam_disk: PathBuf = self.archive_manager.cam_disk_path().to_path_buf();
         fsck_image(&cam_disk)?;
-        let mounted = mount_image(&cam_disk, false)?;
+        let mounted = mount_image(&cam_disk)?;
         let (deleted, skipped) = self
             .archive_manager
             .delete_archived_files(result, mounted.path())?;

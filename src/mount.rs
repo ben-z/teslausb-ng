@@ -294,15 +294,10 @@ pub fn fsck_image(image_path: &Path) -> Result<()> {
     device.detach()
 }
 
-pub fn mount_image(image_path: &Path, readonly: bool) -> Result<MountedImage> {
-    let device = setup_loop_device(image_path, readonly)?;
+pub fn mount_image(image_path: &Path) -> Result<MountedImage> {
+    let device = setup_loop_device(image_path, false)?;
     ensure_ext4(device.partition())?;
-    if readonly {
-        return Err(Error::new(
-            "ext4 read-only mounts require a recovered snapshot",
-        ));
-    }
-    mount_partition(device, readonly)
+    mount_partition(device, false)
 }
 
 fn mount_partition(device: LoopDevice, readonly: bool) -> Result<MountedImage> {

@@ -3,6 +3,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -162,7 +163,9 @@ fn offline_init_mount_status_doctor_and_deinit() {
     assert_success(&status);
     let status_json = stdout(&status);
     assert!(status_json.contains("\"backingfiles_mounted\": true"));
-    assert!(status_json.contains("\"snapshots\": { \"count\": 0, \"deletable\": 0 }"));
+    assert!(
+        status_json.contains("\"snapshots\": { \"count\": 0, \"pending\": 0, \"archiving\": 0 }")
+    );
     assert!(status_json.contains("\"system\": \"none\""));
 
     let doctor = harness.run(&["--config", &config, "doctor"]);
@@ -279,11 +282,18 @@ fn offline_ext4_recovery_failure_prevents_upload_and_preserves_evidence() {
             fs::read(recovery[0].join("raw.bin")).unwrap(),
             fs::read(harness.backingfiles.join("cam_disk.bin")).unwrap()
         );
-        assert_success(&harness.run(&["--config", &config, "clean"]));
+        let clean = harness.run(&["--config", &config, "clean"]);
+        assert!(!clean.status.success(), "{}", describe(&clean));
+        assert!(
+            stderr(&clean).contains("recovery evidence already exists"),
+            "{}",
+            describe(&clean)
+        );
         assert!(
             recovery[0].join("raw.bin").is_file(),
             "normal cleanup erased failed recovery evidence"
         );
+        assert_eq!(recovery_files(&recovery[0]), retained_files);
         assert_eq!(fs::read(&state_path).unwrap(), failed_state);
     }
 }
@@ -582,7 +592,7 @@ fn offline_status_before_init_warns_when_not_mounted() {
     let json = stdout(&status);
     assert!(json.contains("\"backingfiles_mounted\": false"), "{json}");
     assert!(json.contains("Backingfiles not mounted"), "{json}");
-    assert!(json.contains("\"snapshots\": { \"count\": 0, \"deletable\": 0 }"));
+    assert!(json.contains("\"snapshots\": { \"count\": 0, \"pending\": 0, \"archiving\": 0 }"));
 }
 
 #[test]
@@ -636,7 +646,9 @@ fn offline_archive_snapshots_and_clean_with_fake_rclone() {
 
     let clean = harness.run(&["--config", &config, "clean", "--dry-run"]);
     assert_success(&clean);
-    assert!(stdout(&clean).contains("No deletable snapshots"));
+    assert!(
+        stdout(&clean).contains("Would remove 0 incomplete snapshot(s); pending uploads preserved")
+    );
 
     let log = harness.command_log();
     assert!(log.contains("rclone\tlsf\tfake:"));
@@ -678,6 +690,74 @@ fn offline_archive_failure_returns_nonzero_without_privileged_tools() {
 }
 
 #[test]
+fn offline_pending_archive_survives_clean_and_rejects_destination_changes() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    let failed = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_FAIL", "SavedClips")],
+    );
+    assert!(!failed.status.success(), "{}", describe(&failed));
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    assert!(snapshot.join("snap.toc").is_file());
+    assert!(snapshot.join("archive-plan.json").is_file());
+    let retained = recovery_files(&snapshot);
+    let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
+    let listed = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&listed);
+    let snapshots: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots[0]["state"], "pending");
+    for args in [
+        vec!["--config", &config, "clean", "--dry-run"],
+        vec!["--config", &config, "clean"],
+    ] {
+        assert_success(&harness.run(&args));
+        assert_eq!(recovery_files(&snapshot), retained);
+    }
+    let original_config = fs::read_to_string(&harness.config).unwrap();
+    fs::write(
+        &harness.config,
+        original_config.replace("RCLONE_PATH=TeslaArchive", "RCLONE_PATH=OtherArchive"),
+    )
+    .unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    let redirected = harness.run(&["--config", &config, "archive"]);
+    assert!(!redirected.status.success(), "{}", describe(&redirected));
+    assert!(
+        stderr(&redirected).contains("archive plan"),
+        "{}",
+        describe(&redirected)
+    );
+    let rejected_log = harness.command_log();
+    assert!(!rejected_log.contains("rclone\tcopy"));
+    assert!(!rejected_log.contains("cp\t--reflink=always"));
+    assert!(!rejected_log.contains("mount\t-o\tro"));
+    assert_eq!(recovery_files(&snapshot), retained);
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
+    );
+
+    fs::write(&harness.config, original_config).unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert_eq!(
+        fs::read_to_string(harness.archive_path("SavedClips/event/front.mp4")).unwrap(),
+        "saved-front"
+    );
+    assert!(!snapshot.exists());
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
+    );
+    let retry_log = harness.command_log();
+    assert!(!retry_log.contains("live-camera-fsck"));
+    assert!(!retry_log.contains("mount\t-o\trw"));
+}
+
+#[test]
 fn offline_run_loop_archives_updates_monitors_and_stops_on_sigterm() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -704,29 +784,39 @@ fn offline_run_loop_archives_updates_monitors_and_stops_on_sigterm() {
         ],
     );
 
-    if !wait_until(
-        || {
-            harness.archive_path("Photobooth/photo.jpg").exists()
-                && fs::read_dir(harness.backingfiles.join("snapshots"))
-                    .unwrap()
-                    .all(|entry| {
-                        !entry
-                            .unwrap()
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("snap-")
-                    })
-        },
-        Duration::from_secs(10),
-    ) {
-        terminate_child(&mut child);
-        let output = child.wait_with_output().unwrap();
-        panic!("run loop did not archive in time\n{}", describe(&output));
-    }
-
+    let stderr_pipe = child.stderr.take().unwrap();
+    let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stderr_pipe);
+        let mut captured = Vec::new();
+        let mut signaled = false;
+        loop {
+            let mut line = Vec::new();
+            if reader.read_until(b'\n', &mut line).unwrap() == 0 {
+                break;
+            }
+            if !signaled && line.starts_with(b"clean up complete: deleted 4, skipped 0") {
+                completed_tx.send(()).unwrap();
+                signaled = true;
+            }
+            captured.extend_from_slice(&line);
+        }
+        captured
+    });
+    let completed = completed_rx.recv_timeout(Duration::from_secs(30)).is_ok();
     terminate_child(&mut child);
-    let output = child.wait_with_output().unwrap();
+    let mut output = child.wait_with_output().unwrap();
+    output.stderr = reader.join().unwrap();
+    assert!(
+        completed,
+        "run loop did not complete cleanup\n{}",
+        describe(&output)
+    );
     assert_success(&output);
+    assert!(harness.archive_path("Photobooth/photo.jpg").is_file());
+    let snapshots = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&snapshots);
+    assert_eq!(stdout(&snapshots).trim(), "[]");
 
     let stderr = stderr(&output);
     assert!(stderr.contains("waiting up to 1s for USB writes to become idle"));
@@ -967,7 +1057,22 @@ fn offline_manual_archive_sigterm_reaps_copy_and_unmounts_snapshot() {
             path.display()
         );
     }
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    assert!(
+        snapshot.join("snap.toc").is_file(),
+        "SIGTERM discarded pending footage"
+    );
+    assert!(snapshot.join("archive-plan.json").is_file());
+    let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
     assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert!(!snapshot.exists());
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
+    );
+    assert!(!harness.command_log().contains("live-camera-fsck"));
+    assert!(!harness.command_log().contains("mount\t-o\trw"));
 }
 
 #[test]
