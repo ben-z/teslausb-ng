@@ -151,27 +151,21 @@ fn config(args: &GlobalArgs) -> Result<Config> {
     load_config(args.config_path.as_deref())
 }
 
-fn create_components(
-    config: &Config,
-) -> Result<(
-    SnapshotManager<RealFileSystem>,
-    ArchiveManager<RealFileSystem>,
-)> {
+fn create_archive_manager(config: &Config) -> Result<ArchiveManager<RealFileSystem>> {
     let fs = RealFileSystem;
     validate_camera_image(&fs, &config.cam_disk_path())?;
     let snapshot_manager =
         SnapshotManager::new(fs, config.cam_disk_path(), config.snapshots_path())?;
-    snapshot_manager.recover_archive_workspace()?;
-    snapshot_manager.recover_incomplete()?;
+    snapshot_manager.recover()?;
     let backend = ArchiveBackend::from_config(&config.archive, fs);
     let archive_manager = ArchiveManager::new(
         fs,
-        snapshot_manager.clone(),
+        snapshot_manager,
         backend,
         config.cam_disk_path(),
         &config.archive,
     );
-    Ok((snapshot_manager, archive_manager))
+    Ok(archive_manager)
 }
 
 fn cmd_init(args: &GlobalArgs) -> Result<i32> {
@@ -285,17 +279,13 @@ fn cmd_run(args: &GlobalArgs) -> Result<i32> {
     for warning in config.warnings() {
         eprintln!("warning: {}", warning);
     }
-    let (snapshot_manager, archive_manager) = create_components(&config)?;
+    let archive_manager = create_archive_manager(&config)?;
     let temperature_monitor = SysfsTemperatureMonitor::default_sysfs(TemperatureConfig::default());
     let temperature_guard = temperature_monitor.start()?;
-    let mut coordinator = Coordinator::new(
-        snapshot_manager,
-        archive_manager,
-        Some(UsbGadget::default()),
-        &config.runtime,
-    )
-    .with_led(SysfsLedController::auto_detect()?)
-    .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
+    let mut coordinator =
+        Coordinator::new(archive_manager, Some(UsbGadget::default()), &config.runtime)
+            .with_led(SysfsLedController::auto_detect()?)
+            .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
     let run_result = coordinator.run();
     let temperature_result = temperature_guard.stop();
     run_result?;
@@ -308,14 +298,10 @@ fn cmd_archive(args: &GlobalArgs) -> Result<i32> {
     ensure_dependencies(&config, DependencySet::Runtime)?;
     ensure_mounted(&config)?;
     let _archive_lock = archive_lock(&config)?;
-    let (snapshot_manager, archive_manager) = create_components(&config)?;
-    let mut coordinator = Coordinator::new(
-        snapshot_manager,
-        archive_manager,
-        Some(UsbGadget::default()),
-        &config.runtime,
-    )
-    .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
+    let archive_manager = create_archive_manager(&config)?;
+    let mut coordinator =
+        Coordinator::new(archive_manager, Some(UsbGadget::default()), &config.runtime)
+            .with_idle_detector(ProcIdleDetector::default_proc(&config.runtime));
     Ok(if coordinator.run_once()? { 0 } else { 1 })
 }
 
@@ -341,21 +327,13 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
     } else {
         Vec::new()
     };
-    let deletable_count = if mounted {
-        snapshots
-            .iter()
-            .filter(|snapshot| snapshot.is_deletable())
-            .count()
-    } else {
+    if !mounted {
         warnings.push("Backingfiles not mounted (run 'teslausb mount' or 'teslausb run')".into());
-        0
-    };
-    if deletable_count > 0 {
-        warnings.push(format!(
-            "{} stale snapshot(s) found (run 'teslausb clean' or wait for the next archive cycle)",
-            deletable_count
-        ));
     }
+    let pending_count = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.state() == crate::snapshot::SnapshotState::Pending)
+        .count();
     let space = if mounted {
         Some(disk_space(&config.backingfiles_path)?)
     } else {
@@ -364,7 +342,7 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
 
     if json {
         println!(
-            "{{\n  \"backingfiles_mounted\": {},\n  \"warnings\": [{}],\n  \"space\": {},\n  \"snapshots\": {{ \"count\": {}, \"deletable\": {} }},\n  \"archive\": {{ \"system\": \"{}\", \"reachable\": {} }}\n}}",
+            "{{\n  \"backingfiles_mounted\": {},\n  \"warnings\": [{}],\n  \"space\": {},\n  \"snapshots\": {{ \"count\": {}, \"pending\": {}, \"archiving\": {} }},\n  \"archive\": {{ \"system\": \"{}\", \"reachable\": {} }}\n}}",
             mounted,
             warnings
                 .iter()
@@ -373,7 +351,8 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
                 .join(", "),
             space_json(space),
             snapshots.len(),
-            deletable_count,
+            pending_count,
+            snapshots.len() - pending_count,
             json_escape(&config.archive.system),
             archive_reachable
         );
@@ -391,7 +370,7 @@ fn cmd_status(args: &GlobalArgs) -> Result<i32> {
             if mounted { "Yes" } else { "No" }
         );
         println!("Snapshots: {}", snapshots.len());
-        println!("Deletable snapshots: {}", deletable_count);
+        println!("Pending uploads: {}", pending_count);
         if let Some(space) = space {
             println!(
                 "Space: {:.1} GiB free / {:.1} GiB total",
@@ -431,7 +410,7 @@ fn cmd_snapshots(args: &GlobalArgs) -> Result<i32> {
                     "{{\"id\":{},\"state\":\"{}\",\"refs\":{},\"created_at_unix\":{},\"path\":\"{}\"}}",
                     snapshot.id,
                     match snapshot.state() {
-                        crate::snapshot::SnapshotState::Ready => "ready",
+                        crate::snapshot::SnapshotState::Pending => "pending",
                         crate::snapshot::SnapshotState::Archiving => "archiving",
                     },
                     snapshot.refcount,
@@ -451,7 +430,7 @@ fn cmd_snapshots(args: &GlobalArgs) -> Result<i32> {
         println!("{}", "-".repeat(80));
         for snapshot in snapshots {
             let state = match snapshot.state() {
-                crate::snapshot::SnapshotState::Ready => "ready",
+                crate::snapshot::SnapshotState::Pending => "pending",
                 crate::snapshot::SnapshotState::Archiving => "archiving",
             };
             println!(
@@ -477,26 +456,19 @@ fn cmd_clean(args: &GlobalArgs) -> Result<i32> {
         config.cam_disk_path(),
         config.snapshots_path(),
     )?;
-    let deletable = manager.get_deletable_snapshots()?;
-    if deletable.is_empty() {
-        println!("No deletable snapshots");
-        return Ok(0);
+    let cleaned = manager.clean_incomplete(dry_run)?;
+    for path in &cleaned {
+        println!(
+            "{} {}",
+            if dry_run { "Would remove" } else { "Removed" },
+            path.display()
+        );
     }
-    if dry_run {
-        println!("Would delete {} snapshot(s):", deletable.len());
-        for snapshot in deletable {
-            println!("  {}: {}", snapshot.id, snapshot.path.display());
-        }
-        return Ok(0);
-    }
-    let mut deleted = 0;
-    for snapshot in deletable {
-        if manager.delete_snapshot(snapshot.id)? {
-            deleted += 1;
-            println!("Deleted snapshot {}", snapshot.id);
-        }
-    }
-    println!("Deleted {} snapshot(s)", deleted);
+    println!(
+        "{} {} incomplete snapshot(s); pending uploads preserved",
+        if dry_run { "Would remove" } else { "Removed" },
+        cleaned.len()
+    );
     Ok(0)
 }
 
@@ -753,7 +725,7 @@ fn create_cam_disk(cam_disk_path: &Path, cam_size: u64) -> Result<()> {
         Some(Duration::from_secs(300)),
     )?;
     loop_device.detach()?;
-    let mounted = mount_image(cam_disk_path, false)?;
+    let mounted = mount_image(cam_disk_path)?;
     let camera = mounted.path().join("TeslaCam");
     fs::create_dir_all(&camera)?;
     // The car's recording process may use a different Unix identity.
@@ -952,7 +924,7 @@ Commands:\n\
   archive                    Run one archive cycle\n\
   status [--json]            Show status\n\
   snapshots [--json]         List snapshots\n\
-  clean [--dry-run]          Delete deletable snapshots\n\
+  clean [--dry-run]          Remove incomplete snapshots; preserve pending uploads\n\
   gadget <on|off|status>     Manage USB mass storage gadget\n\
   service <install|uninstall|status>\n\
   doctor [--startup]         Check external dependencies\n"

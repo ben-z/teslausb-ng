@@ -17,6 +17,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
 
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
+    fn directory_exists(&self, path: &Path) -> Result<bool>;
     fn require_regular_file(&self, path: &Path) -> Result<()>;
     fn require_directory(&self, path: &Path) -> Result<()>;
     fn list_dir_names(&self, path: &Path) -> Result<Vec<String>>;
@@ -36,6 +37,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn mtime_secs(&self, path: &Path) -> Result<u64>;
     fn walk_files(&self, path: &Path) -> Result<Vec<PathBuf>>;
     fn sync_dir(&self, path: &Path) -> Result<()>;
+    fn is_locked(&self, path: &Path) -> Result<bool>;
     fn try_lock(&self, path: &Path) -> Result<Option<Self::Lock>>;
 }
 
@@ -63,6 +65,19 @@ impl FileSystem for RealFileSystem {
 
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn directory_exists(&self, path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => Ok(true),
+            Ok(_) => Err(Error::new(format!(
+                "expected a directory without symlinks: {}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(Error::from(error)
+                .context(format!("failed to inspect directory {}", path.display()))),
+        }
     }
 
     fn require_regular_file(&self, path: &Path) -> Result<()> {
@@ -239,7 +254,9 @@ impl FileSystem for RealFileSystem {
 
     fn walk_files(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        walk_files_real(path, &mut files)?;
+        walk_files_real(path, &mut files).map_err(|error| {
+            error.context(format!("failed to enumerate directory {}", path.display()))
+        })?;
         files.sort();
         Ok(files)
     }
@@ -248,6 +265,21 @@ impl FileSystem for RealFileSystem {
         let dir = File::open(path)?;
         dir.sync_all()?;
         Ok(())
+    }
+
+    fn is_locked(&self, path: &Path) -> Result<bool> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(Error::new(format!(
+                "lock path is not a file: {}",
+                path.display()
+            )));
+        }
+        Ok(!try_lock_exclusive(&file)?)
     }
 
     fn try_lock(&self, path: &Path) -> Result<Option<Self::Lock>> {
@@ -310,9 +342,7 @@ fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
 }
 
 fn walk_files_real(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
+    RealFileSystem.require_directory(path)?;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let entry_path = entry.path();
@@ -321,6 +351,11 @@ fn walk_files_real(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             walk_files_real(&entry_path, files)?;
         } else if metadata.is_file() {
             files.push(entry_path);
+        } else {
+            return Err(Error::new(format!(
+                "expected a regular file or directory without symlinks: {}",
+                entry_path.display()
+            )));
         }
     }
     Ok(())
@@ -353,6 +388,7 @@ struct MockState {
     tick: u64,
     locks: HashSet<PathBuf>,
     removal_failures: HashSet<PathBuf>,
+    read_failures: HashSet<PathBuf>,
     fail_next_reflink: bool,
     attached_images: HashSet<PathBuf>,
     recovery_failures: HashSet<PathBuf>,
@@ -415,6 +451,14 @@ impl MockFileSystem {
             .insert(normalize(path));
     }
 
+    pub fn fail_read(&self, path: &Path) {
+        self.inner
+            .lock()
+            .unwrap()
+            .read_failures
+            .insert(normalize(path));
+    }
+
     pub fn fail_next_reflink(&self) {
         self.inner.lock().unwrap().fail_next_reflink = true;
     }
@@ -465,6 +509,24 @@ impl FileSystem for MockFileSystem {
 
     fn is_dir(&self, path: &Path) -> bool {
         self.inner.lock().unwrap().dirs.contains(&normalize(path))
+    }
+
+    fn directory_exists(&self, path: &Path) -> Result<bool> {
+        let path = normalize(path);
+        let state = self.inner.lock().unwrap();
+        if state.read_failures.contains(&path) {
+            return Err(Error::new(format!(
+                "cannot read directory {}",
+                path.display()
+            )));
+        }
+        if state.files.contains_key(&path) {
+            return Err(Error::new(format!(
+                "expected a directory: {}",
+                path.display()
+            )));
+        }
+        Ok(state.dirs.contains(&path))
     }
 
     fn require_regular_file(&self, path: &Path) -> Result<()> {
@@ -674,11 +736,17 @@ impl FileSystem for MockFileSystem {
     }
 
     fn walk_files(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        self.require_directory(path)?;
         let path = normalize(path);
-        let mut files: Vec<PathBuf> = self
-            .inner
-            .lock()
-            .unwrap()
+        let state = self.inner.lock().unwrap();
+        if let Some(unreadable) = state
+            .read_failures
+            .iter()
+            .find(|candidate| is_under(candidate, &path))
+        {
+            return Err(Error::new(format!("cannot read {}", unreadable.display())));
+        }
+        let mut files: Vec<PathBuf> = state
             .files
             .keys()
             .filter(|candidate| is_under(candidate, &path))
@@ -690,6 +758,18 @@ impl FileSystem for MockFileSystem {
 
     fn sync_dir(&self, _path: &Path) -> Result<()> {
         Ok(())
+    }
+
+    fn is_locked(&self, path: &Path) -> Result<bool> {
+        let path = normalize(path);
+        let state = self.inner.lock().unwrap();
+        if state.dirs.contains(&path) {
+            return Err(Error::new(format!(
+                "lock path is not a file: {}",
+                path.display()
+            )));
+        }
+        Ok(state.locks.contains(&path))
     }
 
     fn try_lock(&self, path: &Path) -> Result<Option<Self::Lock>> {
@@ -744,6 +824,21 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn lock_probe_does_not_create_files_and_releases_its_lock() {
+        let root = temp_dir("lock-probe");
+        let path = root.join("snap.lock");
+        assert!(!RealFileSystem.is_locked(&path).unwrap());
+        assert!(!path.exists());
+        let lock = RealFileSystem.try_lock(&path).unwrap().unwrap();
+        assert!(RealFileSystem.is_locked(&path).unwrap());
+        drop(lock);
+        assert!(!RealFileSystem.is_locked(&path).unwrap());
+        assert!(RealFileSystem.try_lock(&path).unwrap().is_some());
+        assert!(RealFileSystem.is_locked(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -933,11 +1028,22 @@ mod tests {
     }
 
     #[test]
-    fn real_filesystem_walks_missing_directories_as_empty() {
+    fn real_directory_discovery_distinguishes_absence_from_invalid_paths() {
         let fs = RealFileSystem;
-        let missing = temp_dir("missing").join("not-there");
-
-        assert!(fs.walk_files(&missing).unwrap().is_empty());
+        let root = temp_dir("directory-discovery");
+        let missing = root.join("not-there");
+        assert!(!fs.directory_exists(&missing).unwrap());
+        assert!(fs.walk_files(&missing).is_err());
+        assert!(fs.directory_exists(&root).unwrap());
+        let file = root.join("file");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(fs.directory_exists(&file).is_err());
+        assert!(fs.directory_exists(&file.join("child")).is_err());
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        assert!(fs.directory_exists(&link).is_err());
+        assert!(fs.walk_files(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

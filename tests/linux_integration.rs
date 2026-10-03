@@ -443,12 +443,18 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
     }
     set_flags("--dry-run");
     let dry_run = archive();
-    assert_success(&dry_run);
+    assert!(!dry_run.status.success(), "{}", describe(&dry_run));
     assert!(
-        stderr(&dry_run).contains("archive complete: 0 files"),
+        stderr(&dry_run).contains("0 files"),
         "{}",
         describe(&dry_run)
     );
+    let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
+    let pending = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&pending);
+    let snapshots: serde_json::Value = serde_json::from_str(&stdout(&pending)).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots[0]["state"], "pending");
     assert!(!archive_destination
         .join("SavedClips/unconfirmed/front.mp4")
         .exists());
@@ -469,11 +475,15 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
 
     set_flags("--exclude *.json");
     let excluded = archive();
-    assert_success(&excluded);
+    assert!(!excluded.status.success(), "{}", describe(&excluded));
     assert!(
-        stderr(&excluded).contains("archive complete: 1 files"),
+        stderr(&excluded).contains("1 files"),
         "{}",
         describe(&excluded)
+    );
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
     );
     assert_eq!(
         fs::read_to_string(archive_destination.join("SavedClips/unconfirmed/front.mp4")).unwrap(),
@@ -510,7 +520,21 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
         "event-metadata"
     );
     let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "ro");
-    assert!(!cam.path().join(unconfirmed).exists());
+    assert_eq!(
+        fs::read_to_string(cam.path().join(unconfirmed).join("front.mp4")).unwrap(),
+        "unconfirmed-video"
+    );
+    assert_eq!(
+        fs::read_to_string(cam.path().join(unconfirmed).join("event.json")).unwrap(),
+        "event-metadata"
+    );
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
+    );
+    let retired = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&retired);
+    assert_eq!(stdout(&retired).trim(), "[]");
 }
 
 #[test]
@@ -623,6 +647,17 @@ fn linux_failed_archive_cleans_files_confirmed_before_rclone_error() {
         assert_archived_files_removed_from_cam(cam.path());
     }
 
+    let snapshots = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&snapshots);
+    let pending: serde_json::Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert_eq!(pending.as_array().unwrap().len(), 1);
+    assert_eq!(pending[0]["state"], "pending");
+    let retry = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert_success(&retry);
+    assert!(!stderr(&retry).contains("clean up complete"));
     let snapshots = harness.run(&["--config", &config, "snapshots", "--json"]);
     assert_success(&snapshots);
     assert_eq!(stdout(&snapshots).trim(), "[]");
@@ -852,8 +887,8 @@ fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gon
             "durable-camera-recording",
         );
     }
-    let camera_before = run("sha256sum", [harness.cam_disk().as_os_str()]);
-    assert_success(&camera_before);
+    let camera_original = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&camera_original);
     let archive_root = harness.root.join("archive-restarted");
     let marker = harness.root.join("copy-held");
     let mut child = harness.spawn_with_env(
@@ -940,11 +975,37 @@ fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gon
     assert!(loops_backed_under(&harness.backingfiles)
         .unwrap()
         .is_empty());
+    {
+        let cam = PartitionMount::mount(
+            &harness.cam_disk(),
+            &harness.root.join("cam-rollover"),
+            "rw",
+        );
+        fs::remove_file(
+            cam.path()
+                .join("TeslaCam/RecentClips/2026-10-02_12-34-56-front.mp4"),
+        )
+        .unwrap();
+        write_file(
+            cam.path()
+                .join("TeslaCam/RecentClips/2026-10-02_12-35-56-front.mp4"),
+            "new-camera-recording",
+        );
+    }
+    let camera_before = run("sha256sum", [harness.cam_disk().as_os_str()]);
+    assert_success(&camera_before);
+    assert_ne!(stdout(&camera_original), stdout(&camera_before));
     let restarted = harness.run_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
     );
     assert_success(&restarted);
+    assert!(
+        archive_root
+            .join("fake:TeslaArchive/RecentClips/2026-10-02/2026-10-02_12-34-56-front.mp4")
+            .is_file(),
+        "restart discarded the only remaining copy of the rolled-off RecentClips video"
+    );
     assert_eq!(
         fs::read_to_string(
             archive_root
@@ -961,6 +1022,174 @@ fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gon
     let camera_after = run("sha256sum", [harness.cam_disk().as_os_str()]);
     assert_success(&camera_after);
     assert_eq!(stdout(&camera_before), stdout(&camera_after));
+}
+
+#[test]
+#[ignore = "requires root, Linux loop devices, XFS reflinks, ext4, and mount support"]
+fn linux_failed_and_interrupted_archives_preserve_rolled_off_clips_until_retry() {
+    for interruption in ["copy failure", "SIGTERM"] {
+        let harness = Harness::new("rclone");
+        let config = harness.config_arg();
+        let contents = fs::read_to_string(&harness.config).unwrap();
+        fs::write(
+            &harness.config,
+            format!("{contents}ARCHIVE_RECENTCLIPS=true\n"),
+        )
+        .unwrap();
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+        let old_clip = "TeslaCam/RecentClips/2026-10-02_12-34-56-front.mp4";
+        {
+            let cam =
+                PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-write"), "rw");
+            write_file(cam.path().join(old_clip), "only-snapshot-retains-this-clip");
+            write_file(
+                cam.path().join("TeslaCam/SavedClips/event/front.mp4"),
+                "saved-event-retained-on-resume",
+            );
+        }
+        let archive_root = harness.root.join("archive-retried");
+        let failed = if interruption == "SIGTERM" {
+            let marker = harness.root.join("copy-held");
+            let mut child = harness.spawn_with_env(
+                &["--config", &config, "archive"],
+                &[
+                    ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
+                    ("TESLAUSB_FAKE_RCLONE_HOLD", &marker),
+                ],
+            );
+            if !wait_until(
+                || marker.is_file() && fs::read_to_string(&marker).unwrap().lines().count() == 2,
+                Duration::from_secs(30),
+            ) {
+                terminate_child(&mut child);
+                panic!(
+                    "copy did not start: {}",
+                    describe(&child.wait_with_output().unwrap())
+                );
+            }
+            let copy_pid: i32 = fs::read_to_string(&marker)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            terminate_child(&mut child);
+            let stopped = wait_until(
+                || child.try_wait().unwrap().is_some(),
+                Duration::from_secs(5),
+            );
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            let copy_still_running = unsafe { kill(-copy_pid, 0) } == 0;
+            if copy_still_running {
+                assert_eq!(unsafe { kill(-copy_pid, 9) }, 0);
+            }
+            if !stopped {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                stopped,
+                "SIGTERM did not stop archive: {}",
+                describe(&output)
+            );
+            assert!(!copy_still_running, "copy process group survived SIGTERM");
+            output
+        } else {
+            harness.run_with_env(
+                &["--config", &config, "archive"],
+                &[
+                    ("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root),
+                    ("TESLAUSB_FAKE_RCLONE_FAIL_BEFORE_COPY", Path::new("true")),
+                ],
+            )
+        };
+        assert!(
+            !failed.status.success(),
+            "{interruption}: {}",
+            describe(&failed)
+        );
+        assert!(!archive_root.exists());
+        assert!(loops_backed_under(&harness.backingfiles)
+            .unwrap()
+            .is_empty());
+        let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+        assert!(
+            snapshot.join("snap.toc").is_file(),
+            "{interruption} discarded the pending snapshot"
+        );
+        let plan = fs::read(snapshot.join("archive-plan.json")).unwrap();
+        let snapshot_hash = run("sha256sum", [snapshot.join("snap.bin").as_os_str()]);
+        assert_success(&snapshot_hash);
+        for args in [
+            vec!["--config", &config, "clean", "--dry-run"],
+            vec!["--config", &config, "clean"],
+        ] {
+            assert_success(&harness.run(&args));
+            assert!(snapshot.join("snap.toc").is_file());
+            assert_eq!(fs::read(snapshot.join("archive-plan.json")).unwrap(), plan);
+            let retained = run("sha256sum", [snapshot.join("snap.bin").as_os_str()]);
+            assert_success(&retained);
+            assert_eq!(stdout(&snapshot_hash), stdout(&retained));
+        }
+        {
+            let cam = PartitionMount::mount(
+                &harness.cam_disk(),
+                &harness.root.join("cam-rollover"),
+                "rw",
+            );
+            fs::remove_file(cam.path().join(old_clip)).unwrap();
+            write_file(
+                cam.path()
+                    .join("TeslaCam/RecentClips/2026-10-02_12-35-56-front.mp4"),
+                "new-live-recording",
+            );
+        }
+        let live_before = run("sha256sum", [harness.cam_disk().as_os_str()]);
+        assert_success(&live_before);
+        let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
+        let retry = harness.run_with_env(
+            &["--config", &config, "archive"],
+            &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+        );
+        assert_success(&retry);
+        assert_eq!(
+            fs::read_to_string(
+                archive_root
+                    .join("fake:TeslaArchive/RecentClips/2026-10-02/2026-10-02_12-34-56-front.mp4")
+            )
+            .unwrap(),
+            "only-snapshot-retains-this-clip"
+        );
+        assert_eq!(
+            fs::read_to_string(archive_root.join("fake:TeslaArchive/SavedClips/event/front.mp4"))
+                .unwrap(),
+            "saved-event-retained-on-resume"
+        );
+        assert!(
+            !archive_root
+                .join("fake:TeslaArchive/RecentClips/2026-10-02/2026-10-02_12-35-56-front.mp4")
+                .exists(),
+            "retry must finish the pending snapshot before taking new footage"
+        );
+        assert!(!snapshot.exists());
+        assert_eq!(
+            fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+            next_id
+        );
+        let live_after = run("sha256sum", [harness.cam_disk().as_os_str()]);
+        assert_success(&live_after);
+        assert_eq!(
+            stdout(&live_before),
+            stdout(&live_after),
+            "resumed snapshot must not clean up the changed live camera"
+        );
+        assert!(loops_backed_under(&harness.backingfiles)
+            .unwrap()
+            .is_empty());
+    }
 }
 
 #[test]
@@ -1024,7 +1253,6 @@ fn linux_ext4_corruption_stops_archive_and_preserves_recovery_evidence() {
         stdout(&raw).split_whitespace().next(),
         stdout(&before).split_whitespace().next()
     );
-    assert_success(&harness.run(&["--config", &config, "clean"]));
     assert!(recovery[0].join("raw.bin").is_file());
     assert!(recovery[0].join("recovered.bin").is_file());
     let retained_before = run(
@@ -1035,6 +1263,9 @@ fn linux_ext4_corruption_stops_archive_and_preserves_recovery_evidence() {
         ],
     );
     assert_success(&retained_before);
+    let clean = harness.run(&["--config", &config, "clean"]);
+    assert!(!clean.status.success(), "{}", describe(&clean));
+    assert!(stderr(&clean).contains("recovery evidence already exists"));
     let retry = harness.run_with_env(
         &["--config", &config, "archive"],
         &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
@@ -1516,6 +1747,10 @@ case "${1:-}" in
         if [ -n "${TESLAUSB_FAKE_RCLONE_HOLD:-}" ]; then
             printf '%s\n%s\n' "$$" "$src" > "$TESLAUSB_FAKE_RCLONE_HOLD"
             while :; do sleep 1; done
+        fi
+        if [ "${TESLAUSB_FAKE_RCLONE_FAIL_BEFORE_COPY:-}" = "true" ]; then
+            printf '{"msg":"injected failure before transfer","level":"error"}\n' >&2
+            exit 9
         fi
         archive="${TESLAUSB_FAKE_RCLONE_ARCHIVE:?}"
         mkdir -p "$archive/$dst"

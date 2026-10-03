@@ -8,7 +8,7 @@ use crate::config::ArchiveConfig;
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 use crate::mount::mount_snapshot;
-use crate::snapshot::{SnapshotHandle, SnapshotManager};
+use crate::snapshot::{Snapshot, SnapshotHandle, SnapshotManager};
 
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -283,7 +283,7 @@ impl<F: FileSystem> RcloneBackend<F> {
     }
 
     fn copy_directory_inner(&self, src: &Path, dst_name: &str) -> Result<CopyResult> {
-        let files = self.scan_directory(src)?;
+        let files = scan_directory(&self.fs, src)?;
         if dst_name != "RecentClips" {
             return self.copy_batch(src, dst_name, &files, None);
         }
@@ -397,21 +397,21 @@ impl<F: FileSystem> RcloneBackend<F> {
             archived_files: select_archived_files(files, &confirmed),
         })
     }
+}
 
-    fn scan_directory(&self, src: &Path) -> Result<Vec<ArchivedFile>> {
-        let mut files = Vec::new();
-        for file in self.fs.walk_files(src)? {
-            let relative_path = file
-                .strip_prefix(src)
-                .map_err(|_| Error::new("failed to build relative archive path"))?
-                .to_path_buf();
-            files.push(ArchivedFile {
-                relative_path,
-                size: self.fs.file_size(&file)?,
-            });
-        }
-        Ok(files)
-    }
+fn scan_directory(fs: &impl FileSystem, src: &Path) -> Result<Vec<ArchivedFile>> {
+    fs.walk_files(src)?
+        .into_iter()
+        .map(|file| {
+            Ok(ArchivedFile {
+                relative_path: file
+                    .strip_prefix(src)
+                    .map_err(|_| Error::new("failed to build relative archive path"))?
+                    .to_path_buf(),
+                size: fs.file_size(&file)?,
+            })
+        })
+        .collect()
 }
 
 fn recent_archive_directory(path: &Path) -> Result<String> {
@@ -539,16 +539,61 @@ fn fully_confirmed(event: &[EventFile], confirmed: &[ArchivedFile]) -> bool {
 }
 
 #[derive(Debug, Clone)]
+struct ArchivePlan {
+    system: String,
+    drive: String,
+    path: String,
+    directories: Vec<&'static str>,
+}
+
+impl ArchivePlan {
+    fn new(config: &ArchiveConfig) -> Self {
+        Self {
+            system: config.system.clone(),
+            drive: config.rclone_drive.clone(),
+            path: config.rclone_path.clone(),
+            directories: [
+                (config.archive_saved, "SavedClips"),
+                (config.archive_sentry, "SentryClips"),
+                (config.archive_recent, "RecentClips"),
+                (config.archive_track, "TrackMode"),
+                (config.archive_photobooth, "Photobooth"),
+            ]
+            .into_iter()
+            .filter_map(|(enabled, name)| enabled.then_some(name))
+            .collect(),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "system": self.system,
+            "drive": self.drive,
+            "path": self.path,
+            "directories": self.directories,
+        })
+    }
+
+    fn validate(&self, contents: &str) -> Result<()> {
+        let stored: serde_json::Value = serde_json::from_str(contents)
+            .map_err(|error| Error::new(format!("invalid pending archive plan: {error}")))?;
+        if stored != self.json() {
+            return Err(Error::new(
+                "pending archive plan differs from current configuration; restore its backend, destination, and enabled directories before retrying",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ArchiveManager<F: FileSystem> {
     fs: F,
     snapshot_manager: SnapshotManager<F>,
     backend: ArchiveBackend<F>,
     cam_disk_path: PathBuf,
-    archive_recent: bool,
-    archive_saved: bool,
-    archive_sentry: bool,
-    archive_track: bool,
-    archive_photobooth: bool,
+    plan: ArchivePlan,
     event_stability: Duration,
     events: Arc<Mutex<HashMap<(String, PathBuf), EventObservation>>>,
 }
@@ -566,11 +611,7 @@ impl<F: FileSystem> ArchiveManager<F> {
             snapshot_manager,
             backend,
             cam_disk_path,
-            archive_recent: config.archive_recent,
-            archive_saved: config.archive_saved,
-            archive_sentry: config.archive_sentry,
-            archive_track: config.archive_track,
-            archive_photobooth: config.archive_photobooth,
+            plan: ArchivePlan::new(config),
             event_stability: config.event_stability,
             events: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -584,20 +625,58 @@ impl<F: FileSystem> ArchiveManager<F> {
         &self.cam_disk_path
     }
 
-    pub fn archive_new_snapshot(&self) -> Result<ArchiveResult> {
-        let snapshot = self.snapshot_manager.create_snapshot()?;
+    pub fn has_pending_snapshot(&self) -> Result<bool> {
+        Ok(!self.snapshot_manager.get_snapshots()?.is_empty())
+    }
+
+    fn pending_or_new_snapshot(&self) -> Result<(Snapshot, bool)> {
+        if let Some(snapshot) = self.snapshot_manager.get_snapshots()?.into_iter().next() {
+            let path = snapshot.archive_plan_path();
+            self.fs.require_regular_file(&path).map_err(|error| {
+                error.context(format!(
+                    "pending snapshot {} has no valid archive plan; preserved at {}",
+                    snapshot.id,
+                    snapshot.path.display()
+                ))
+            })?;
+            self.plan.validate(&self.fs.read_text(&path)?)?;
+            eprintln!("resuming pending archive snapshot {}", snapshot.id);
+            return Ok((snapshot, true));
+        }
+        Ok((
+            self.snapshot_manager
+                .create_snapshot(&self.plan.json().to_string())?,
+            false,
+        ))
+    }
+
+    pub fn archive_pending_or_new_snapshot(&self) -> Result<ArchiveResult> {
+        let (snapshot, resumed) = self.pending_or_new_snapshot()?;
         let handle = self.snapshot_manager.acquire(snapshot.id)?;
         let mounted = mount_snapshot(&snapshot.image_path())?;
-        let result = self.archive_snapshot(&handle, mounted.path())?;
+        let result = self.archive_snapshot(&handle, mounted.path(), resumed)?;
         mounted.unmount()?;
 
         Ok(result)
+    }
+
+    pub fn retire_snapshot(&self, result: &ArchiveResult) -> Result<()> {
+        if !result.success() {
+            return Err(Error::new("cannot retire an incomplete archive snapshot"));
+        }
+        if !self.snapshot_manager.retire_snapshot(result.snapshot_id)? {
+            return Err(Error::new(
+                "completed archive snapshot disappeared before retirement",
+            ));
+        }
+        Ok(())
     }
 
     pub fn archive_snapshot(
         &self,
         handle: &SnapshotHandle<F>,
         mount_path: &Path,
+        resumed: bool,
     ) -> Result<ArchiveResult> {
         let snapshot = handle.snapshot()?;
         let mut result = ArchiveResult::new(snapshot.id);
@@ -611,7 +690,7 @@ impl<F: FileSystem> ArchiveManager<F> {
         }
 
         result.state = ArchiveState::Archiving;
-        let dirs = self.dirs_to_archive(mount_path);
+        let dirs = self.dirs_to_archive(mount_path)?;
         if dirs.is_empty() {
             result.state = ArchiveState::Completed;
             result.completed_secs = Some(now_secs());
@@ -620,21 +699,34 @@ impl<F: FileSystem> ArchiveManager<F> {
 
         let mut errors = Vec::new();
         for (src, dst_name) in dirs {
+            let expected = scan_directory(&self.fs, &src)?;
             let copy = self.backend.copy_directory(&src, &dst_name);
             result.files_transferred += copy.files_transferred;
             result.bytes_transferred += copy.bytes_transferred;
-            if copy.success {
+            let missing: Vec<_> = expected
+                .iter()
+                .filter(|file| !copy.archived_files.contains(file))
+                .collect();
+            if copy.success && missing.is_empty() {
                 eprintln!(
                     "{dst_name}: transferred {} files ({})",
                     copy.files_transferred,
                     format_size(copy.bytes_transferred)
                 );
             } else {
-                let error = copy.error.ok_or_else(|| {
-                    Error::new(format!(
-                        "{dst_name}: archive backend failed without error details"
-                    ))
-                })?;
+                let error = if copy.success {
+                    format!(
+                        "{} files lack positive archive confirmation (first: {}); snapshot retained",
+                        missing.len(),
+                        missing[0].relative_path.display()
+                    )
+                } else {
+                    copy.error.ok_or_else(|| {
+                        Error::new(format!(
+                            "{dst_name}: archive backend failed without error details"
+                        ))
+                    })?
+                };
                 eprintln!(
                     "warning: {dst_name}: failed after transferring {} files ({}): {error}",
                     copy.files_transferred,
@@ -642,9 +734,12 @@ impl<F: FileSystem> ArchiveManager<F> {
                 );
                 errors.push(format!("{dst_name}: {error}"));
             }
-            let cleanup_files = self.cleanup_candidates(&src, &dst_name, copy.archived_files)?;
-            if !cleanup_files.is_empty() {
-                result.archived_files.push((dst_name, cleanup_files));
+            if !resumed {
+                let cleanup_files =
+                    self.cleanup_candidates(&src, &dst_name, copy.archived_files)?;
+                if !cleanup_files.is_empty() {
+                    result.archived_files.push((dst_name, cleanup_files));
+                }
             }
         }
 
@@ -713,6 +808,9 @@ impl<F: FileSystem> ArchiveManager<F> {
 
     fn event_files(&self, source: &Path) -> Result<HashMap<PathBuf, Vec<EventFile>>> {
         let mut events = HashMap::<PathBuf, Vec<EventFile>>::new();
+        if !self.fs.directory_exists(source)? {
+            return Ok(events);
+        }
         for path in self.fs.walk_files(source)? {
             let relative = path
                 .strip_prefix(source)
@@ -734,58 +832,17 @@ impl<F: FileSystem> ArchiveManager<F> {
         Ok(events)
     }
 
-    fn dirs_to_archive(&self, mount_path: &Path) -> Vec<(PathBuf, String)> {
-        let mut dirs = Vec::new();
-        self.push_dir(
-            &mut dirs,
-            self.archive_saved,
-            mount_path,
-            "TeslaCam/SavedClips",
-            "SavedClips",
-        );
-        self.push_dir(
-            &mut dirs,
-            self.archive_sentry,
-            mount_path,
-            "TeslaCam/SentryClips",
-            "SentryClips",
-        );
-        self.push_dir(
-            &mut dirs,
-            self.archive_recent,
-            mount_path,
-            "TeslaCam/RecentClips",
-            "RecentClips",
-        );
-        self.push_dir(
-            &mut dirs,
-            self.archive_track,
-            mount_path,
-            "TeslaTrackMode",
-            "TrackMode",
-        );
-        self.push_dir(
-            &mut dirs,
-            self.archive_photobooth,
-            mount_path,
-            "TeslaCam/Photobooth",
-            "Photobooth",
-        );
-        dirs
-    }
-
-    fn push_dir(
-        &self,
-        dirs: &mut Vec<(PathBuf, String)>,
-        enabled: bool,
-        mount_path: &Path,
-        relative: &str,
-        name: &str,
-    ) {
-        let path = mount_path.join(relative);
-        if enabled && self.fs.exists(&path) {
-            dirs.push((path, name.to_string()));
+    fn dirs_to_archive(&self, mount_path: &Path) -> Result<Vec<(PathBuf, String)>> {
+        let mut directories = Vec::new();
+        for name in &self.plan.directories {
+            let relative = cam_dir_for_archive_name(name)
+                .ok_or_else(|| Error::new(format!("unknown archive directory: {name}")))?;
+            let path = mount_path.join(relative);
+            if self.fs.directory_exists(&path)? {
+                directories.push((path, (*name).to_string()));
+            }
         }
+        Ok(directories)
     }
 
     pub fn delete_archived_files(
@@ -1022,6 +1079,7 @@ mod tests {
         );
         for directory in ["SavedClips", "SentryClips"] {
             let source = PathBuf::from("/cam/TeslaCam").join(directory);
+            manager.fs.create_dir_all(&source).unwrap();
             manager
                 .cleanup_candidates(&source, directory, Vec::new())
                 .unwrap();
@@ -1072,6 +1130,163 @@ mod tests {
     }
 
     #[test]
+    fn pending_snapshot_reuses_original_image_before_capturing_new_camera_data() {
+        let fs = MockFileSystem::new();
+        let manager = manager(fs.clone());
+        let (first, resumed) = manager.pending_or_new_snapshot().unwrap();
+        assert!(!resumed);
+        fs.write_bytes("/backingfiles/cam_disk.bin", b"new camera recordings");
+
+        for _ in 0..3 {
+            let (pending, resumed) = manager.pending_or_new_snapshot().unwrap();
+            assert!(resumed);
+            assert_eq!(pending.id, first.id);
+            assert_eq!(fs.read_bytes(pending.image_path()).unwrap(), b"cam");
+            assert_eq!(manager.snapshot_manager.get_snapshots().unwrap().len(), 1);
+        }
+        assert_eq!(
+            fs.read_bytes("/backingfiles/cam_disk.bin").unwrap(),
+            b"new camera recordings"
+        );
+    }
+
+    #[test]
+    fn pending_archive_plan_rejects_missing_malformed_and_changed_policy() {
+        let fs = MockFileSystem::new();
+        let manager = manager(fs.clone());
+        let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+        let path = snapshot.archive_plan_path();
+        fs.remove_file(&path).unwrap();
+        assert!(manager.pending_or_new_snapshot().is_err());
+        for content in ["{", "null", "{}"] {
+            fs.write_text_atomic(&path, content).unwrap();
+            assert!(manager.pending_or_new_snapshot().is_err());
+        }
+        for (key, value) in [
+            ("version", serde_json::json!(2)),
+            ("system", serde_json::json!("rclone")),
+            ("drive", serde_json::json!("other-drive")),
+            ("path", serde_json::json!("other-folder")),
+            ("directories", serde_json::json!([])),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut changed = manager.plan.json();
+            changed[key] = value;
+            fs.write_text_atomic(&path, &changed.to_string()).unwrap();
+            assert!(manager.pending_or_new_snapshot().is_err(), "{key}");
+            assert_eq!(fs.read_bytes(snapshot.image_path()).unwrap(), b"cam");
+            assert_eq!(manager.snapshot_manager.get_snapshots().unwrap().len(), 1);
+        }
+        fs.write_text_atomic(&path, &manager.plan.json().to_string())
+            .unwrap();
+        assert!(manager.pending_or_new_snapshot().unwrap().1);
+    }
+
+    #[test]
+    fn archive_plan_allows_transfer_flag_changes_without_changing_required_scope() {
+        let config = ArchiveConfig::default();
+        let original = ArchivePlan::new(&config).json().to_string();
+        let changed = ArchiveConfig {
+            rclone_flags: vec!["--exclude".into(), "*.json".into()],
+            ..config
+        };
+        ArchivePlan::new(&changed).validate(&original).unwrap();
+    }
+
+    #[test]
+    fn zero_exit_without_every_path_and_size_confirmation_retains_snapshot() {
+        for (name, size) in [("back.mp4", 1000), ("front.mp4", 999)] {
+            let fs = MockFileSystem::new();
+            fs.create_dir_all(Path::new("/mnt/TeslaCam/RecentClips/event"))
+                .unwrap();
+            fs.write_bytes(
+                format!("/mnt/TeslaCam/RecentClips/event/{name}"),
+                &vec![0; size],
+            );
+            if name == "back.mp4" {
+                fs.write_bytes("/mnt/TeslaCam/RecentClips/event/front.mp4", &[0; 1000]);
+            }
+            let manager = manager_with(
+                fs.clone(),
+                ArchiveConfig {
+                    archive_recent: true,
+                    ..ArchiveConfig::default()
+                },
+                ArchiveBackend::Mock(MockArchiveBackend::reachable(true)),
+            );
+            let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+            let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
+            let result = manager
+                .archive_snapshot(&handle, Path::new("/mnt"), false)
+                .unwrap();
+            assert!(!result.success());
+            assert!(result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("lack positive archive confirmation"));
+            drop(handle);
+            assert!(manager.retire_snapshot(&result).is_err());
+            assert!(fs.exists(&snapshot.toc_path()));
+            assert_eq!(manager.pending_or_new_snapshot().unwrap().0.id, snapshot.id);
+        }
+    }
+
+    #[test]
+    fn resumed_archive_confirms_files_without_observing_or_cleaning_live_events() {
+        let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips/event"))
+            .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", &[0; 1000]);
+        let manager = manager_with(
+            fs.clone(),
+            ArchiveConfig::default(),
+            ArchiveBackend::Mock(MockArchiveBackend::reachable(true)),
+        );
+        let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+        let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
+        for _ in 0..2 {
+            let result = manager
+                .archive_snapshot(&handle, Path::new("/mnt"), true)
+                .unwrap();
+            assert!(result.success());
+            assert!(result.archived_files.is_empty());
+            assert!(manager.events.lock().unwrap().is_empty());
+        }
+        let result = manager
+            .archive_snapshot(&handle, Path::new("/mnt"), true)
+            .unwrap();
+        drop(handle);
+        manager.retire_snapshot(&result).unwrap();
+        assert!(!manager.has_pending_snapshot().unwrap());
+        assert!(fs.exists(Path::new("/mnt/TeslaCam/SavedClips/event/front.mp4")));
+    }
+
+    #[test]
+    fn confirmed_snapshot_can_retire_before_event_cleanup_grace() {
+        let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips/event"))
+            .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", &[0; 1000]);
+        let mut manager = manager_with(
+            fs,
+            ArchiveConfig::default(),
+            ArchiveBackend::Mock(MockArchiveBackend::reachable(true)),
+        );
+        manager.event_stability = Duration::from_secs(600);
+        let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+        let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
+        let result = manager
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
+            .unwrap();
+        assert!(result.success());
+        assert!(result.archived_files.is_empty());
+        drop(handle);
+        manager.retire_snapshot(&result).unwrap();
+        assert!(!manager.has_pending_snapshot().unwrap());
+    }
+
+    #[test]
     fn copy_result_carries_success_and_error_details() {
         let ok = CopyResult {
             success: true,
@@ -1117,6 +1332,7 @@ mod tests {
     #[test]
     fn recent_and_marker_only_events_are_never_cleanup_candidates() {
         let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/clips/event")).unwrap();
         fs.write_bytes("/clips/event/event.json", b"{}");
         fs.write_bytes("/clips/event/thumb.png", b"png");
         let manager = manager(fs.clone());
@@ -1163,6 +1379,7 @@ mod tests {
     #[test]
     fn events_must_remain_unchanged_for_the_observed_grace_period() {
         let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/clips/event")).unwrap();
         fs.write_bytes("/clips/event/front.mp4", b"video");
         let mut manager = manager(fs.clone());
         manager.event_stability = Duration::from_secs(600);
@@ -1281,7 +1498,7 @@ mod tests {
             ArchiveConfig::default().copy_timeout,
             fs,
         );
-        let files = backend.scan_directory(Path::new("/clips")).unwrap();
+        let files = scan_directory(&backend.fs, Path::new("/clips")).unwrap();
         let by_path = files
             .iter()
             .map(|file| (file.relative_path.clone(), file.size))
@@ -1367,7 +1584,7 @@ mod tests {
             .unwrap();
 
         let manager = manager(fs);
-        let dirs = manager.dirs_to_archive(Path::new("/mnt"));
+        let dirs = manager.dirs_to_archive(Path::new("/mnt")).unwrap();
         let names = dirs.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
 
         assert_eq!(names, vec!["SavedClips", "SentryClips", "Photobooth"]);
@@ -1395,11 +1612,53 @@ mod tests {
         let manager = manager_with(fs, config, ArchiveBackend::None);
         let names = manager
             .dirs_to_archive(Path::new("/mnt"))
+            .unwrap()
             .into_iter()
             .map(|(_, name)| name)
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["RecentClips", "TrackMode"]);
+    }
+
+    #[test]
+    fn archive_directory_read_errors_preserve_pending_snapshot() {
+        for unreadable in [
+            "/mnt/TeslaCam/SavedClips",
+            "/mnt/TeslaCam/SavedClips/event/front.mp4",
+        ] {
+            let fs = MockFileSystem::new();
+            fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips/event"))
+                .unwrap();
+            fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", b"recording");
+            fs.fail_read(Path::new(unreadable));
+            let backend = MockArchiveBackend::reachable(true);
+            let manager = manager_with(
+                fs.clone(),
+                ArchiveConfig::default(),
+                ArchiveBackend::Mock(backend.clone()),
+            );
+            let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+            let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
+
+            let error = manager
+                .archive_snapshot(&handle, Path::new("/mnt"), false)
+                .unwrap_err();
+            assert!(error.to_string().contains(unreadable));
+            assert!(backend.copied_dirs().is_empty());
+            drop(handle);
+            manager.snapshot_manager.recover().unwrap();
+            manager.snapshot_manager.clean_incomplete(false).unwrap();
+            assert!(fs.exists(&snapshot.toc_path()));
+            assert_eq!(fs.read_bytes(snapshot.image_path()).unwrap(), b"cam");
+        }
+    }
+
+    #[test]
+    fn archive_directory_discovery_rejects_files_instead_of_directories() {
+        let fs = MockFileSystem::new();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips", b"not a directory");
+        let error = manager(fs).dirs_to_archive(Path::new("/mnt")).unwrap_err();
+        assert!(error.to_string().contains("expected a directory"));
     }
 
     #[test]
@@ -1420,11 +1679,14 @@ mod tests {
             ArchiveConfig::default(),
             ArchiveBackend::Mock(backend),
         );
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Completed);
@@ -1451,11 +1713,14 @@ mod tests {
             ArchiveConfig::default(),
             ArchiveBackend::Mock(MockArchiveBackend::reachable(false)),
         );
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Failed);
@@ -1475,11 +1740,14 @@ mod tests {
             ArchiveConfig::default(),
             ArchiveBackend::Mock(MockArchiveBackend::failing(&["SavedClips"])),
         );
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Failed);
@@ -1500,11 +1768,14 @@ mod tests {
             ArchiveConfig::default(),
             ArchiveBackend::Mock(MockArchiveBackend::partial_failing(&["SavedClips"])),
         );
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Failed);
@@ -1526,11 +1797,14 @@ mod tests {
             ArchiveConfig::default(),
             ArchiveBackend::Mock(MockArchiveBackend::reachable(true)),
         );
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Completed);
@@ -1544,16 +1818,38 @@ mod tests {
         fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips"))
             .unwrap();
         let manager = manager(fs);
-        let snapshot = manager.snapshot_manager.create_snapshot().unwrap();
+        let snapshot = manager
+            .snapshot_manager
+            .create_snapshot(&manager.plan.json().to_string())
+            .unwrap();
         let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
 
         let result = manager
-            .archive_snapshot(&handle, Path::new("/mnt"))
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
             .unwrap();
 
         assert_eq!(result.state, ArchiveState::Completed);
         assert_eq!(result.files_transferred, 0);
         assert!(result.archived_files.is_empty());
+    }
+
+    #[test]
+    fn none_backend_cannot_retire_nonempty_intended_files() {
+        let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/mnt/TeslaCam/SavedClips/event"))
+            .unwrap();
+        fs.write_bytes("/mnt/TeslaCam/SavedClips/event/front.mp4", b"recording");
+        let manager = manager(fs.clone());
+        let (snapshot, _) = manager.pending_or_new_snapshot().unwrap();
+        let handle = manager.snapshot_manager.acquire(snapshot.id).unwrap();
+        let result = manager
+            .archive_snapshot(&handle, Path::new("/mnt"), false)
+            .unwrap();
+        assert!(!result.success());
+        assert!(result.archived_files.is_empty());
+        drop(handle);
+        assert!(manager.retire_snapshot(&result).is_err());
+        assert!(fs.exists(&snapshot.toc_path()));
     }
 
     #[test]

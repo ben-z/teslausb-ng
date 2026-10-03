@@ -3,15 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::archive::{format_size, ArchiveManager};
+use crate::archive::{format_size, ArchiveBackend, ArchiveManager};
 use crate::config::RuntimeConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 use crate::gadget::{GadgetDisableGuard, UsbGadget};
 use crate::idle::ProcIdleDetector;
 use crate::led::{LedPattern, SysfsLedController};
 use crate::mount::{fsck_image, mount_image};
-use crate::snapshot::SnapshotManager;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -25,7 +24,6 @@ pub fn request_stop() {
 
 #[derive(Debug, Clone)]
 pub struct Coordinator<F: FileSystem> {
-    snapshot_manager: SnapshotManager<F>,
     archive_manager: ArchiveManager<F>,
     gadget: Option<UsbGadget>,
     led: Option<SysfsLedController>,
@@ -38,13 +36,11 @@ pub struct Coordinator<F: FileSystem> {
 
 impl<F: FileSystem> Coordinator<F> {
     pub fn new(
-        snapshot_manager: SnapshotManager<F>,
         archive_manager: ArchiveManager<F>,
         gadget: Option<UsbGadget>,
         config: &RuntimeConfig,
     ) -> Self {
         Self {
-            snapshot_manager,
             archive_manager,
             gadget,
             led: None,
@@ -132,28 +128,27 @@ impl<F: FileSystem> Coordinator<F> {
     }
 
     fn do_archive_cycle(&mut self) -> Result<ArchiveCycle> {
+        let has_pending = self.archive_manager.has_pending_snapshot()?;
+        if matches!(self.archive_manager.backend(), ArchiveBackend::None) {
+            if has_pending {
+                return Err(Error::new(
+                    "archiving is disabled while snapshots await upload; restore their archive configuration before retrying",
+                ));
+            }
+            return Ok(ArchiveCycle {
+                success: true,
+                files_transferred: 0,
+            });
+        }
         self.set_led(LedPattern::FastBlink)?;
-        let mut stale = 0;
-        while self.snapshot_manager.delete_oldest_if_deletable()? {
-            stale += 1;
-        }
-        if stale == 1 {
-            eprintln!("warning: deleted 1 stale snapshot, likely from an unclean stop");
-        } else if stale > 1 {
-            eprintln!(
-                "error: deleted {} stale snapshots; expected at most 1 under eager clean up",
-                stale
-            );
-        }
-
-        if !self.wait_for_usb_idle() {
+        if !has_pending && !self.wait_for_usb_idle() {
             return Ok(ArchiveCycle {
                 success: false,
                 files_transferred: 0,
             });
         }
 
-        let result = self.archive_manager.archive_new_snapshot()?;
+        let result = self.archive_manager.archive_pending_or_new_snapshot()?;
         if result.success() {
             eprintln!(
                 "archive complete: {} files transferred, {}",
@@ -180,10 +175,12 @@ impl<F: FileSystem> Coordinator<F> {
             self.delete_archived_files(&result)?;
         }
 
-        if let Err(err) = self.snapshot_manager.delete_snapshot(result.snapshot_id) {
+        if result.success() {
+            self.archive_manager.retire_snapshot(&result)?;
+        } else {
             eprintln!(
-                "warning: failed to delete snapshot {}: {}",
-                result.snapshot_id, err
+                "retained pending archive snapshot {} for retry",
+                result.snapshot_id
             );
         }
 
@@ -209,7 +206,7 @@ impl<F: FileSystem> Coordinator<F> {
 
         let cam_disk: PathBuf = self.archive_manager.cam_disk_path().to_path_buf();
         fsck_image(&cam_disk)?;
-        let mounted = mount_image(&cam_disk, false)?;
+        let mounted = mount_image(&cam_disk)?;
         let (deleted, skipped) = self
             .archive_manager
             .delete_archived_files(result, mounted.path())?;
@@ -312,6 +309,69 @@ fn install_signal_handlers() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ArchiveConfig;
+    use crate::filesystem::MockFileSystem;
+    use crate::snapshot::SnapshotManager;
+    use std::path::Path;
+
+    fn disabled_coordinator(
+        fs: MockFileSystem,
+    ) -> (Coordinator<MockFileSystem>, SnapshotManager<MockFileSystem>) {
+        let camera = PathBuf::from("/backingfiles/cam_disk.bin");
+        fs.write_bytes(&camera, b"recording");
+        let snapshots = SnapshotManager::new(
+            fs.clone(),
+            camera.clone(),
+            PathBuf::from("/backingfiles/snapshots"),
+        )
+        .unwrap();
+        let manager = ArchiveManager::new(
+            fs,
+            snapshots.clone(),
+            ArchiveBackend::None,
+            camera,
+            &ArchiveConfig::default(),
+        );
+        (
+            Coordinator::new(manager, None, &RuntimeConfig::default()),
+            snapshots,
+        )
+    }
+
+    #[test]
+    fn disabled_archiving_succeeds_without_creating_snapshots() {
+        let fs = MockFileSystem::new();
+        let (mut coordinator, snapshots) = disabled_coordinator(fs.clone());
+
+        let result = coordinator.do_archive_cycle().unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.files_transferred, 0);
+        assert!(snapshots.get_snapshots().unwrap().is_empty());
+        assert!(!fs.exists(Path::new("/backingfiles/snapshots/.next-id")));
+        assert_eq!(
+            fs.read_bytes("/backingfiles/cam_disk.bin").unwrap(),
+            b"recording"
+        );
+    }
+
+    #[test]
+    fn disabled_archiving_rejects_and_preserves_pending_snapshots() {
+        let fs = MockFileSystem::new();
+        let (mut coordinator, snapshots) = disabled_coordinator(fs.clone());
+        let snapshot = snapshots.create_snapshot("pending archive plan").unwrap();
+
+        let error = coordinator.do_archive_cycle().unwrap_err();
+
+        assert!(error.to_string().contains("archiving is disabled"));
+        assert_eq!(snapshots.get_snapshots().unwrap().len(), 1);
+        assert!(fs.exists(&snapshot.toc_path()));
+        assert_eq!(fs.read_bytes(snapshot.image_path()).unwrap(), b"recording");
+        assert_eq!(
+            fs.read_text(snapshot.archive_plan_path()).unwrap(),
+            "pending archive plan"
+        );
+    }
 
     #[test]
     fn backoff_yields_exponential_sequence_capped_at_max() {

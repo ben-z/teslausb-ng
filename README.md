@@ -308,7 +308,7 @@ Run device commands as root.
 | `teslausb archive` | Run one archive cycle |
 | `teslausb status [--json]` | Show space, snapshots, and archive reachability |
 | `teslausb snapshots [--json]` | List complete snapshots |
-| `teslausb clean [--dry-run]` | Delete snapshots that are not in use |
+| `teslausb clean [--dry-run]` | Remove incomplete snapshots; preserve pending uploads |
 | `teslausb gadget on/off/status` | Manage USB gadget mode |
 | `teslausb service install/uninstall/status` | Manage the systemd service |
 | `teslausb doctor [--startup]` | Check external dependencies |
@@ -391,10 +391,13 @@ the car's firmware, USB cache behavior, or every possible storage failure.
 
 ## Safety Model
 
-- A snapshot becomes complete when `snap.toc` is written after its data.
+- A snapshot becomes complete when `snap.toc` is written after its data and
+  archive plan. It remains pending until all intended files have positive
+  archive confirmations. Interrupted uploads retry the same snapshot.
 - Snapshot creation, recovery, acquisition, and deletion share a catalog lock.
 - Snapshot handles keep an exclusive lock until their final release.
-- Deletion keeps both locks, removes `snap.toc` first, then removes the data.
+- Retirement after confirmed upload keeps both locks, removes `snap.toc` first,
+  then removes the data. Ordinary cleanup preserves complete pending snapshots.
 - Runtime recovery removes incomplete snapshots; status and dry-run inspection
   preserve them.
 - Snapshot loops are read-only. Ext4 journals are replayed and independently
