@@ -1649,7 +1649,7 @@ mod tests {
             manager.snapshot_manager.recover().unwrap();
             manager.snapshot_manager.clean_incomplete(false).unwrap();
             assert!(fs.exists(&snapshot.toc_path()));
-            assert_eq!(fs.read_bytes(&snapshot.image_path()).unwrap(), b"cam");
+            assert_eq!(fs.read_bytes(snapshot.image_path()).unwrap(), b"cam");
         }
     }
 
