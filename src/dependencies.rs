@@ -137,7 +137,6 @@ fn add_init_specs(specs: &mut Vec<DependencySpec>) {
     add(specs, spec("parted", "parted", &["--version"], None));
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
-    add(specs, spec("kpartx", "kpartx", &["-V"], None));
     add(specs, spec("mkfs.ext4", "mkfs.ext4", &["-V"], None));
     add_mount_specs(specs);
     add_reflink_cp(specs);
@@ -162,7 +161,7 @@ fn add_runtime_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
     add(specs, spec("e2fsck", "e2fsck", &["-V"], None));
     add(specs, spec("losetup", "losetup", &["--version"], None));
     add(specs, spec("blockdev", "blockdev", &["--version"], None));
-    add(specs, spec("kpartx", "kpartx", &["-V"], None));
+    add(specs, spec("parted", "parted", &["--version"], None));
     add_reflink_cp(specs);
     if config.archive.system == "rclone" {
         add(
@@ -435,14 +434,17 @@ mod tests {
         let init = specs_for(&config, DependencySet::Init);
         assert!(init.iter().any(|item| item.command == "mkfs.ext4"));
         let runtime = specs_for(&config, DependencySet::Runtime);
-        for command in ["blkid", "e2fsck"] {
+        for command in ["blkid", "e2fsck", "parted"] {
             assert!(
                 runtime.iter().any(|item| item.command == command),
                 "missing {command}"
             );
         }
         for item in specs_for(&config, DependencySet::Full) {
-            assert!(!matches!(item.command, "mkfs.vfat" | "fsck.fat" | "fsck"));
+            assert!(!matches!(
+                item.command,
+                "mkfs.vfat" | "fsck.fat" | "fsck" | "kpartx"
+            ));
         }
     }
 }

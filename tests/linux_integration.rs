@@ -345,6 +345,58 @@ fn linux_archive_cycle_uses_real_loop_mounts_and_cleans_cam_disk() {
 }
 
 #[test]
+#[ignore = "requires root, Linux loop devices, GPT, XFS reflinks, ext4, and mount support"]
+fn linux_gpt_camera_image_archives_and_cleans_up_using_partition_ranges() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-write"), "rw");
+        write_cam_fixture(cam.path());
+    }
+    let image = harness.cam_disk();
+    let table = run(
+        "parted",
+        ["-sm", image.to_str().unwrap(), "unit", "B", "print"],
+    );
+    assert_success(&table);
+    let table = stdout(&table);
+    let partition = table.lines().find(|line| line.starts_with("1:")).unwrap();
+    let fields: Vec<_> = partition.split(':').collect();
+    // Leave the filesystem at its original byte range while providing room
+    // beyond it for GPT's backup partition table.
+    let file = fs::OpenOptions::new().write(true).open(&image).unwrap();
+    file.set_len(file.metadata().unwrap().len() + 1024 * 1024)
+        .unwrap();
+    assert_success(&run(
+        "parted",
+        ["-s", image.to_str().unwrap(), "mklabel", "gpt"],
+    ));
+    assert_success(&run(
+        "parted",
+        [
+            "-s",
+            image.to_str().unwrap(),
+            "mkpart",
+            "primary",
+            "ext4",
+            fields[1],
+            fields[2],
+        ],
+    ));
+
+    let archive_root = harness.root.join("archive-gpt");
+    let archive = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_ARCHIVE", &archive_root)],
+    );
+    assert_success(&archive);
+    assert_archive_contains_fixture(&archive_root.join("fake:TeslaArchive"));
+    let cam = PartitionMount::mount(&image, &harness.root.join("cam-verify"), "ro");
+    assert_archived_files_removed_from_cam(cam.path());
+}
+
+#[test]
 #[ignore = "requires root, real rclone, Linux loop devices, XFS reflinks, and ext4 mounts"]
 fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
     let harness = Harness::new("rclone");
@@ -819,6 +871,28 @@ fn linux_dirty_ext4_snapshot_replays_privately_and_preserves_camera_bytes() {
     ));
     let before = run("sha256sum", [harness.cam_disk().as_os_str()]);
     assert_success(&before);
+    let fsck = harness.fake_bin.join("e2fsck");
+    fs::write(
+        &fsck,
+        r#"#!/bin/sh
+set -eu
+for device do :; done
+case "$device" in
+    /dev/loop*)
+        name=${device##*/}
+        [ "$(cat "/sys/class/block/$name/loop/partscan")" = 0 ]
+        [ "$(cat "/sys/class/block/$name/loop/offset")" -gt 0 ]
+        [ "$(cat "/sys/class/block/$name/loop/sizelimit")" -gt 0 ]
+        [ ! -e "/sys/class/block/$name/${name}p1" ]
+        printf '%s\n' "$device" >> "${TESLAUSB_RANGE_CHECK_LOG:?}"
+        ;;
+esac
+exec /usr/sbin/e2fsck "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fsck, fs::Permissions::from_mode(0o755)).unwrap();
+    let range_log = harness.root.join("partition-ranges.log");
     let archive_root = harness.root.join("archive-dirty");
     let archive = harness
         .command(&["--config", &config, "archive"])
@@ -831,9 +905,14 @@ fn linux_dirty_ext4_snapshot_replays_privately_and_preserves_camera_bytes() {
             "TESLAUSB_SNAPSHOT_CATALOG",
             harness.backingfiles.join("snapshots"),
         )
+        .env("TESLAUSB_RANGE_CHECK_LOG", &range_log)
         .output()
         .unwrap();
     assert_success(&archive);
+    assert!(
+        fs::read_to_string(range_log).unwrap().lines().count() >= 2,
+        "journal recovery and verification must use partition byte ranges"
+    );
     assert!(
         stderr(&archive).contains("recovering journal"),
         "{}",
@@ -926,8 +1005,7 @@ fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gon
     );
     assert_success(&partition);
     let partition = stdout(&partition).trim().to_string();
-    let loop_name = Path::new(&partition).file_name().unwrap().to_str().unwrap();
-    let loop_dev = format!("/dev/{}", loop_name.strip_suffix("p1").unwrap());
+    let loop_dev = partition;
     let backing = run("losetup", ["-n", "-O", "BACK-FILE", &loop_dev]);
     assert_success(&backing);
     let recovered = PathBuf::from(stdout(&backing).trim());
@@ -938,7 +1016,6 @@ fn linux_abrupt_archive_death_recovers_only_after_owned_kernel_resources_are_gon
         image: recovered.clone(),
         loop_dev,
         mount_point,
-        kpartx_used: partition.starts_with("/dev/mapper/"),
     };
     let raw = recovery.join("raw.bin");
     let state_path = harness.backingfiles.join("snapshots/recovery.state");
@@ -1351,48 +1428,49 @@ struct PartitionMount {
     image: PathBuf,
     loop_dev: String,
     mount_point: PathBuf,
-    kpartx_used: bool,
 }
 
 impl PartitionMount {
     fn mount(image: &Path, mount_point: &Path, mode: &str) -> Self {
         fs::create_dir_all(mount_point).unwrap();
+        let table = run(
+            "parted",
+            [
+                OsStr::new("-sm"),
+                image.as_os_str(),
+                OsStr::new("unit"),
+                OsStr::new("B"),
+                OsStr::new("print"),
+            ],
+        );
+        assert_success(&table);
+        let table = stdout(&table);
+        let partition = table.lines().find(|line| line.starts_with("1:")).unwrap();
+        let fields: Vec<_> = partition.split(':').collect();
+        let offset = fields[1].strip_suffix('B').unwrap();
+        let size = fields[3].strip_suffix('B').unwrap();
         let output = run(
             "losetup",
-            [OsStr::new("-Pf"), OsStr::new("--show"), image.as_os_str()],
+            [
+                OsStr::new("--find"),
+                OsStr::new("--show"),
+                OsStr::new("--offset"),
+                OsStr::new(offset),
+                OsStr::new("--sizelimit"),
+                OsStr::new(size),
+                image.as_os_str(),
+            ],
         );
         assert_success(&output);
         let loop_dev = stdout(&output).trim().to_string();
         assert!(!loop_dev.is_empty(), "losetup produced no loop device");
-
-        let _ = run_status(
-            "blockdev",
-            [OsStr::new("--rereadpt"), OsStr::new(&loop_dev)],
-        );
-        let direct_partition = format!("{loop_dev}p1");
-        let (partition, kpartx_used) = if wait_for_path(Path::new(&direct_partition)) {
-            (direct_partition, false)
-        } else {
-            assert_success(&run("kpartx", [OsStr::new("-av"), OsStr::new(&loop_dev)]));
-            let loop_name = Path::new(&loop_dev)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            let mapper = format!("/dev/mapper/{loop_name}p1");
-            assert!(
-                wait_for_path(Path::new(&mapper)),
-                "partition device did not appear for {image:?}"
-            );
-            (mapper, true)
-        };
 
         assert_success(&run(
             "mount",
             [
                 OsStr::new("-o"),
                 OsStr::new(mode),
-                OsStr::new(&partition),
+                OsStr::new(&loop_dev),
                 mount_point.as_os_str(),
             ],
         ));
@@ -1401,7 +1479,6 @@ impl PartitionMount {
             image: image.to_path_buf(),
             loop_dev,
             mount_point: mount_point.to_path_buf(),
-            kpartx_used,
         }
     }
 
@@ -1411,9 +1488,6 @@ impl PartitionMount {
 
     fn clean_up(&self) -> Result<(), String> {
         unmount_fixture(&self.mount_point)?;
-        if self.kpartx_used {
-            checked_run("kpartx", ["-d", &self.loop_dev])?;
-        }
         checked_run("losetup", ["-d", &self.loop_dev])?;
         wait_for_detached_loops(&self.image)
     }
@@ -1569,7 +1643,6 @@ fn require_linux_integration() {
         "dumpe2fs",
         "findmnt",
         "e2fsck",
-        "kpartx",
         "losetup",
         "mkfs.ext4",
         "mkfs.xfs",
@@ -1607,16 +1680,6 @@ fn temp_path(prefix: &str) -> PathBuf {
         "{prefix}-{}-{counter}-{suffix}",
         std::process::id()
     ))
-}
-
-fn wait_for_path(path: &Path) -> bool {
-    for _ in 0..50 {
-        if path.exists() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    path.exists()
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -1792,17 +1855,6 @@ where
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
-}
-
-fn run_status<I, S>(program: &str, args: I) -> std::io::Result<std::process::ExitStatus>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .status()
 }
 
 fn assert_success(output: &Output) {
