@@ -214,6 +214,13 @@ Boolean values must be `true` or `false`. File settings take precedence over
 environment variables. To install a service using another configuration file,
 use `sudo teslausb --config /absolute/path/teslausb.conf service install --force`.
 
+teslausb owns rclone's comparison and batch retry policy because confirmed files
+can be removed from the camera disk. `RCLONE_FLAGS` must not contain `--checksum`
+(`-c`), `--ignore-size`, `--size-only`, `--ignore-checksum`, `--modify-window`, or
+`--retries`. Their native `RCLONE_*` environment variables must also be unset.
+Each copy batch has one high-level attempt; rclone retains its low-level request
+retries, and teslausb retries the pending snapshot after a failed archive.
+
 ## Initialize
 
 For a new installation, create the XFS backing image and camera disk:

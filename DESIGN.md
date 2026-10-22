@@ -138,6 +138,14 @@ snapshot never advances event stability or deletes live camera files; only fresh
 snapshots can establish that the car has stopped changing an event. Transfer
 filters and dry runs cannot acknowledge omitted files as archived.
 
+Each rclone copy batch has one high-level attempt. The coordinator retries the
+immutable pending snapshot after failure; a second attempt inside the same copy
+command could overwrite a file already confirmed by that command. Custom flags
+and native environment overrides that weaken comparisons or change the
+high-level retry count are rejected before archiving. This keeps an
+unchanged-file confirmation from accepting a different size or a weaker
+comparison policy.
+
 A catalog lock serializes snapshot creation, inspection, recovery, and deletion.
 The `clean` command removes only incomplete snapshots and refuses to run while
 a filesystem recovery workspace exists. Per-snapshot locks remain held through

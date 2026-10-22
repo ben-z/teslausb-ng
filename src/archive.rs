@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::command::CommandRunner;
-use crate::config::ArchiveConfig;
+use crate::config::{validate_rclone_environment, validate_rclone_flags, ArchiveConfig};
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 use crate::mount::mount_snapshot;
@@ -283,6 +283,8 @@ impl<F: FileSystem> RcloneBackend<F> {
     }
 
     fn copy_directory_inner(&self, src: &Path, dst_name: &str) -> Result<CopyResult> {
+        validate_rclone_flags(&self.flags)?;
+        validate_rclone_environment()?;
         let files = scan_directory(&self.fs, src)?;
         if dst_name != "RecentClips" {
             return self.copy_batch(src, dst_name, &files, None);
@@ -342,8 +344,18 @@ impl<F: FileSystem> RcloneBackend<F> {
             self.destination(destination),
         ];
         args.extend(self.flags.clone());
+        // The coordinator retries the immutable snapshot. Repeating a whole batch here
+        // could overwrite a file whose earlier success already permits live deletion.
         args.extend(
-            ["--use-json-log", "--log-level", "DEBUG", "--no-traverse"].map(str::to_string),
+            [
+                "--retries",
+                "1",
+                "--use-json-log",
+                "--log-level",
+                "DEBUG",
+                "--no-traverse",
+            ]
+            .map(str::to_string),
         );
         args.extend([
             "--log-file".to_string(),
@@ -1292,6 +1304,29 @@ mod tests {
         };
         assert!(!failed.success);
         assert_eq!(failed.error.as_deref(), Some("connection failed"));
+    }
+
+    #[test]
+    fn directly_constructed_backend_rejects_unsafe_confirmation_options() {
+        for flag in ["--ignore-size", "--checksum", "--retries=2"] {
+            let fs = MockFileSystem::new();
+            fs.write_bytes("/camera/front.mp4", b"preserved recording");
+            let backend = RcloneBackend::new(
+                "archive".into(),
+                "TeslaCam".into(),
+                vec![flag.into()],
+                Duration::from_secs(1),
+                fs.clone(),
+            );
+            let result = backend.copy_directory(Path::new("/camera"), "SavedClips");
+            assert!(!result.success, "{flag}");
+            assert!(result.archived_files.is_empty(), "{flag}");
+            assert!(result.error.unwrap().contains(flag), "{flag}");
+            assert_eq!(
+                fs.read_bytes("/camera/front.mp4").unwrap(),
+                b"preserved recording"
+            );
+        }
     }
 
     #[test]

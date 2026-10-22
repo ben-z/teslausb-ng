@@ -8,6 +8,14 @@ use crate::error::{Error, Result};
 
 pub const GB: u64 = 1024 * 1024 * 1024;
 const MB: u64 = 1024 * 1024;
+const RESERVED_RCLONE_OPTIONS: [(&str, &str); 6] = [
+    ("--ignore-size", "RCLONE_IGNORE_SIZE"),
+    ("--size-only", "RCLONE_SIZE_ONLY"),
+    ("--ignore-checksum", "RCLONE_IGNORE_CHECKSUM"),
+    ("--checksum", "RCLONE_CHECKSUM"),
+    ("--modify-window", "RCLONE_MODIFY_WINDOW"),
+    ("--retries", "RCLONE_RETRIES"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveConfig {
@@ -158,6 +166,7 @@ pub fn parse_size(input: &str) -> Result<u64> {
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<Config> {
+    validate_rclone_environment()?;
     let file_values = match path {
         Some(path) => parse_config_file(path)?,
         None if Path::new("/etc/teslausb.conf").exists() => {
@@ -171,6 +180,38 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         return Err(Error::new(errors.join("; ")));
     }
     Ok(config)
+}
+
+pub(crate) fn validate_rclone_flags(flags: &[String]) -> Result<()> {
+    for flag in flags {
+        let name = match flag.split_once('=') {
+            Some((name, _)) => name,
+            None => flag.as_str(),
+        };
+        let short_checksum =
+            name.starts_with('-') && !name.starts_with("--") && name[1..].contains('c');
+        if short_checksum
+            || RESERVED_RCLONE_OPTIONS
+                .iter()
+                .any(|(option, _)| name == *option)
+        {
+            return Err(Error::new(format!(
+                "{flag} is reserved for TeslaUSB archive verification; remove it from RCLONE_FLAGS"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rclone_environment() -> Result<()> {
+    for (_, key) in RESERVED_RCLONE_OPTIONS {
+        if env::var_os(key).is_some() {
+            return Err(Error::new(format!(
+                "{key} is reserved for TeslaUSB archive verification; remove it from the environment"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
@@ -201,6 +242,7 @@ fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
     if let Some(value) = get_var(file_values, "RCLONE_FLAGS") {
         archive.rclone_flags = value.split_whitespace().map(str::to_string).collect();
     }
+    validate_rclone_flags(&archive.rclone_flags)?;
 
     archive.archive_recent = get_bool(file_values, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
     archive.archive_saved = get_bool(file_values, "ARCHIVE_SAVEDCLIPS", archive.archive_saved)?;
@@ -425,6 +467,73 @@ BACKINGFILES_PATH=/mnt/backing
         );
         assert_eq!(config.mutable_path, PathBuf::from("/var/lib/teslausb"));
         assert_eq!(config.backingfiles_path, PathBuf::from("/mnt/backing"));
+    }
+
+    #[test]
+    fn reserved_rclone_flags_require_removal_even_when_disabled_or_redundant() {
+        for value in [
+            "--ignore-size",
+            "--ignore-size=false",
+            "--size-only",
+            "--size-only=false",
+            "--ignore-checksum",
+            "--ignore-checksum=false",
+            "--checksum",
+            "--checksum=false",
+            "--checksum false",
+            "-c",
+            "-c=false",
+            "-c false",
+            "-vc",
+            "-cvI",
+            "-Ivc=false",
+            "--modify-window=0s",
+            "--modify-window 0s",
+            "--retries=1",
+            "--retries 1",
+        ] {
+            let flags = value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(
+                validate_rclone_flags(&flags)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reserved"),
+                "{value}"
+            );
+            let values = HashMap::from([("RCLONE_FLAGS".to_string(), value.to_string())]);
+            assert!(
+                load_from_sources(&values)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("RCLONE_FLAGS"),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_rclone_options_remain_available() {
+        let flags = [
+            "--ignore-times",
+            "-I",
+            "--compare-dest",
+            "remote:comparison",
+            "--fast-list",
+            "--checkers=4",
+            "--retries-sleep=1s",
+            "--low-level-retries",
+            "5",
+        ]
+        .map(str::to_string);
+        validate_rclone_flags(&flags).unwrap();
+        let values = HashMap::from([("RCLONE_FLAGS".to_string(), flags.join(" "))]);
+        assert_eq!(
+            load_from_sources(&values).unwrap().archive.rclone_flags,
+            flags
+        );
     }
 
     #[test]
