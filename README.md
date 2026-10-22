@@ -88,7 +88,7 @@ On a Debian or Ubuntu board, install the system dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y git rclone xfsprogs parted e2fsprogs kpartx util-linux kmod
+sudo apt install -y git rclone xfsprogs parted e2fsprogs util-linux kmod
 ```
 
 With Rust and Cargo installed, build on the board:
@@ -116,6 +116,7 @@ From the source checkout:
 git pull --ff-only
 cargo build --release --locked
 sudo systemctl stop teslausb
+sudo teslausb gadget off
 sudo install -m 0755 target/release/teslausb /usr/local/bin/teslausb
 sudo teslausb service install --force
 sudo systemctl start teslausb
@@ -126,6 +127,14 @@ sudo journalctl -u teslausb -n 100 --no-pager
 The forced service installation updates the executable path and lifecycle
 commands. Initialization is for new installations; `deinit` permanently deletes
 local recordings.
+
+The service disables USB after a clean stop. An archiver failure leaves the USB
+gadget in its existing state while systemd restarts the archiver, so a snapshot
+recovery failure does not interrupt recording. Failed maintenance of the live
+camera filesystem leaves USB disabled until the filesystem can be checked safely.
+Stopping an already failed service can leave USB enabled. Before disk maintenance,
+run `teslausb gadget off` after stopping the service. `service uninstall` also
+removes the gadget explicitly.
 
 ## Board Configuration
 

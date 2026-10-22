@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(any(target_os = "linux", test))]
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,15 +24,13 @@ enum LoopState {
 #[derive(Debug)]
 pub struct LoopDevice {
     loop_dev: String,
-    partition: String,
     image: PathBuf,
-    kpartx_used: bool,
     state: LoopState,
 }
 
 impl LoopDevice {
     pub fn partition(&self) -> &str {
-        &self.partition
+        &self.loop_dev
     }
 
     pub fn detach(&mut self) -> Result<()> {
@@ -39,14 +38,6 @@ impl LoopDevice {
             return Ok(());
         }
         if self.state == LoopState::Attached {
-            if self.kpartx_used {
-                CommandRunner.check(
-                    "kpartx",
-                    ["-d", self.loop_dev.as_str()],
-                    Some(Duration::from_secs(30)),
-                )?;
-                self.kpartx_used = false;
-            }
             self.state = LoopState::Detaching;
             CommandRunner.check(
                 "losetup",
@@ -192,48 +183,82 @@ impl Drop for MountedImage {
 
 pub fn setup_loop_device(image_path: &Path, readonly: bool) -> Result<LoopDevice> {
     let image = fs::canonicalize(image_path)?;
-    let mut args = vec!["-Pf", "--show"];
+    let image_string = image.display().to_string();
+    let table = CommandRunner.check(
+        "parted",
+        ["-sm", &image_string, "unit", "B", "print"],
+        Some(Duration::from_secs(30)),
+    )?;
+    let (offset, size) = first_partition_range(&table.stdout, fs::metadata(&image)?.len())?;
+    let offset = offset.to_string();
+    let size = size.to_string();
+    // Expose only the filesystem, so detach never rescans kernel partitions
+    // while udev may still be probing them.
+    let mut args = vec![
+        "--find",
+        "--show",
+        "--offset",
+        &offset,
+        "--sizelimit",
+        &size,
+    ];
     if readonly {
         args.push("--read-only");
     }
-    let image_string = image.display().to_string();
     args.push(&image_string);
     let output = CommandRunner.check("losetup", args, Some(Duration::from_secs(30)))?;
     let loop_dev = output.stdout.trim().to_string();
     if loop_dev.is_empty() {
         return Err(Error::new("losetup did not print a loop device"));
     }
-    let mut device = LoopDevice {
-        partition: format!("{}p1", loop_dev),
+    Ok(LoopDevice {
         loop_dev,
         image,
-        kpartx_used: false,
         state: LoopState::Attached,
+    })
+}
+
+fn first_partition_range(table: &str, image_size: u64) -> Result<(u64, u64)> {
+    let mut lines = table.lines();
+    if lines.next() != Some("BYT;") || lines.next().is_none() {
+        return Err(Error::new(
+            "parted did not report a byte-based partition table",
+        ));
+    }
+    let mut partitions = lines.filter(|line| line.starts_with("1:"));
+    let partition = partitions
+        .next()
+        .ok_or_else(|| Error::new("camera image has no first partition"))?;
+    if partitions.next().is_some() {
+        return Err(Error::new("camera image has multiple first partitions"));
+    }
+    let mut fields = partition.split(':').skip(1);
+    let mut byte_field = || -> Result<u64> {
+        fields
+            .next()
+            .and_then(|field| field.strip_suffix('B'))
+            .ok_or_else(|| Error::new("invalid byte range for camera image first partition"))?
+            .parse()
+            .map_err(|error| Error::new(format!("invalid camera partition byte value: {error}")))
     };
-    if wait_for_path(Path::new(&device.partition), Duration::from_secs(2)) {
-        return Ok(device);
+    let offset = byte_field()?;
+    let end = byte_field()?;
+    let size = byte_field()?;
+    let limit = offset
+        .checked_add(size)
+        .ok_or_else(|| Error::new("camera image first partition byte range overflows"))?;
+    if offset == 0
+        || size == 0
+        || offset % 512 != 0
+        || size % 512 != 0
+        || limit > image_size
+        || limit - 1 != end
+    {
+        return Err(Error::new(
+            "camera image first partition has an invalid byte range",
+        ));
     }
-    CommandRunner.check(
-        "kpartx",
-        [
-            if readonly { "-arv" } else { "-av" },
-            device.loop_dev.as_str(),
-        ],
-        Some(Duration::from_secs(30)),
-    )?;
-    device.kpartx_used = true;
-    let loop_name = Path::new(&device.loop_dev)
-        .file_name()
-        .ok_or_else(|| Error::new("invalid loop-device path"))?
-        .to_string_lossy();
-    device.partition = format!("/dev/mapper/{}p1", loop_name);
-    if wait_for_path(Path::new(&device.partition), Duration::from_secs(2)) {
-        return Ok(device);
-    }
-    Err(Error::new(format!(
-        "partition device did not appear for {}",
-        image_path.display()
-    )))
+    Ok((offset, size))
 }
 
 fn validate_filesystem(value: &str) -> Result<()> {
@@ -402,17 +427,6 @@ pub(crate) fn recover_ext4_image(image_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_path(path: &Path, timeout: Duration) -> bool {
-    let started = std::time::Instant::now();
-    while started.elapsed() < timeout {
-        if path.exists() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    path.exists()
-}
-
 fn temp_mount_point(timestamp: SystemTime) -> Result<PathBuf> {
     let suffix = timestamp
         .duration_since(UNIX_EPOCH)
@@ -499,15 +513,13 @@ mod tests {
     }
 
     #[test]
-    fn loop_device_returns_partition_path() {
+    fn loop_device_exposes_only_the_partition_byte_range() {
         let device = LoopDevice {
             loop_dev: "/dev/null".into(),
-            partition: "/dev/nullp1".into(),
-            kpartx_used: false,
             state: LoopState::Detached,
             image: PathBuf::from("/dev/null"),
         };
-        assert_eq!(device.partition(), "/dev/nullp1");
+        assert_eq!(device.partition(), "/dev/null");
     }
 
     #[test]
@@ -515,8 +527,6 @@ mod tests {
         let mut device = LoopDevice {
             // Neither a detach command nor a sysfs probe can use this device path.
             loop_dev: "/".into(),
-            partition: String::new(),
-            kpartx_used: true,
             state: LoopState::Detached,
             image: PathBuf::from("/missing/recovered.bin"),
         };
@@ -526,20 +536,39 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_path_detects_existing_and_missing_paths() {
-        let existing = std::env::temp_dir().join(format!(
-            "teslausb-wait-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&existing, b"x").unwrap();
+    fn partition_ranges_support_mbr_and_gpt_without_kernel_partition_devices() {
+        for label in ["msdos", "gpt"] {
+            let table =
+                format!("BYT;\n/disk:4096B:file:512:512:{label}::;\n1:512B:3583B:3072B:ext4::;\n");
+            assert_eq!(first_partition_range(&table, 4096).unwrap(), (512, 3072));
+        }
+    }
 
-        assert!(wait_for_path(&existing, Duration::from_millis(1)));
-        let _ = fs::remove_file(&existing);
-        assert!(!wait_for_path(&existing, Duration::from_millis(1)));
+    #[test]
+    fn partition_ranges_reject_missing_ambiguous_or_invalid_ranges() {
+        let header = "BYT;\n/disk:4096B:file:512:512:msdos::;\n";
+        for row in [
+            "",
+            "2:512B:1023B:512B:::;\n",
+            "1:512B:1023B:512B:::;\n1:1024B:1535B:512B:::;\n",
+            "1:512s:1023B:512B:::;\n",
+            "1:invalidB:1023B:512B:::;\n",
+            "1:0B:511B:512B:::;\n",
+            "1:512B:511B:0B:::;\n",
+            "1:513B:1024B:512B:::;\n",
+            "1:512B:1024B:513B:::;\n",
+            "1:512B:1024B:512B:::;\n",
+            "1:512B:4607B:4096B:::;\n",
+            "1:18446744073709551104B:0B:512B:::;\n",
+        ] {
+            assert!(
+                first_partition_range(&format!("{header}{row}"), 4096).is_err(),
+                "accepted {row:?}"
+            );
+        }
+        for table in ["", "BYT;", "CHS;\n/disk\n1:512B:1023B:512B:::;\n"] {
+            assert!(first_partition_range(table, 4096).is_err());
+        }
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn offline_init_mount_status_doctor_and_deinit() {
         "truncate\t-s",
         "mkfs.xfs\t-f",
         "parted\t-s",
-        "losetup\t-Pf\t--show",
+        "losetup\t--find\t--show\t--offset",
         "mkfs.ext4\t-F\t-b\t4096\t-I\t256\t-m\t0",
         "mount\t-o\tloop",
         "stat\t-f\t-c\t%T",
@@ -210,7 +210,7 @@ fn offline_archive_recovers_ext4_privately_before_readonly_mount() {
         "blkid\t-p\t-s\tTYPE\t-o\tvalue",
         "e2fsck\t-p\t-E\tjournal_only",
         "e2fsck\t-f\t-n",
-        "losetup\t-Pf\t--show\t--read-only",
+        "--read-only",
         "mount\t-o\tro,noload",
     ] {
         assert!(log.contains(command), "missing {command:?}\n{log}");
@@ -293,6 +293,11 @@ fn offline_ext4_recovery_failure_prevents_upload_and_preserves_evidence() {
             recovery[0].join("raw.bin").is_file(),
             "normal cleanup erased failed recovery evidence"
         );
+        assert_eq!(recovery_files(&recovery[0]), retained_files);
+        assert_eq!(fs::read(&state_path).unwrap(), failed_state);
+        let run = harness.run(&["--config", &config, "run"]);
+        assert!(!run.status.success(), "{}", describe(&run));
+        assert!(stderr(&run).contains("recovery evidence already exists"));
         assert_eq!(recovery_files(&recovery[0]), retained_files);
         assert_eq!(fs::read(&state_path).unwrap(), failed_state);
     }
@@ -1203,6 +1208,8 @@ fn offline_service_install_status_and_uninstall() {
     assert!(!service.contains("network-online.target"));
     assert!(service.contains(" run\n"));
     assert!(service.contains("ExecStopPost="));
+    assert!(service.contains("$${SERVICE_RESULT:?systemd did not supply SERVICE_RESULT}"));
+    assert!(service.contains("teslausb-stop"));
     assert!(!service.lines().any(|line| line.starts_with("ExecStop=")));
     assert!(service.contains(" gadget off\n"));
 
@@ -1371,7 +1378,20 @@ case "$tool" in
 esac
 
 case "$tool" in
-    sync|mkfs.xfs|parted|blockdev|modprobe)
+    sync|mkfs.xfs|blockdev|modprobe)
+        exit 0
+        ;;
+    parted)
+        if [ "$(last_arg "$@")" = print ]; then
+            image=''
+            for arg in "$@"; do
+                if [ -f "$arg" ]; then image="$arg"; fi
+            done
+            test -n "$image"
+            bytes=$(wc -c < "$image" | tr -d '[:space:]')
+            printf 'BYT;\n%s:%sB:file:512:512:msdos::;\n' "$image" "$bytes"
+            printf '1:512B:%sB:%sB:::;\n' "$((bytes - 1))" "$((bytes - 512))"
+        fi
         exit 0
         ;;
     mkfs.ext4)
@@ -1419,7 +1439,7 @@ case "$tool" in
             path=$(last_arg "$@")
         fi
         mkdir -p "$(dirname "$path")"
-        printf 'fake disk image\n' > "$path"
+        dd if=/dev/zero of="$path" bs=512 count=8
         exit 0
         ;;
     losetup)
@@ -1439,11 +1459,9 @@ case "$tool" in
         fi
         image=$(last_arg "$@")
         loop="$state/loop0"
-        partition="${loop}p1"
         printf '%s\n' "$image" > "$state/attached-image"
         : > "$loop"
-        : > "$partition"
-        printf '%s\t%s\n' "$partition" "$image" >> "$state/partition-map.tsv"
+        printf '%s\t%s\n' "$loop" "$image" >> "$state/partition-map.tsv"
         printf '%s\n' "$loop"
         exit 0
         ;;
@@ -1477,7 +1495,7 @@ case "$tool" in
             : > "$state/rw-$(key_for "$target")"
         fi
         case "$src" in
-            *p1)
+            "$state/loop0")
                 if [ -n "${TESLAUSB_FAKE_CAM_SOURCE:-}" ] && [ -d "$TESLAUSB_FAKE_CAM_SOURCE" ]; then
                     /bin/cp -Rp "$TESLAUSB_FAKE_CAM_SOURCE"/. "$target"/
                 fi

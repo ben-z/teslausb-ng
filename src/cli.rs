@@ -531,7 +531,7 @@ fn cmd_service(args: &GlobalArgs) -> Result<i32> {
         "uninstall" => {
             let config = config(args)?;
             ensure_dependencies(&config, DependencySet::Service)?;
-            uninstall_service()?;
+            uninstall_service(&config)?;
             Ok(0)
         }
         "status" => {
@@ -767,6 +767,7 @@ fn filesystem_type(path: &Path) -> Result<String> {
 }
 
 const SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/teslausb.service";
+const SERVICE_STOP_SCRIPT: &str = r#"if [ "${SERVICE_RESULT:?systemd did not supply SERVICE_RESULT}" = success ]; then exec "$@"; else printf 'error: archiver failed (%s); USB gadget state preserved\n' "$SERVICE_RESULT" >&2; fi"#;
 
 fn systemd_service_path() -> PathBuf {
     env::var_os("TESLAUSB_SYSTEMD_SERVICE_PATH")
@@ -782,13 +783,16 @@ fn install_service(force: bool, config_path: Option<&Path>) -> Result<()> {
             path.display()
         )));
     }
-    let mut command = systemd_quote(&env::current_exe()?.display().to_string());
-    if let Some(path) = config_path {
-        command.push_str(" --config ");
-        command.push_str(&systemd_quote(
-            &fs::canonicalize(path)?.display().to_string(),
-        ));
-    }
+    let executable = env::current_exe()?.display().to_string();
+    let config_args = match config_path {
+        Some(path) => format!(
+            " --config {}",
+            systemd_argument(&fs::canonicalize(path)?.display().to_string())
+        ),
+        None => String::new(),
+    };
+    let command = format!("{}{config_args}", systemd_quote(&executable));
+    let stop_command = format!("{}{config_args}", systemd_argument(&executable));
     let service = format!(
         "[Unit]\n\
 Description=TeslaUSB Archiver\n\
@@ -802,7 +806,7 @@ ExecStartPre={exe} doctor --startup\n\
 ExecStartPre={exe} mount\n\
 ExecStartPre={exe} gadget on\n\
 ExecStart={exe} run\n\
-ExecStopPost={exe} gadget off\n\
+ExecStopPost=/bin/sh -c {stop_script} teslausb-stop {stop_command} gadget off\n\
 TimeoutStartSec=300\n\
 KillMode=mixed\n\
 TimeoutStopSec=900\n\
@@ -811,7 +815,8 @@ RestartSec=10\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n",
-        exe = command
+        exe = command,
+        stop_script = systemd_argument(SERVICE_STOP_SCRIPT),
     );
     fs::write(&path, service)?;
     CommandRunner.check(
@@ -838,7 +843,12 @@ fn systemd_quote(value: &str) -> String {
     )
 }
 
-fn uninstall_service() -> Result<()> {
+fn systemd_argument(value: &str) -> String {
+    // Systemd expands environment variables in arguments, but not executable names.
+    systemd_quote(value).replace('$', "$$")
+}
+
+fn uninstall_service(config: &Config) -> Result<()> {
     let path = systemd_service_path();
     if !path.exists() {
         println!("Service is not installed");
@@ -849,6 +859,11 @@ fn uninstall_service() -> Result<()> {
         ["stop", "teslausb.service"],
         Some(Duration::from_secs(30)),
     )?;
+    let gadget = UsbGadget::default();
+    if gadget.is_initialized() {
+        let _archive_lock = archive_lock(config)?;
+        gadget.remove()?;
+    }
     CommandRunner.check(
         "systemctl",
         ["disable", "teslausb.service"],
@@ -1063,6 +1078,87 @@ mod tests {
             run(strings(&["teslausb", "gadget", "status", "--json"])).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn service_stop_preserves_the_gadget_after_archiver_failure() {
+        for result in [
+            "exit-code",
+            "signal",
+            "core-dump",
+            "timeout",
+            "watchdog",
+            "oom-kill",
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    SERVICE_STOP_SCRIPT,
+                    "teslausb-stop",
+                    "/bin/sh",
+                    "-c",
+                    "exit 99",
+                ])
+                .env("SERVICE_RESULT", result)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{result}: {output:?}");
+            assert!(String::from_utf8(output.stderr).unwrap().contains(&format!(
+                "archiver failed ({result}); USB gadget state preserved"
+            )));
+        }
+    }
+
+    #[test]
+    fn service_stop_runs_gadget_command_with_literal_arguments_on_success() {
+        let config = "/tmp/config with $dollars ${braces} %percent 'quotes'";
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                SERVICE_STOP_SCRIPT,
+                "teslausb-stop",
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' \"$@\"; exit 17",
+                "gadget-command",
+                "--config",
+                config,
+                "gadget",
+                "off",
+            ])
+            .env("SERVICE_RESULT", "success")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("--config\n{config}\ngadget\noff\n")
+        );
+    }
+
+    #[test]
+    fn service_stop_requires_systemd_result_and_quotes_literal_paths() {
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                SERVICE_STOP_SCRIPT,
+                "teslausb-stop",
+                "/bin/sh",
+                "-c",
+                "exit 99",
+            ])
+            .env_remove("SERVICE_RESULT")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("systemd did not supply SERVICE_RESULT"));
+        assert_eq!(
+            systemd_argument("/tmp/a $b ${c} %d \\\"e"),
+            "\"/tmp/a $$b $${c} %%d \\\\\\\"e\""
+        );
+        assert_eq!(systemd_quote("/tmp/a $b ${c} %d"), "\"/tmp/a $b ${c} %%d\"");
     }
 
     #[test]
