@@ -1,14 +1,18 @@
 #![cfg(target_os = "linux")]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -467,7 +471,7 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
                 PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam-real"), "rw");
             write_cam_fixture(cam.path());
         }
-        set_flags("--checksum");
+        set_flags("--fast-list");
         let output = archive();
         assert_success(&output);
         let expected = if copied {
@@ -556,7 +560,7 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
         );
     }
 
-    set_flags("--checksum");
+    set_flags("--fast-list");
     let configured = archive_command()
         .env("RCLONE_CONFIG", config_home.join("rclone/rclone.conf"))
         .output()
@@ -587,6 +591,257 @@ fn linux_real_rclone_confirms_copies_and_preserves_unconfirmed_files() {
     let retired = harness.run(&["--config", &config, "snapshots", "--json"]);
     assert_success(&retired);
     assert_eq!(stdout(&retired).trim(), "[]");
+}
+
+#[test]
+#[ignore = "requires root, real rclone, Linux loop devices, XFS reflinks, and ext4 mounts"]
+fn linux_real_rclone_does_not_retry_confirmed_files_after_a_partial_failure() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    let real_rclone = run_shell("command -v rclone");
+    assert_success(&real_rclone);
+    fs::remove_file(harness.fake_bin.join("rclone")).unwrap();
+    std::os::unix::fs::symlink(stdout(&real_rclone).trim(), harness.fake_bin.join("rclone"))
+        .unwrap();
+    let server = FailingWebDav::new(&harness.root);
+    let rclone_config = harness.root.join("rclone.conf");
+    fs::write(
+        &rclone_config,
+        format!(
+            "[fake]\ntype = webdav\nurl = http://{}/\nvendor = other\n",
+            server.address
+        ),
+    )
+    .unwrap();
+    let config_content = fs::read_to_string(&harness.config).unwrap().replace(
+        "RCLONE_FLAGS=--fast-list",
+        "RCLONE_FLAGS=--ignore-times --checkers 1 --transfers 1 --order-by name --low-level-retries 1 --retries-sleep 0s",
+    );
+    fs::write(&harness.config, config_content).unwrap();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "512M"]));
+    {
+        let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam"), "rw");
+        write_file(
+            cam.path().join("TeslaCam/SavedClips/a/front.mp4"),
+            "complete camera video",
+        );
+        write_file(
+            cam.path().join("TeslaCam/SavedClips/b/front.mp4"),
+            "retain failed video",
+        );
+    }
+
+    let output = harness
+        .command(&["--config", &config, "archive"])
+        .env("RCLONE_CONFIG", &rclone_config)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    let state = server.state.lock().unwrap();
+    let successful = "/TeslaArchive/SavedClips/a/front.mp4";
+    let failed = "/TeslaArchive/SavedClips/b/front.mp4";
+    assert_eq!(state.puts, [successful, failed], "{}", describe(&output));
+    assert_eq!(
+        state.files.get(successful).unwrap(),
+        b"complete camera video"
+    );
+    assert!(!state.files.contains_key(failed));
+    drop(state);
+
+    let pending = harness.run(&["--config", &config, "snapshots", "--json"]);
+    assert_success(&pending);
+    let snapshots: serde_json::Value = serde_json::from_str(&stdout(&pending)).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots[0]["state"], "pending");
+    let cam = PartitionMount::mount(&harness.cam_disk(), &harness.root.join("cam"), "ro");
+    assert_eq!(
+        fs::read(cam.path().join("TeslaCam/SavedClips/b/front.mp4")).unwrap(),
+        b"retain failed video"
+    );
+}
+
+#[derive(Default)]
+struct WebDavState {
+    directories: BTreeSet<String>,
+    files: BTreeMap<String, Vec<u8>>,
+    puts: Vec<String>,
+}
+
+struct FailingWebDav {
+    root: PathBuf,
+    address: SocketAddr,
+    state: Arc<Mutex<WebDavState>>,
+    stopping: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FailingWebDav {
+    fn new(root: &Path) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(WebDavState {
+            directories: ["/".to_string(), "/TeslaArchive".to_string()].into(),
+            ..WebDavState::default()
+        }));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_state = state.clone();
+        let worker_stopping = stopping.clone();
+        let worker = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                if worker_stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream.set_read_timeout(Some(CLEANUP_TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(CLEANUP_TIMEOUT)).unwrap();
+                Self::respond(stream, &mut worker_state.lock().unwrap());
+            }
+        });
+        Self {
+            root: root.to_path_buf(),
+            address,
+            state,
+            stopping,
+            worker: Some(worker),
+        }
+    }
+
+    fn respond(stream: TcpStream, state: &mut WebDavState) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: Vec<_> = line.split_whitespace().map(str::to_string).collect();
+        assert_eq!(request.len(), 3, "invalid HTTP request: {line:?}");
+        let method = &request[0];
+        let path = request[1].trim_end_matches('/');
+        let path = if path.is_empty() { "/" } else { path };
+        let mut length = 0;
+        let mut depth = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "truncated HTTP headers"
+            );
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("invalid HTTP header");
+            if name.eq_ignore_ascii_case("Content-Length") {
+                length = value.trim().parse().unwrap();
+            } else if name.eq_ignore_ascii_case("Depth") {
+                depth = value.trim().to_string();
+            } else {
+                assert!(
+                    !name.eq_ignore_ascii_case("Transfer-Encoding"),
+                    "chunked fixture requests are unsupported"
+                );
+            }
+        }
+        let mut content = vec![0; length];
+        reader.read_exact(&mut content).unwrap();
+        let (status, body) = match method.as_str() {
+            "PROPFIND" if state.directories.contains(path) || state.files.contains_key(path) => {
+                let prefix = format!("{}/", path.trim_end_matches('/'));
+                let mut names = vec![path.to_string()];
+                if depth != "0" {
+                    names.extend(
+                        state
+                            .directories
+                            .iter()
+                            .chain(state.files.keys())
+                            .filter(|name| {
+                                name.strip_prefix(&prefix).is_some_and(|relative| {
+                                    !relative.is_empty() && !relative.contains('/')
+                                })
+                            })
+                            .cloned(),
+                    );
+                }
+                let mut xml =
+                    String::from("<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\">");
+                for name in names {
+                    let (resource, size) = if state.directories.contains(&name) {
+                        ("<d:collection/>", 0)
+                    } else {
+                        ("", state.files.get(&name).unwrap().len())
+                    };
+                    xml.push_str(&format!("<d:response><d:href>{name}</d:href><d:propstat><d:prop><d:resourcetype>{resource}</d:resourcetype><d:getcontentlength>{size}</d:getcontentlength><d:getlastmodified>Wed, 01 Jan 2020 00:00:00 GMT</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                }
+                xml.push_str("</d:multistatus>");
+                (207, xml.into_bytes())
+            }
+            "PROPFIND" => (404, Vec::new()),
+            "MKCOL" => {
+                state.directories.insert(path.to_string());
+                (201, Vec::new())
+            }
+            "PUT" => {
+                state.puts.push(path.to_string());
+                if path.ends_with("/b/front.mp4") {
+                    (503, b"injected retryable failure".to_vec())
+                } else if state
+                    .puts
+                    .iter()
+                    .filter(|name| name.as_str() == path)
+                    .count()
+                    > 1
+                {
+                    state
+                        .files
+                        .insert(path.to_string(), b"corrupt partial overwrite".to_vec());
+                    (503, b"injected partial overwrite failure".to_vec())
+                } else {
+                    state.files.insert(path.to_string(), content);
+                    (201, Vec::new())
+                }
+            }
+            "PROPPATCH" => (
+                207,
+                b"<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"/>".to_vec(),
+            ),
+            "DELETE" => (
+                if state.files.remove(path).is_some() {
+                    204
+                } else {
+                    404
+                },
+                Vec::new(),
+            ),
+            "GET" | "HEAD" => (
+                200,
+                state
+                    .files
+                    .get(path)
+                    .expect("requested missing object")
+                    .clone(),
+            ),
+            _ => panic!("unexpected WebDAV request: {method} {path}"),
+        };
+        let mut stream = reader.into_inner();
+        write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        if method != "HEAD" {
+            stream.write_all(&body).unwrap();
+        }
+    }
+}
+
+impl Drop for FailingWebDav {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let wake = TcpStream::connect(self.address)
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let joined = self
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| "WebDAV fixture worker panicked".to_string());
+        report_cleanup_result(&self.root, joined.and(wake));
+    }
 }
 
 #[test]

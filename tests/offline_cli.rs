@@ -85,27 +85,14 @@ impl Harness {
     }
 
     fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-        let mut path = OsString::from(&self.bin);
-        path.push(":");
-        path.push(&self.old_path);
-
-        let mut command = Command::new(env!("CARGO_BIN_EXE_teslausb"));
-        command
-            .args(args)
-            .env_remove("CAM_FILESYSTEM")
-            .env("PATH", path)
-            .env("TESLAUSB_FAKE_STATE", &self.state)
-            .env("TESLAUSB_PROC_PATH", self.root.join("proc"))
-            .env("TESLAUSB_FAKE_CAM_SOURCE", &self.cam_source)
-            .env("TESLAUSB_SYSTEMD_SERVICE_PATH", &self.service_path)
-            .stdin(Stdio::null());
+        let mut command = self.command(args);
         for (key, value) in extra_env {
             command.env(key, value);
         }
         command.output().unwrap()
     }
 
-    fn spawn_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Child {
+    fn command(&self, args: &[&str]) -> Command {
         let mut path = OsString::from(&self.bin);
         path.push(":");
         path.push(&self.old_path);
@@ -114,14 +101,24 @@ impl Harness {
         command
             .args(args)
             .env_remove("CAM_FILESYSTEM")
+            .env_remove("RCLONE_IGNORE_SIZE")
+            .env_remove("RCLONE_SIZE_ONLY")
+            .env_remove("RCLONE_IGNORE_CHECKSUM")
+            .env_remove("RCLONE_CHECKSUM")
+            .env_remove("RCLONE_MODIFY_WINDOW")
+            .env_remove("RCLONE_RETRIES")
             .env("PATH", path)
             .env("TESLAUSB_FAKE_STATE", &self.state)
             .env("TESLAUSB_PROC_PATH", self.root.join("proc"))
             .env("TESLAUSB_FAKE_CAM_SOURCE", &self.cam_source)
             .env("TESLAUSB_SYSTEMD_SERVICE_PATH", &self.service_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn spawn_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Child {
+        let mut command = self.command(args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -487,6 +484,105 @@ fn offline_invalid_archive_settings_fail_before_commands_or_disk_changes() {
             }
         }
     }
+}
+
+#[test]
+fn offline_reserved_rclone_flags_fail_before_commands_or_disk_changes() {
+    for flags in [
+        "--ignore-size",
+        "--ignore-size=false",
+        "--size-only",
+        "--size-only=false",
+        "--ignore-checksum",
+        "--ignore-checksum=false",
+        "--checksum",
+        "--checksum=false",
+        "-c",
+        "-vc",
+        "-c=false",
+        "-Ivc=false",
+        "--modify-window=0s",
+        "--modify-window 0s",
+        "--retries=1",
+        "--retries 1",
+    ] {
+        for in_file in [false, true] {
+            for command in ["init", "archive", "run"] {
+                let harness = Harness::new("none");
+                let config = harness.config_arg();
+                if in_file {
+                    let contents = fs::read_to_string(&harness.config).unwrap();
+                    fs::write(&harness.config, format!("{contents}RCLONE_FLAGS={flags}\n"))
+                        .unwrap();
+                }
+                fs::write(harness.backingfiles.join("cam_disk.bin"), b"recordings").unwrap();
+                fs::write(
+                    harness.mutable.join("backingfiles.img"),
+                    b"backing filesystem",
+                )
+                .unwrap();
+                let environment = if in_file {
+                    Vec::new()
+                } else {
+                    vec![("RCLONE_FLAGS", flags)]
+                };
+                let output = harness.run_with_env(&["--config", &config, command], &environment);
+                assert_reserved_config_rejection(&harness, &output, "RCLONE_FLAGS");
+            }
+        }
+    }
+}
+
+#[test]
+fn offline_reserved_rclone_environment_fails_for_any_present_value() {
+    for key in [
+        "RCLONE_IGNORE_SIZE",
+        "RCLONE_SIZE_ONLY",
+        "RCLONE_IGNORE_CHECKSUM",
+        "RCLONE_CHECKSUM",
+        "RCLONE_MODIFY_WINDOW",
+        "RCLONE_RETRIES",
+    ] {
+        for value in [
+            OsString::new(),
+            OsString::from("false"),
+            OsString::from("0"),
+            OsString::from("1"),
+            OsString::from_vec(vec![0xff]),
+        ] {
+            for command in ["init", "archive", "run"] {
+                let harness = Harness::new("none");
+                fs::write(harness.backingfiles.join("cam_disk.bin"), b"recordings").unwrap();
+                fs::write(
+                    harness.mutable.join("backingfiles.img"),
+                    b"backing filesystem",
+                )
+                .unwrap();
+                let output = harness
+                    .command(&["--config", &harness.config_arg(), command])
+                    .env(key, &value)
+                    .output()
+                    .unwrap();
+                assert_reserved_config_rejection(&harness, &output, key);
+            }
+        }
+    }
+}
+
+fn assert_reserved_config_rejection(harness: &Harness, output: &Output, option: &str) {
+    assert!(!output.status.success(), "{}", describe(output));
+    assert!(stderr(output).contains(option), "{}", describe(output));
+    assert!(stderr(output).contains("reserved"), "{}", describe(output));
+    assert!(harness.command_log().is_empty());
+    assert!(!harness.backingfiles.join("snapshots").exists());
+    assert_eq!(
+        fs::read(harness.backingfiles.join("cam_disk.bin")).unwrap(),
+        b"recordings"
+    );
+    assert_eq!(
+        fs::read(harness.mutable.join("backingfiles.img")).unwrap(),
+        b"backing filesystem"
+    );
 }
 
 #[test]
