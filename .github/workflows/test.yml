@@ -23,7 +23,7 @@ jobs:
         run: cargo test --locked
 
       - name: Run clippy
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Install coverage tool
         run: cargo install cargo-llvm-cov --locked
@@ -48,3 +48,6 @@ jobs:
 
       - name: Run Linux integration tests
         run: scripts/run-linux-integration.sh
+
+      - name: Run systemd integration tests
+        run: scripts/run-systemd-integration.sh

@@ -925,40 +925,24 @@ impl<F: FileSystem> ArchiveManager<F> {
                 }
                 self.fs.remove_file(&file_path)?;
                 deleted += 1;
+                self.cleanup_empty_parents(&base_path, &archived_file.relative_path)?;
             }
-            self.cleanup_empty_dirs(&base_path)?;
         }
 
         Ok((deleted, skipped))
     }
 
-    fn cleanup_empty_dirs(&self, base_path: &Path) -> Result<()> {
-        let mut dirs = self.collect_dirs(base_path)?;
-        dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        for dir in dirs {
-            if self.fs.list_dir_names(&dir)?.is_empty() {
-                self.fs.remove_dir(&dir)?;
+    fn cleanup_empty_parents(&self, base_path: &Path, deleted_relative_path: &Path) -> Result<()> {
+        // Other empty directories may be destinations for events the car is still saving.
+        for parent in deleted_relative_path.ancestors().skip(1) {
+            if parent.as_os_str().is_empty() {
+                break;
             }
-        }
-        Ok(())
-    }
-
-    fn collect_dirs(&self, base_path: &Path) -> Result<Vec<PathBuf>> {
-        let mut dirs = Vec::new();
-        self.collect_dirs_recursive(base_path, &mut dirs)?;
-        Ok(dirs)
-    }
-
-    fn collect_dirs_recursive(&self, path: &Path, dirs: &mut Vec<PathBuf>) -> Result<()> {
-        if !self.fs.exists(path) {
-            return Ok(());
-        }
-        for name in self.fs.list_dir_names(path)? {
-            let child = path.join(name);
-            if self.fs.is_dir(&child) {
-                dirs.push(child.clone());
-                self.collect_dirs_recursive(&child, dirs)?;
+            let directory = base_path.join(parent);
+            if !self.fs.list_dir_names(&directory)?.is_empty() {
+                break;
             }
+            self.fs.remove_dir(&directory)?;
         }
         Ok(())
     }
@@ -1921,6 +1905,10 @@ mod tests {
         fs.write_bytes("/cam/TeslaCam/SavedClips/event/front.mp4", b"1234");
         let manager = manager(fs.clone());
         let result = result_with_file("SavedClips", "event/front.mp4", 4);
+        fs.create_dir_all(Path::new("/cam/TeslaCam/SavedClips/new-event"))
+            .unwrap();
+        fs.create_dir_all(Path::new("/cam/TeslaCam/SavedClips/unrelated/empty"))
+            .unwrap();
 
         manager
             .delete_archived_files(&result, Path::new("/cam"))
@@ -1928,6 +1916,78 @@ mod tests {
 
         assert!(!fs.exists(Path::new("/cam/TeslaCam/SavedClips/event")));
         assert!(fs.exists(Path::new("/cam/TeslaCam/SavedClips")));
+        assert!(fs.exists(Path::new("/cam/TeslaCam/SavedClips/new-event")));
+        assert!(fs.exists(Path::new("/cam/TeslaCam/SavedClips/unrelated/empty")));
+    }
+
+    #[test]
+    fn cleanup_preserves_empty_children_created_after_the_snapshot() {
+        let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/cam/TeslaCam/SavedClips/event"))
+            .unwrap();
+        fs.write_bytes("/cam/TeslaCam/SavedClips/event/front.mp4", b"1234");
+        let manager = manager(fs.clone());
+        let result = result_with_file("SavedClips", "event/front.mp4", 4);
+        let new_directory = Path::new("/cam/TeslaCam/SavedClips/event/new-recording");
+        fs.create_dir_all(new_directory).unwrap();
+
+        assert_eq!(
+            manager
+                .delete_archived_files(&result, Path::new("/cam"))
+                .unwrap(),
+            (1, 0)
+        );
+        assert!(fs.exists(new_directory));
+        assert!(fs.exists(Path::new("/cam/TeslaCam/SavedClips/event")));
+    }
+
+    #[test]
+    fn cleanup_does_not_prune_parents_or_children_of_skipped_files() {
+        for missing in [false, true] {
+            let fs = MockFileSystem::new();
+            let file = Path::new("/cam/TeslaCam/SavedClips/event/front.mp4");
+            fs.create_dir_all(file.parent().unwrap()).unwrap();
+            fs.write_bytes(file, b"1234");
+            let manager = manager(fs.clone());
+            let result = result_with_file("SavedClips", "event/front.mp4", 4);
+            let new_directory = Path::new("/cam/TeslaCam/SavedClips/event/new-recording");
+            fs.create_dir_all(new_directory).unwrap();
+            if missing {
+                fs.remove_file(file).unwrap();
+            } else {
+                fs.write_bytes(file, b"changed");
+            }
+
+            assert_eq!(
+                manager
+                    .delete_archived_files(&result, Path::new("/cam"))
+                    .unwrap(),
+                (0, 1)
+            );
+            assert!(fs.exists(new_directory));
+            assert!(fs.exists(file.parent().unwrap()));
+        }
+    }
+
+    #[test]
+    fn cleanup_prunes_empty_ancestors_without_removing_the_clip_category() {
+        let fs = MockFileSystem::new();
+        fs.create_dir_all(Path::new("/cam/TeslaTrackMode/lap/recordings"))
+            .unwrap();
+        fs.write_bytes("/cam/TeslaTrackMode/lap/recordings/front.mp4", b"1234");
+        let manager = manager(fs.clone());
+        let result = result_with_file("TrackMode", "lap/recordings/front.mp4", 4);
+
+        assert_eq!(
+            manager
+                .delete_archived_files(&result, Path::new("/cam"))
+                .unwrap(),
+            (1, 0)
+        );
+        assert!(!fs.exists(Path::new("/cam/TeslaTrackMode/lap/recordings")));
+        assert!(!fs.exists(Path::new("/cam/TeslaTrackMode/lap")));
+        assert!(fs.exists(Path::new("/cam/TeslaTrackMode")));
+        assert!(fs.exists(Path::new("/cam")));
     }
 
     #[test]
