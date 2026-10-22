@@ -431,6 +431,65 @@ fn offline_unsupported_camera_filesystem_stops_before_mount_or_upload() {
 }
 
 #[test]
+fn offline_invalid_archive_settings_fail_before_commands_or_disk_changes() {
+    for (system, drive, expected_error) in [
+        ("rcloen", "remote", "Unknown archive system: rcloen"),
+        ("rclone", "", "ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE"),
+        (
+            "rclone",
+            " \t ",
+            "ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE",
+        ),
+    ] {
+        for in_file in [false, true] {
+            for command in ["init", "archive", "run"] {
+                let harness = Harness::new("none");
+                let config = harness.config_arg();
+                let contents = fs::read_to_string(&harness.config).unwrap();
+                let contents = contents
+                    .lines()
+                    .filter(|line| !line.starts_with("ARCHIVE_SYSTEM="))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let contents = if in_file {
+                    format!("{contents}\nARCHIVE_SYSTEM={system}\nRCLONE_DRIVE='{drive}'\n")
+                } else {
+                    contents
+                };
+                fs::write(&harness.config, contents).unwrap();
+                let camera = harness.backingfiles.join("cam_disk.bin");
+                let backing = harness.mutable.join("backingfiles.img");
+                if command != "init" {
+                    fs::write(&camera, b"existing camera recordings").unwrap();
+                    fs::write(&backing, b"existing backing filesystem").unwrap();
+                }
+                let environment = if in_file {
+                    Vec::new()
+                } else {
+                    vec![("ARCHIVE_SYSTEM", system), ("RCLONE_DRIVE", drive)]
+                };
+                let output = harness.run_with_env(&["--config", &config, command], &environment);
+                assert!(!output.status.success(), "{}", describe(&output));
+                assert!(
+                    stderr(&output).contains(expected_error),
+                    "{}",
+                    describe(&output)
+                );
+                assert!(harness.command_log().is_empty());
+                assert!(!harness.backingfiles.join("snapshots").exists());
+                if command == "init" {
+                    assert!(!camera.exists());
+                    assert!(!backing.exists());
+                } else {
+                    assert_eq!(fs::read(camera).unwrap(), b"existing camera recordings");
+                    assert_eq!(fs::read(backing).unwrap(), b"existing backing filesystem");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn offline_obsolete_filesystem_configuration_fails_before_modification() {
     for value in ["ext4", "fat32", ""] {
         for in_file in [false, true] {

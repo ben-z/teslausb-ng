@@ -64,13 +64,16 @@ cargo fmt
 cargo test
 cargo llvm-cov --locked --summary-only --fail-under-lines 85
 scripts/run-linux-integration.sh
+scripts/run-systemd-integration.sh
 ```
 
 `cargo test` includes offline CLI integration tests with fake Unix tools. Keep
 those tests current when changing deployment, service, mount, `run`, or archive
 flows. `scripts/run-linux-integration.sh` runs ignored Linux tests that use real
 loop devices, XFS, ext4, and mounts; use a privileged Linux host, VM, or QEMU
-guest.
+guest. `scripts/run-systemd-integration.sh` tests the generated service's failure,
+retry, and stop behavior with a running systemd manager on Linux. Both integration
+scripts require root; the runners invoke sudo when needed.
 
 ## Common Tasks
 
