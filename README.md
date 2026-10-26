@@ -304,8 +304,17 @@ limit, it cannot accept the new date subfolders. Stop the service and rename the
 old archive folder to `RecentClips-before-YYYY-MM-DD`, using the migration date
 and preserving its files. Verify that the destination name is unused before
 moving it. Restart the service to create a new `RecentClips` tree beside the
-preserved archive. TeslaCam Replay recognizes both the dated folders and
-preserved archives with this name.
+preserved archive.
+
+TeslaCam Replay reads Recent videos only from `RecentClips/YYYY-MM-DD/`. Before
+using the dated-only reader, move recognized videos from preserved archives
+into the canonical date folders, using the recording date in each filename.
+Use Google Drive parent moves that retain the existing file IDs. Check for
+destination name conflicts before moving files. Record every file's ID, size, and checksum
+before the move, and verify them afterward. Keep metadata, unidentified files,
+and recovery artifacts, including empty files, in the preserved archive. Do not
+delete or automatically deduplicate them. Complete and verify this backfill
+before deploying the dated-only reader.
 
 The camera filesystem and XFS backing filesystem have separate space
 limits. Deleting snapshots frees XFS space. Removing confirmed saved events
