@@ -164,6 +164,9 @@ fn add_runtime_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
     add(specs, spec("parted", "parted", &["--version"], None));
     add_reflink_cp(specs);
     if config.archive.system == "rclone" {
+        if !config.archive.network.blocked_ssids.is_empty() {
+            add(specs, spec("iw", "iw", &["--version"], None));
+        }
         add(
             specs,
             spec(
@@ -426,6 +429,29 @@ mod tests {
 
         assert!(dependency_detail(&report).contains("nonzero status"));
         assert!(dependency_detail(&report).contains("version 1.47.2"));
+    }
+
+    #[test]
+    fn wifi_detection_is_required_only_for_enabled_upload_policy() {
+        let mut config = Config::default();
+        config.archive.system = "rclone".into();
+        assert!(!specs_for(&config, DependencySet::Runtime)
+            .iter()
+            .any(|item| item.command == "iw"));
+        config.archive.network.blocked_ssids.push("Hotspot".into());
+        for set in [
+            DependencySet::Runtime,
+            DependencySet::Startup,
+            DependencySet::Full,
+        ] {
+            assert!(specs_for(&config, set)
+                .iter()
+                .any(|item| item.command == "iw"));
+        }
+        config.archive.system = "none".into();
+        assert!(!specs_for(&config, DependencySet::Runtime)
+            .iter()
+            .any(|item| item.command == "iw"));
     }
 
     #[test]

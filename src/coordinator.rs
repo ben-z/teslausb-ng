@@ -64,6 +64,10 @@ impl<F: FileSystem> Coordinator<F> {
 
     pub fn run_once(&mut self) -> Result<bool> {
         install_signal_handlers();
+        if let Some(ssid) = self.archive_manager.backend().blocked_network()? {
+            eprintln!("uploads paused on blocked Wi-Fi network {ssid:?}");
+            return Ok(false);
+        }
         if !self.archive_manager.backend().is_reachable() {
             eprintln!("error: archive backend is not reachable");
             return Ok(false);
@@ -114,6 +118,11 @@ impl<F: FileSystem> Coordinator<F> {
         self.set_led(LedPattern::SlowBlink)?;
         let mut backoff = Backoff::new(self.poll_interval, self.max_idle_interval);
         while !stop.load(Ordering::SeqCst) {
+            if let Some(ssid) = self.archive_manager.backend().blocked_network()? {
+                eprintln!("uploads paused on blocked Wi-Fi network {ssid:?}");
+                wait_interruptible(self.poll_interval, stop);
+                continue;
+            }
             if self.archive_manager.backend().is_reachable() {
                 return Ok(());
             }

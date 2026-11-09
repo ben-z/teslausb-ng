@@ -44,20 +44,23 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.run_inner(program, args, timeout, false)
+        self.run_inner(program, args, timeout, false, None)
     }
 
-    pub fn run_interruptible<I, S>(
+    pub fn run_interruptible_checked<I, S>(
         &self,
         program: &str,
         args: I,
         timeout: Option<Duration>,
+        check_interval: Duration,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<CommandOutput>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.run_inner(program, args, timeout, true)
+        check()?;
+        self.run_inner(program, args, timeout, true, Some((check_interval, check)))
     }
 
     fn run_inner<I, S>(
@@ -66,6 +69,7 @@ impl CommandRunner {
         args: I,
         timeout: Option<Duration>,
         interruptible: bool,
+        mut check: Option<(Duration, &mut dyn FnMut() -> Result<()>)>,
     ) -> Result<CommandOutput>
     where
         I: IntoIterator<Item = S>,
@@ -91,11 +95,23 @@ impl CommandRunner {
         let stderr = read_pipe(child.stderr.take().expect("stderr was piped"));
         let started = Instant::now();
         let mut interrupted = false;
+        let mut check_error = None;
+        let mut last_check = started;
         let (status, timed_out) = loop {
             let status = child.try_wait()?;
             if stdout.is_finished() && stderr.is_finished() {
                 if let Some(status) = status {
                     break (status, false);
+                }
+            }
+            if let Some((interval, callback)) = &mut check {
+                if last_check.elapsed() >= *interval {
+                    if let Err(error) = callback() {
+                        check_error = Some(error);
+                        kill_process_group(child.id())?;
+                        break (child.wait()?, false);
+                    }
+                    last_check = Instant::now();
                 }
             }
             if interruptible && crate::coordinator::stop_requested() {
@@ -112,6 +128,9 @@ impl CommandRunner {
         };
         let stdout = join_reader(stdout)?;
         let stderr = join_reader(stderr)?;
+        if let Some(error) = check_error {
+            return Err(error);
+        }
         if interrupted {
             return Err(Error::new(format!("{program} stopped by shutdown request")));
         }
