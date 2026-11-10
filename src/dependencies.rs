@@ -164,7 +164,7 @@ fn add_runtime_specs(specs: &mut Vec<DependencySpec>, config: &Config) {
     add(specs, spec("parted", "parted", &["--version"], None));
     add_reflink_cp(specs);
     if config.archive.system == "rclone" {
-        if !config.archive.network.blocked_ssids.is_empty() {
+        if !config.archive.network.paused_ssids.is_empty() {
             add(specs, spec("iw", "iw", &["--version"], None));
         }
         add(
@@ -438,7 +438,7 @@ mod tests {
         assert!(!specs_for(&config, DependencySet::Runtime)
             .iter()
             .any(|item| item.command == "iw"));
-        config.archive.network.blocked_ssids.push("Hotspot".into());
+        config.archive.network.paused_ssids.push("Hotspot".into());
         for set in [
             DependencySet::Runtime,
             DependencySet::Startup,

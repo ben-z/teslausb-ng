@@ -105,9 +105,9 @@ impl<F: FileSystem> ArchiveBackend<F> {
         }
     }
 
-    pub fn blocked_network(&self) -> Result<Option<String>> {
+    pub fn paused_network(&self) -> Result<Option<String>> {
         match self {
-            Self::Rclone(backend) => backend.network.blocked_network(),
+            Self::Rclone(backend) => backend.network.paused_network(),
             _ => Ok(None),
         }
     }

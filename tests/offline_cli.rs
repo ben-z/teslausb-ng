@@ -100,7 +100,7 @@ impl Harness {
         let mut command = Command::new(env!("CARGO_BIN_EXE_teslausb"));
         command
             .args(args)
-            .env_remove("ARCHIVE_BLOCKED_SSIDS")
+            .env_remove("ARCHIVE_PAUSED_SSIDS")
             .env_remove("CAM_FILESYSTEM")
             .env_remove("RCLONE_IGNORE_SIZE")
             .env_remove("RCLONE_SIZE_ONLY")
@@ -126,10 +126,10 @@ impl Harness {
         command.spawn().unwrap()
     }
 
-    fn block_ssids(&self, ssids: &[&str]) {
+    fn pause_uploads_on_ssids(&self, ssids: &[&str]) {
         let mut content = fs::read_to_string(&self.config).unwrap();
         content.push_str(&format!(
-            "ARCHIVE_BLOCKED_SSIDS={}\n",
+            "ARCHIVE_PAUSED_SSIDS={}\n",
             serde_json::to_string(ssids).unwrap()
         ));
         fs::write(&self.config, content).unwrap();
@@ -831,22 +831,18 @@ fn offline_archive_snapshots_and_clean_with_fake_rclone() {
 }
 
 #[test]
-fn offline_blocked_wifi_prevents_network_requests_and_new_snapshots() {
+fn offline_paused_wifi_prevents_network_requests_and_new_snapshots() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
-    harness.block_ssids(&["Hotspot"]);
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
     fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
     fs::write(harness.state.join("iw-wlan1"), "Hotspot").unwrap();
     fs::write(harness.state.join("commands.log"), "").unwrap();
 
-    let blocked = harness.run(&["--config", &config, "archive"]);
-    assert!(!blocked.status.success(), "{}", describe(&blocked));
-    assert!(
-        stderr(&blocked).contains("Hotspot"),
-        "{}",
-        describe(&blocked)
-    );
+    let paused = harness.run(&["--config", &config, "archive"]);
+    assert!(!paused.status.success(), "{}", describe(&paused));
+    assert!(stderr(&paused).contains("Hotspot"), "{}", describe(&paused));
     let log = harness.command_log();
     assert!(!log.contains("rclone\tlsf"), "{log}");
     assert!(!log.contains("rclone\tcopy"), "{log}");
@@ -862,7 +858,7 @@ fn offline_blocked_wifi_prevents_network_requests_and_new_snapshots() {
 }
 
 #[test]
-fn offline_blocked_wifi_preserves_pending_upload_until_an_allowed_connection() {
+fn offline_paused_wifi_preserves_pending_upload_until_an_allowed_connection() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
@@ -874,12 +870,12 @@ fn offline_blocked_wifi_preserves_pending_upload_until_an_allowed_connection() {
     let snapshot = harness.backingfiles.join("snapshots/snap-000000");
     let retained = recovery_files(&snapshot);
     let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
-    harness.block_ssids(&["Hotspot"]);
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
     fs::write(harness.state.join("iw-wlan0"), "Hotspot").unwrap();
     fs::write(harness.state.join("commands.log"), "").unwrap();
 
-    let blocked = harness.run(&["--config", &config, "archive"]);
-    assert!(!blocked.status.success(), "{}", describe(&blocked));
+    let paused = harness.run(&["--config", &config, "archive"]);
+    assert!(!paused.status.success(), "{}", describe(&paused));
     assert_eq!(recovery_files(&snapshot), retained);
     assert!(!harness.command_log().contains("rclone\tlsf"));
     assert!(!harness.command_log().contains("rclone\tcopy"));
@@ -895,8 +891,8 @@ fn offline_blocked_wifi_preserves_pending_upload_until_an_allowed_connection() {
 }
 
 #[test]
-fn offline_blocked_wifi_matches_exact_decoded_ssids() {
-    for (ssid, blocked) in [
+fn offline_paused_wifi_matches_exact_decoded_ssids() {
+    for (ssid, paused) in [
         (r"Ben\xe2\x80\x99s iPhone", true),
         (r"\x20Hotspot\x20", true),
         (r"\x48otspot", true),
@@ -905,17 +901,17 @@ fn offline_blocked_wifi_matches_exact_decoded_ssids() {
     ] {
         let harness = Harness::new("rclone");
         let config = harness.config_arg();
-        harness.block_ssids(&["Ben’s iPhone", " Hotspot ", "Hotspot"]);
+        harness.pause_uploads_on_ssids(&["Ben’s iPhone", " Hotspot ", "Hotspot"]);
         assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
         fs::write(harness.state.join("iw-wlan0"), ssid).unwrap();
         let archive = harness.run(&["--config", &config, "archive"]);
         assert_eq!(
             !archive.status.success(),
-            blocked,
+            paused,
             "SSID {ssid:?}: {}",
             describe(&archive)
         );
-        assert_eq!(harness.command_log().contains("rclone\tcopy"), !blocked);
+        assert_eq!(harness.command_log().contains("rclone\tcopy"), !paused);
     }
 }
 
@@ -924,7 +920,7 @@ fn offline_wifi_detection_errors_prevent_uploads() {
     for fault in ["iw-error", "iw-malformed"] {
         let harness = Harness::new("rclone");
         let config = harness.config_arg();
-        harness.block_ssids(&["Hotspot"]);
+        harness.pause_uploads_on_ssids(&["Hotspot"]);
         assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
         fs::write(harness.state.join(fault), "").unwrap();
         fs::write(harness.state.join("commands.log"), "").unwrap();
@@ -940,7 +936,7 @@ fn offline_wifi_detection_errors_prevent_uploads() {
 fn offline_wifi_change_stops_active_copy_and_preserves_pending_upload() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
-    harness.block_ssids(&["Hotspot"]);
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
     fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
     assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
     fs::write(harness.state.join("commands.log"), "").unwrap();
@@ -980,7 +976,7 @@ fn offline_wifi_change_stops_active_copy_and_preserves_pending_upload() {
     assert!(stopped, "{}", describe(&output));
     assert!(
         !copy_still_running,
-        "copy process group survived blocked Wi-Fi detection"
+        "copy process group survived paused Wi-Fi detection"
     );
     assert!(!output.status.success(), "{}", describe(&output));
     assert!(stderr(&output).contains("Hotspot"), "{}", describe(&output));
@@ -999,10 +995,10 @@ fn offline_wifi_change_stops_active_copy_and_preserves_pending_upload() {
 }
 
 #[test]
-fn offline_wifi_service_resumes_without_restart_after_leaving_blocked_network() {
+fn offline_wifi_service_resumes_without_restart_after_leaving_paused_network() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
-    harness.block_ssids(&["Hotspot"]);
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
     fs::write(harness.state.join("iw-wlan0"), "Hotspot").unwrap();
     let led_path = harness.root.join("led");
     let thermal_path = harness.root.join("thermal/temp");

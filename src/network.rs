@@ -20,21 +20,21 @@ impl NetworkPolicy {
         self.config.check_interval
     }
 
-    pub fn blocked_network(&self) -> Result<Option<String>> {
-        if self.config.blocked_ssids.is_empty() {
+    pub fn paused_network(&self) -> Result<Option<String>> {
+        if self.config.paused_ssids.is_empty() {
             return Ok(None);
         }
         let devices = self.iw(&["dev"])?;
         for interface in interfaces(&devices)? {
             let link = self.iw(&["dev", interface, "link"])?;
             if let Some(ssid) = connected_ssid(&link)? {
-                if let Some(blocked) = self
+                if let Some(ssid) = self
                     .config
-                    .blocked_ssids
+                    .paused_ssids
                     .iter()
                     .find(|name| name.as_bytes() == ssid)
                 {
-                    return Ok(Some(blocked.clone()));
+                    return Ok(Some(ssid.clone()));
                 }
             }
         }
@@ -42,9 +42,9 @@ impl NetworkPolicy {
     }
 
     pub fn ensure_allowed(&self) -> Result<()> {
-        if let Some(ssid) = self.blocked_network()? {
+        if let Some(ssid) = self.paused_network()? {
             return Err(Error::new(format!(
-                "uploads paused on blocked Wi-Fi network {ssid:?}"
+                "uploads paused on Wi-Fi network {ssid:?}"
             )));
         }
         Ok(())

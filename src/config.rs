@@ -54,7 +54,7 @@ impl Default for ArchiveConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
-    pub blocked_ssids: Vec<String>,
+    pub paused_ssids: Vec<String>,
     pub check_timeout: Duration,
     pub check_interval: Duration,
 }
@@ -62,7 +62,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            blocked_ssids: Vec::new(),
+            paused_ssids: Vec::new(),
             check_timeout: Duration::from_secs(10),
             check_interval: Duration::from_secs(5),
         }
@@ -262,20 +262,20 @@ fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
         archive.rclone_flags = value.split_whitespace().map(str::to_string).collect();
     }
     validate_rclone_flags(&archive.rclone_flags)?;
-    if let Some(value) = get_var(file_values, "ARCHIVE_BLOCKED_SSIDS") {
-        archive.network.blocked_ssids = serde_json::from_str(&value).map_err(|error| {
+    if let Some(value) = get_var(file_values, "ARCHIVE_PAUSED_SSIDS") {
+        archive.network.paused_ssids = serde_json::from_str(&value).map_err(|error| {
             Error::new(format!(
-                "invalid ARCHIVE_BLOCKED_SSIDS: {error}; expected a JSON array of SSID strings"
+                "invalid ARCHIVE_PAUSED_SSIDS: {error}; expected a JSON array of SSID strings"
             ))
         })?;
         if archive
             .network
-            .blocked_ssids
+            .paused_ssids
             .iter()
             .any(|ssid| ssid.is_empty() || ssid.len() > 32)
         {
             return Err(Error::new(
-                "ARCHIVE_BLOCKED_SSIDS entries must contain 1 to 32 UTF-8 bytes",
+                "ARCHIVE_PAUSED_SSIDS entries must contain 1 to 32 UTF-8 bytes",
             ));
         }
     }
@@ -506,9 +506,9 @@ BACKINGFILES_PATH=/mnt/backing
     }
 
     #[test]
-    fn blocked_ssids_preserve_exact_names_and_reject_invalid_lists() {
+    fn paused_ssids_preserve_exact_names_and_reject_invalid_lists() {
         let values = HashMap::from([(
-            "ARCHIVE_BLOCKED_SSIDS".into(),
+            "ARCHIVE_PAUSED_SSIDS".into(),
             r#"["Ben’s iPhone", " A,b:c\\d "]"#.into(),
         )]);
         assert_eq!(
@@ -516,7 +516,7 @@ BACKINGFILES_PATH=/mnt/backing
                 .unwrap()
                 .archive
                 .network
-                .blocked_ssids,
+                .paused_ssids,
             ["Ben’s iPhone", r" A,b:c\d "]
         );
         for value in [
@@ -527,18 +527,18 @@ BACKINGFILES_PATH=/mnt/backing
             r#"[""]"#,
             &format!("[\"{}\"]", "a".repeat(33)),
         ] {
-            let values = HashMap::from([("ARCHIVE_BLOCKED_SSIDS".into(), value.into())]);
+            let values = HashMap::from([("ARCHIVE_PAUSED_SSIDS".into(), value.into())]);
             assert!(load_from_sources(&values)
                 .unwrap_err()
                 .to_string()
-                .contains("ARCHIVE_BLOCKED_SSIDS"));
+                .contains("ARCHIVE_PAUSED_SSIDS"));
         }
-        let values = HashMap::from([("ARCHIVE_BLOCKED_SSIDS".into(), "[]".into())]);
+        let values = HashMap::from([("ARCHIVE_PAUSED_SSIDS".into(), "[]".into())]);
         assert!(load_from_sources(&values)
             .unwrap()
             .archive
             .network
-            .blocked_ssids
+            .paused_ssids
             .is_empty());
     }
 
