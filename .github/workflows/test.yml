@@ -46,8 +46,9 @@ jobs:
       - name: Install Linux integration dependencies
         run: sudo apt-get update && sudo apt-get install -y xfsprogs e2fsprogs parted util-linux rclone
 
+      # Pass the toolchain paths explicitly: the runner's sudo may ignore -E.
       - name: Run Linux integration tests
-        run: scripts/run-linux-integration.sh
+        run: sudo env PATH="$PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$(rustup show home)" scripts/run-linux-integration.sh
 
       - name: Run systemd integration tests
-        run: scripts/run-systemd-integration.sh
+        run: sudo env PATH="$PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$(rustup show home)" scripts/run-systemd-integration.sh
