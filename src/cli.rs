@@ -54,6 +54,8 @@ fn run(argv: Vec<String>) -> Result<i32> {
         "gadget" => cmd_gadget(&parsed),
         "service" => cmd_service(&parsed),
         "doctor" => cmd_doctor(&parsed),
+        "config" => cmd_config_install(&parsed),
+        "wifi-priorities" => cmd_wifi_priorities(&parsed),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(0)
@@ -116,6 +118,12 @@ fn validate_args(args: &GlobalArgs) -> Result<()> {
         "status" | "snapshots" => (&["--json"], &[], &args.args),
         "clean" => (&["--dry-run"], &[], &args.args),
         "doctor" => (&["--startup"], &[], &args.args),
+        "wifi-priorities" => (&[], &["--supplicant-config"], &args.args),
+        "config" => (
+            &[],
+            &["--base", "--private", "--output"],
+            args.args.get(1..).unwrap_or(&[]),
+        ),
         "gadget" | "service" => {
             let options = args.args.get(1..).unwrap_or(&[]);
             match (args.command.as_str(), args.args.first().map(String::as_str)) {
@@ -149,6 +157,33 @@ fn archive_lock(config: &Config) -> Result<<RealFileSystem as FileSystem>::Lock>
 
 fn config(args: &GlobalArgs) -> Result<Config> {
     load_config(args.config_path.as_deref())
+}
+
+fn required_path(args: &[String], name: &str) -> Result<PathBuf> {
+    parse_optional_value(args, name)?
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new(format!("{name} requires a path")))
+}
+
+fn cmd_config_install(args: &GlobalArgs) -> Result<i32> {
+    if args.args.first().map(String::as_str) != Some("install") {
+        return Err(Error::new("config requires the install subcommand"));
+    }
+    crate::device_config::install(
+        &required_path(&args.args[1..], "--base")?,
+        &required_path(&args.args[1..], "--private")?,
+        &required_path(&args.args[1..], "--output")?,
+    )?;
+    println!("Device configuration installed with private permissions");
+    Ok(0)
+}
+
+fn cmd_wifi_priorities(args: &GlobalArgs) -> Result<i32> {
+    let config = config(args).map_err(crate::device_config::safe_validation_error)?;
+    let path = required_path(&args.args, "--supplicant-config")?;
+    let count = crate::wifi::apply_priorities(&path, &config.archive.network)?;
+    println!("Wi-Fi priorities configured for {count} saved networks");
+    Ok(0)
 }
 
 fn create_archive_manager(config: &Config) -> Result<ArchiveManager<RealFileSystem>> {
@@ -942,7 +977,9 @@ Commands:\n\
   clean [--dry-run]          Remove incomplete snapshots; preserve pending uploads\n\
   gadget <on|off|status>     Manage USB mass storage gadget\n\
   service <install|uninstall|status>\n\
-  doctor [--startup]         Check external dependencies\n"
+  doctor [--startup]         Check external dependencies\n\
+  config install --base PATH --private PATH --output PATH\n\
+  wifi-priorities --supplicant-config PATH\n"
     );
 }
 

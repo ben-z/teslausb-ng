@@ -1,0 +1,5 @@
+# Copy this to a root-owned file on the device with mode 0600.
+# Populate it there; do not commit a populated copy.
+RCLONE_DRIVE=example-remote
+RCLONE_PATH=/ExampleArchive
+ARCHIVE_PAUSED_SSIDS='["Example Mobile Wi-Fi"]'

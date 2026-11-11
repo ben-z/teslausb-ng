@@ -55,6 +55,8 @@ impl Default for ArchiveConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
     pub paused_ssids: Vec<String>,
+    pub wifi_default_priority: i32,
+    pub wifi_paused_priority: i32,
     pub check_timeout: Duration,
     pub check_interval: Duration,
 }
@@ -63,6 +65,8 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             paused_ssids: Vec::new(),
+            wifi_default_priority: 0,
+            wifi_paused_priority: -10,
             check_timeout: Duration::from_secs(10),
             check_interval: Duration::from_secs(5),
         }
@@ -131,6 +135,10 @@ impl Config {
         }
         if self.archive.system == "rclone" && self.archive.rclone_drive.trim().is_empty() {
             warnings.push("ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE".to_string());
+        }
+        if self.archive.network.wifi_paused_priority >= self.archive.network.wifi_default_priority {
+            warnings
+                .push("WIFI_PAUSED_PRIORITY must be lower than WIFI_DEFAULT_PRIORITY".to_string());
         }
         warnings
     }
@@ -233,36 +241,47 @@ pub(crate) fn validate_rclone_environment() -> Result<()> {
     Ok(())
 }
 
-fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
-    if file_values.contains_key("CAM_FILESYSTEM") || env::var_os("CAM_FILESYSTEM").is_some() {
-        return Err(Error::new(
-            "CAM_FILESYSTEM is no longer supported; remove it from the configuration and environment. TeslaUSB requires an ext4 camera image; preserve and migrate any existing FAT32 image before use",
-        ));
+const UNSUPPORTED_CAM_FILESYSTEM: &str = "CAM_FILESYSTEM is no longer supported; remove it from the configuration and environment. TeslaUSB requires an ext4 camera image; preserve and migrate any existing FAT32 image before use";
+
+pub(crate) fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
+    if env::var_os("CAM_FILESYSTEM").is_some() {
+        return Err(Error::new(UNSUPPORTED_CAM_FILESYSTEM));
+    }
+    load_values(|key| get_var(file_values, key))
+}
+
+pub(crate) fn load_from_file_values(file_values: &HashMap<String, String>) -> Result<Config> {
+    load_values(|key| file_values.get(key).cloned())
+}
+
+fn load_values(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
+    if get("CAM_FILESYSTEM").is_some() {
+        return Err(Error::new(UNSUPPORTED_CAM_FILESYSTEM));
     }
     let mut config = Config::default();
     let mut archive = ArchiveConfig::default();
 
-    if let Some(value) = get_var(file_values, "MUTABLE_PATH") {
+    if let Some(value) = get("MUTABLE_PATH") {
         config.mutable_path = PathBuf::from(value);
     }
-    if let Some(value) = get_var(file_values, "BACKINGFILES_PATH") {
+    if let Some(value) = get("BACKINGFILES_PATH") {
         config.backingfiles_path = PathBuf::from(value);
     }
 
-    if let Some(value) = get_var(file_values, "ARCHIVE_SYSTEM") {
+    if let Some(value) = get("ARCHIVE_SYSTEM") {
         archive.system = value.to_ascii_lowercase();
     }
-    if let Some(value) = get_var(file_values, "RCLONE_DRIVE") {
+    if let Some(value) = get("RCLONE_DRIVE") {
         archive.rclone_drive = value;
     }
-    if let Some(value) = get_var(file_values, "RCLONE_PATH") {
+    if let Some(value) = get("RCLONE_PATH") {
         archive.rclone_path = value;
     }
-    if let Some(value) = get_var(file_values, "RCLONE_FLAGS") {
+    if let Some(value) = get("RCLONE_FLAGS") {
         archive.rclone_flags = value.split_whitespace().map(str::to_string).collect();
     }
     validate_rclone_flags(&archive.rclone_flags)?;
-    if let Some(value) = get_var(file_values, "ARCHIVE_PAUSED_SSIDS") {
+    if let Some(value) = get("ARCHIVE_PAUSED_SSIDS") {
         archive.network.paused_ssids = serde_json::from_str(&value).map_err(|error| {
             Error::new(format!(
                 "invalid ARCHIVE_PAUSED_SSIDS: {error}; expected a JSON array of SSID strings"
@@ -280,24 +299,37 @@ fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
         }
     }
 
-    archive.archive_recent = get_bool(file_values, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
-    archive.archive_saved = get_bool(file_values, "ARCHIVE_SAVEDCLIPS", archive.archive_saved)?;
-    archive.archive_sentry = get_bool(file_values, "ARCHIVE_SENTRYCLIPS", archive.archive_sentry)?;
-    archive.archive_track = get_bool(file_values, "ARCHIVE_TRACKMODECLIPS", archive.archive_track)?;
-    archive.archive_photobooth = get_bool(
-        file_values,
-        "ARCHIVE_PHOTOBOOTH",
-        archive.archive_photobooth,
-    )?;
+    for (key, priority) in [
+        (
+            "WIFI_DEFAULT_PRIORITY",
+            &mut archive.network.wifi_default_priority,
+        ),
+        (
+            "WIFI_PAUSED_PRIORITY",
+            &mut archive.network.wifi_paused_priority,
+        ),
+    ] {
+        if let Some(value) = get(key) {
+            *priority = value
+                .parse()
+                .map_err(|error| Error::new(format!("invalid {key}: {error}")))?;
+        }
+    }
 
-    if let Some(value) = get_var(file_values, "EVENT_STABILITY_SECONDS") {
+    archive.archive_recent = get_bool(&get, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
+    archive.archive_saved = get_bool(&get, "ARCHIVE_SAVEDCLIPS", archive.archive_saved)?;
+    archive.archive_sentry = get_bool(&get, "ARCHIVE_SENTRYCLIPS", archive.archive_sentry)?;
+    archive.archive_track = get_bool(&get, "ARCHIVE_TRACKMODECLIPS", archive.archive_track)?;
+    archive.archive_photobooth = get_bool(&get, "ARCHIVE_PHOTOBOOTH", archive.archive_photobooth)?;
+
+    if let Some(value) = get("EVENT_STABILITY_SECONDS") {
         archive.event_stability =
             Duration::from_secs(value.parse().map_err(|error| {
                 Error::new(format!("invalid EVENT_STABILITY_SECONDS: {error}"))
             })?);
     }
 
-    if let Some(value) = get_var(file_values, "TESLAUSB_IDLE_TIMEOUT_SECS") {
+    if let Some(value) = get("TESLAUSB_IDLE_TIMEOUT_SECS") {
         let seconds: u64 = value
             .parse()
             .map_err(|error| Error::new(format!("invalid TESLAUSB_IDLE_TIMEOUT_SECS: {error}")))?;
@@ -315,8 +347,8 @@ fn get_var(file_values: &HashMap<String, String>, key: &str) -> Option<String> {
     file_values.get(key).cloned().or_else(|| env::var(key).ok())
 }
 
-fn get_bool(file_values: &HashMap<String, String>, key: &str, default: bool) -> Result<bool> {
-    match get_var(file_values, key) {
+fn get_bool(get: &impl Fn(&str) -> Option<String>, key: &str, default: bool) -> Result<bool> {
+    match get(key) {
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
         Some(value) => Err(Error::new(format!(
@@ -334,8 +366,11 @@ fn parse_config_file(path: &Path) -> Result<HashMap<String, String>> {
             e
         ))
     })?;
-    let mut values = HashMap::new();
+    parse_config_content(&content, path)
+}
 
+pub(crate) fn parse_config_content(content: &str, path: &Path) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::new();
     for (index, raw_line) in content.lines().enumerate() {
         let mut line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -503,6 +538,36 @@ BACKINGFILES_PATH=/mnt/backing
         );
         assert_eq!(config.mutable_path, PathBuf::from("/var/lib/teslausb"));
         assert_eq!(config.backingfiles_path, PathBuf::from("/mnt/backing"));
+    }
+
+    #[test]
+    fn wifi_priorities_are_configurable_and_paused_networks_must_rank_lower() {
+        let values = HashMap::from([
+            ("WIFI_DEFAULT_PRIORITY".into(), "100".into()),
+            ("WIFI_PAUSED_PRIORITY".into(), "0".into()),
+        ]);
+        let config = load_from_sources(&values).unwrap();
+        assert_eq!(config.archive.network.wifi_default_priority, 100);
+        assert_eq!(config.archive.network.wifi_paused_priority, 0);
+        assert!(config.warnings().is_empty());
+        for value in ["100", "101"] {
+            let mut invalid = values.clone();
+            invalid.insert("WIFI_PAUSED_PRIORITY".into(), value.into());
+            assert!(load_from_sources(&invalid)
+                .unwrap()
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("WIFI_PAUSED_PRIORITY")));
+        }
+        for key in ["WIFI_DEFAULT_PRIORITY", "WIFI_PAUSED_PRIORITY"] {
+            for value in ["invalid", "2147483648"] {
+                let invalid = HashMap::from([(key.into(), value.into())]);
+                assert!(load_from_sources(&invalid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(key));
+            }
+        }
     }
 
     #[test]
