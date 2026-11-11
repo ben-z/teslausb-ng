@@ -39,10 +39,10 @@ pub fn install(base: &Path, private: &Path, output: &Path) -> Result<()> {
         }
     }
     values.extend(private_values);
-    let config = load_from_file_values(&values).map_err(safe_validation_error)?;
+    let config = load_from_file_values(&values)?;
     let warnings = config.warnings();
     if !warnings.is_empty() {
-        return Err(safe_validation_error(Error::new(warnings.join("; "))));
+        return Err(Error::new(warnings.join("; ")));
     }
 
     match fs::symlink_metadata(output) {
@@ -68,27 +68,6 @@ pub fn install(base: &Path, private: &Path, output: &Path) -> Result<()> {
     }
     merged.push_str(&private_text);
     write_private_atomic(output, &merged)
-}
-
-pub(crate) fn safe_validation_error(error: Error) -> Error {
-    let message = error.to_string();
-    if message.starts_with("Unknown archive system:") {
-        return Error::new("ARCHIVE_SYSTEM must be rclone or none");
-    }
-    if message.starts_with("invalid ARCHIVE_PAUSED_SSIDS:")
-        || message.starts_with("ARCHIVE_PAUSED_SSIDS entries")
-    {
-        return Error::new(
-            "ARCHIVE_PAUSED_SSIDS must be a JSON array of SSID strings containing 1 to 32 UTF-8 bytes each",
-        );
-    }
-    if message.ends_with("remove it from RCLONE_FLAGS") {
-        return Error::new("RCLONE_FLAGS contains an option reserved for archive verification");
-    }
-    if let Some((key, _)) = message.split_once(" must be true or false") {
-        return Error::new(format!("{key} must be true or false"));
-    }
-    error
 }
 
 pub(crate) fn read_private_text(path: &Path) -> Result<String> {

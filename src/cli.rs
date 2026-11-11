@@ -179,7 +179,7 @@ fn cmd_config_install(args: &GlobalArgs) -> Result<i32> {
 }
 
 fn cmd_wifi_priorities(args: &GlobalArgs) -> Result<i32> {
-    let config = config(args).map_err(crate::device_config::safe_validation_error)?;
+    let config = config(args)?;
     let path = required_path(&args.args, "--supplicant-config")?;
     let count = crate::wifi::apply_priorities(&path, &config.archive.network)?;
     println!("Wi-Fi priorities configured for {count} saved networks");
@@ -311,9 +311,6 @@ fn cmd_run(args: &GlobalArgs) -> Result<i32> {
     ensure_dependencies(&config, DependencySet::Runtime)?;
     ensure_mounted(&config)?;
     let _archive_lock = archive_lock(&config)?;
-    for warning in config.warnings() {
-        eprintln!("warning: {}", warning);
-    }
     let archive_manager = create_archive_manager(&config)?;
     let temperature_monitor = SysfsTemperatureMonitor::default_sysfs(TemperatureConfig::default());
     let temperature_guard = temperature_monitor.start()?;
@@ -343,7 +340,7 @@ fn cmd_archive(args: &GlobalArgs) -> Result<i32> {
 fn cmd_status(args: &GlobalArgs) -> Result<i32> {
     let json = has_flag(&args.args, "--json");
     let config = config(args)?;
-    let mut warnings = config.warnings();
+    let mut warnings = Vec::new();
     let mounted = is_mounted(&config.backingfiles_path)?;
     if mounted {
         if let Err(error) = validate_camera_image(&RealFileSystem, &config.cam_disk_path()) {
@@ -611,10 +608,6 @@ fn cmd_doctor(args: &GlobalArgs) -> Result<i32> {
             dependency_detail(&report)
         );
         failed |= !report.ok;
-    }
-    for warning in config.warnings() {
-        println!("warning: {}", warning);
-        failed = true;
     }
     println!(
         "USB gadget UDC: {}",
