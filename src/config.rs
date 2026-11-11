@@ -131,7 +131,7 @@ impl Config {
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if !matches!(self.archive.system.as_str(), "rclone" | "none") {
-            warnings.push(format!("Unknown archive system: {}", self.archive.system));
+            warnings.push("ARCHIVE_SYSTEM must be rclone or none".to_string());
         }
         if self.archive.system == "rclone" && self.archive.rclone_drive.trim().is_empty() {
             warnings.push("ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE".to_string());
@@ -222,9 +222,9 @@ pub(crate) fn validate_rclone_flags(flags: &[String]) -> Result<()> {
                 .iter()
                 .any(|(option, _)| name == *option)
         {
-            return Err(Error::new(format!(
-                "{flag} is reserved for TeslaUSB archive verification; remove it from RCLONE_FLAGS"
-            )));
+            return Err(Error::new(
+                "RCLONE_FLAGS contains an option reserved for archive verification",
+            ));
         }
     }
     Ok(())
@@ -242,6 +242,8 @@ pub(crate) fn validate_rclone_environment() -> Result<()> {
 }
 
 const UNSUPPORTED_CAM_FILESYSTEM: &str = "CAM_FILESYSTEM is no longer supported; remove it from the configuration and environment. TeslaUSB requires an ext4 camera image; preserve and migrate any existing FAT32 image before use";
+const INVALID_PAUSED_SSIDS: &str =
+    "ARCHIVE_PAUSED_SSIDS must be a JSON array of SSID strings containing 1 to 32 UTF-8 bytes each";
 
 pub(crate) fn load_from_sources(file_values: &HashMap<String, String>) -> Result<Config> {
     if env::var_os("CAM_FILESYSTEM").is_some() {
@@ -282,20 +284,15 @@ fn load_values(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
     }
     validate_rclone_flags(&archive.rclone_flags)?;
     if let Some(value) = get("ARCHIVE_PAUSED_SSIDS") {
-        archive.network.paused_ssids = serde_json::from_str(&value).map_err(|error| {
-            Error::new(format!(
-                "invalid ARCHIVE_PAUSED_SSIDS: {error}; expected a JSON array of SSID strings"
-            ))
-        })?;
+        archive.network.paused_ssids =
+            serde_json::from_str(&value).map_err(|_| Error::new(INVALID_PAUSED_SSIDS))?;
         if archive
             .network
             .paused_ssids
             .iter()
             .any(|ssid| ssid.is_empty() || ssid.len() > 32)
         {
-            return Err(Error::new(
-                "ARCHIVE_PAUSED_SSIDS entries must contain 1 to 32 UTF-8 bytes",
-            ));
+            return Err(Error::new(INVALID_PAUSED_SSIDS));
         }
     }
 
@@ -351,9 +348,7 @@ fn get_bool(get: &impl Fn(&str) -> Option<String>, key: &str, default: bool) -> 
     match get(key) {
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(value) => Err(Error::new(format!(
-            "{key} must be true or false, got {value:?}"
-        ))),
+        Some(_) => Err(Error::new(format!("{key} must be true or false"))),
         None => Ok(default),
     }
 }
@@ -503,7 +498,7 @@ mod tests {
         assert!(config
             .warnings()
             .iter()
-            .any(|warning| warning.contains("Unknown archive system")));
+            .any(|warning| warning.contains("ARCHIVE_SYSTEM must be rclone or none")));
 
         config.archive.system = "rclone".into();
         assert!(config

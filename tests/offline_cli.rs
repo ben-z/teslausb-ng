@@ -440,7 +440,7 @@ fn offline_unsupported_camera_filesystem_stops_before_mount_or_upload() {
 #[test]
 fn offline_invalid_archive_settings_fail_before_commands_or_disk_changes() {
     for (system, drive, expected_error) in [
-        ("rcloen", "remote", "Unknown archive system: rcloen"),
+        ("rcloen", "remote", "ARCHIVE_SYSTEM must be rclone or none"),
         ("rclone", "", "ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE"),
         (
             "rclone",
@@ -1156,24 +1156,31 @@ fn offline_wifi_service_resumes_without_restart_after_leaving_paused_network() {
     fs::write(harness.state.join("commands.log"), "").unwrap();
     let led_path = led_path.display().to_string();
     let thermal_path = thermal_path.display().to_string();
-    let mut child = harness.spawn_with_env(
-        &["--config", &config, "run"],
-        &[
-            ("TESLAUSB_LED_PATH", &led_path),
-            ("TESLAUSB_THERMAL_PATH", &thermal_path),
+    let stderr_path = harness.state.join("service.stderr");
+    let mut child = harness
+        .command(&["--config", &config, "run"])
+        .envs([
+            ("TESLAUSB_LED_PATH", led_path.as_str()),
+            ("TESLAUSB_THERMAL_PATH", thermal_path.as_str()),
             ("TESLAUSB_IDLE_TIMEOUT_SECS", "1"),
-        ],
-    );
-    let inspected = wait_until(
-        || harness.command_log().contains("iw\tdev\twlan0\tlink"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    let paused = wait_until(
+        || {
+            fs::read_to_string(&stderr_path)
+                .unwrap()
+                .contains("uploads paused")
+        },
         Duration::from_secs(10),
     );
-    if !inspected {
+    if !paused {
         terminate_child(&mut child);
-        panic!(
-            "service did not inspect Wi-Fi: {}",
-            describe(&child.wait_with_output().unwrap())
-        );
+        let mut output = child.wait_with_output().unwrap();
+        output.stderr = fs::read(&stderr_path).unwrap();
+        panic!("service did not pause uploads: {}", describe(&output));
     }
     assert!(!harness.command_log().contains("rclone\tlsf"));
     assert!(!harness.command_log().contains("rclone\tcopy"));
@@ -1186,7 +1193,8 @@ fn offline_wifi_service_resumes_without_restart_after_leaving_paused_network() {
         Duration::from_secs(30),
     );
     terminate_child(&mut child);
-    let output = child.wait_with_output().unwrap();
+    let mut output = child.wait_with_output().unwrap();
+    output.stderr = fs::read(&stderr_path).unwrap();
     assert!(resumed, "service did not resume: {}", describe(&output));
     assert_success(&output);
     assert!(

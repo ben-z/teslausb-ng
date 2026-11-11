@@ -141,10 +141,10 @@ fn assert_success(output: &Output) {
 
 fn assert_private_error(output: &Output, private_values: &[&str]) {
     assert!(!output.status.success(), "{}", describe(output));
-    let diagnostic = describe(output);
+    let diagnostic = describe(output).to_lowercase();
     for value in private_values {
         assert!(
-            !diagnostic.contains(value),
+            !diagnostic.contains(&value.to_lowercase()),
             "private value appeared in CLI output"
         );
     }
@@ -351,39 +351,54 @@ fn wifi_priorities_reject_malformed_or_public_files_without_changing_them() {
 }
 
 #[test]
-fn wifi_priorities_redact_invalid_private_settings_without_changing_saved_networks() {
+fn invalid_private_settings_are_redacted_before_any_cli_work() {
     let fixture = Fixture::new();
     let original =
         "network={\nssid=\"Example Trusted\"\npsk=\"fictional-authentication-value\"\n}\n";
     write_private(&fixture.supplicant, original);
-    for (invalid, key) in [
-        (
-            "ARCHIVE_PAUSED_SSIDS='\"PRIVATE-SENTINEL\"'\n",
-            "ARCHIVE_PAUSED_SSIDS",
-        ),
-        (
-            "ARCHIVE_RECENTCLIPS=PRIVATE-SENTINEL\n",
-            "ARCHIVE_RECENTCLIPS",
-        ),
-        ("RCLONE_FLAGS=--checksum=PRIVATE-SENTINEL\n", "RCLONE_FLAGS"),
-        ("ARCHIVE_SYSTEM=PRIVATE-SENTINEL\n", "ARCHIVE_SYSTEM"),
+    for (key, value) in [
+        ("ARCHIVE_PAUSED_SSIDS", "\"PRIVATE-SENTINEL\""),
+        ("ARCHIVE_RECENTCLIPS", "PRIVATE-SENTINEL"),
+        ("RCLONE_FLAGS", "--checksum=PRIVATE-SENTINEL"),
+        ("ARCHIVE_SYSTEM", "PRIVATE-SENTINEL"),
     ] {
-        write_private(&fixture.private, &format!("ARCHIVE_SYSTEM=none\n{invalid}"));
-        let output = fixture.apply_priorities();
-        assert_private_error(
-            &output,
-            &[
-                "PRIVATE-SENTINEL",
-                "Example Trusted",
-                "fictional-authentication-value",
-            ],
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(key),
-            "{}",
-            describe(&output)
-        );
-        assert_eq!(fs::read_to_string(&fixture.supplicant).unwrap(), original);
+        for in_file in [true, false] {
+            let content = if in_file {
+                format!("{key}='{value}'\n")
+            } else {
+                String::new()
+            };
+            write_private(&fixture.private, &content);
+            let environment = if in_file { vec![] } else { vec![(key, value)] };
+            for command in [
+                "wifi-priorities",
+                "init",
+                "archive",
+                "run",
+                "status",
+                "doctor",
+            ] {
+                let mut args = vec!["--config", path(&fixture.private), command];
+                if command == "wifi-priorities" {
+                    args.extend(["--supplicant-config", path(&fixture.supplicant)]);
+                }
+                let output = fixture.run_with_env(&args, &environment);
+                assert_private_error(
+                    &output,
+                    &[
+                        "PRIVATE-SENTINEL",
+                        "Example Trusted",
+                        "fictional-authentication-value",
+                    ],
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(key),
+                    "{}",
+                    describe(&output)
+                );
+                assert_eq!(fs::read_to_string(&fixture.supplicant).unwrap(), original);
+            }
+        }
     }
 }
 

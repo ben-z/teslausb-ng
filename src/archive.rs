@@ -1348,7 +1348,11 @@ mod tests {
             let result = backend.copy_directory(Path::new("/camera"), "SavedClips");
             assert!(!result.success, "{flag}");
             assert!(result.archived_files.is_empty(), "{flag}");
-            assert!(result.error.unwrap().contains(flag), "{flag}");
+            let error = result.error.unwrap();
+            assert!(
+                error.contains("RCLONE_FLAGS") && error.contains("reserved"),
+                "{flag}"
+            );
             assert_eq!(
                 fs.read_bytes("/camera/front.mp4").unwrap(),
                 b"preserved recording"
