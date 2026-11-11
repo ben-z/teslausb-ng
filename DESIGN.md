@@ -73,7 +73,7 @@ still matters.
 ## Archive Cycle
 
 ```text
-wait until archive is reachable
+wait until the connected Wi-Fi networks permit uploads and the archive is reachable
 set status LED to slow blink
 set status LED to fast blink while the archive cycle runs
 reuse the oldest pending snapshot, if any

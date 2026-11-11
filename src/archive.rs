@@ -8,6 +8,7 @@ use crate::config::{validate_rclone_environment, validate_rclone_flags, ArchiveC
 use crate::error::{Error, Result};
 use crate::filesystem::FileSystem;
 use crate::mount::mount_snapshot;
+use crate::network::NetworkPolicy;
 use crate::snapshot::{Snapshot, SnapshotHandle, SnapshotManager};
 
 pub fn format_size(bytes: u64) -> String {
@@ -90,15 +91,24 @@ pub enum ArchiveBackend<F: FileSystem> {
 impl<F: FileSystem> ArchiveBackend<F> {
     pub fn from_config(config: &ArchiveConfig, fs: F) -> Self {
         if config.system == "rclone" {
-            Self::Rclone(RcloneBackend::new(
+            let backend = RcloneBackend::new(
+                &config.network,
                 config.rclone_drive.clone(),
                 config.rclone_path.clone(),
                 config.rclone_flags.clone(),
                 config.copy_timeout,
                 fs,
-            ))
+            );
+            Self::Rclone(backend)
         } else {
             Self::None
+        }
+    }
+
+    pub fn paused_network(&self) -> Result<Option<String>> {
+        match self {
+            Self::Rclone(backend) => backend.network.paused_network(),
+            _ => Ok(None),
         }
     }
 
@@ -216,6 +226,7 @@ impl MockArchiveBackend {
 
 #[derive(Debug, Clone)]
 pub struct RcloneBackend<F: FileSystem> {
+    network: NetworkPolicy,
     remote: String,
     path: String,
     flags: Vec<String>,
@@ -224,8 +235,16 @@ pub struct RcloneBackend<F: FileSystem> {
 }
 
 impl<F: FileSystem> RcloneBackend<F> {
-    pub fn new(remote: String, path: String, flags: Vec<String>, timeout: Duration, fs: F) -> Self {
+    pub fn new(
+        network: &crate::config::NetworkConfig,
+        remote: String,
+        path: String,
+        flags: Vec<String>,
+        timeout: Duration,
+        fs: F,
+    ) -> Self {
         Self {
+            network: NetworkPolicy::new(network),
             remote,
             path: path.trim_matches('/').to_string(),
             flags,
@@ -259,14 +278,19 @@ impl<F: FileSystem> RcloneBackend<F> {
     }
 
     pub fn is_reachable(&self) -> bool {
-        CommandRunner
-            .run_interruptible(
-                "rclone",
-                ["lsf", &self.remote_with_colon(), "--max-depth", "1"],
-                Some(Duration::from_secs(30)),
-            )
-            .map(|output| output.success())
-            .unwrap_or(false)
+        match CommandRunner.run_interruptible_checked(
+            "rclone",
+            ["lsf", &self.remote_with_colon(), "--max-depth", "1"],
+            Some(Duration::from_secs(30)),
+            self.network.check_interval(),
+            &mut || self.network.ensure_allowed(),
+        ) {
+            Ok(output) => output.success(),
+            Err(error) => {
+                eprintln!("archive reachability check failed: {error}");
+                false
+            }
+        }
     }
 
     pub fn copy_directory(&self, src: &Path, dst_name: &str) -> CopyResult {
@@ -364,10 +388,12 @@ impl<F: FileSystem> RcloneBackend<F> {
         if let Some(path) = file_list {
             args.extend(["--files-from-raw".to_string(), path.display().to_string()]);
         }
-        let output = CommandRunner.run_interruptible(
+        let output = CommandRunner.run_interruptible_checked(
             "rclone",
             args.iter().map(String::as_str),
             Some(self.timeout),
+            self.network.check_interval(),
+            &mut || self.network.ensure_allowed(),
         )?;
         let diagnostics = combined_command_output(&output);
         if !diagnostics.trim().is_empty() {
@@ -1312,6 +1338,7 @@ mod tests {
             let fs = MockFileSystem::new();
             fs.write_bytes("/camera/front.mp4", b"preserved recording");
             let backend = RcloneBackend::new(
+                &crate::config::NetworkConfig::default(),
                 "archive".into(),
                 "TeslaCam".into(),
                 vec![flag.into()],
@@ -1479,6 +1506,7 @@ mod tests {
     fn rclone_destination_building_matches_expected_paths() {
         let fs = MockFileSystem::new();
         let remote_only = RcloneBackend::new(
+            &crate::config::NetworkConfig::default(),
             "gdrive".into(),
             "".into(),
             Vec::new(),
@@ -1489,6 +1517,7 @@ mod tests {
         assert_eq!(remote_only.destination("SavedClips"), "gdrive:SavedClips");
 
         let with_path = RcloneBackend::new(
+            &crate::config::NetworkConfig::default(),
             "gdrive:".into(),
             "/TeslaCam/archive/".into(),
             Vec::new(),
@@ -1511,6 +1540,7 @@ mod tests {
         fs.write_bytes("/clips/event1/event.json", b"{}");
 
         let backend = RcloneBackend::new(
+            &crate::config::NetworkConfig::default(),
             "gdrive".into(),
             "".into(),
             Vec::new(),

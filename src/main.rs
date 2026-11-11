@@ -10,6 +10,7 @@ mod gadget;
 mod idle;
 mod led;
 mod mount;
+mod network;
 mod snapshot;
 mod space;
 mod temperature;

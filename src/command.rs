@@ -44,20 +44,23 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.run_inner(program, args, timeout, false)
+        self.run_inner(program, args, timeout, false, None)
     }
 
-    pub fn run_interruptible<I, S>(
+    pub fn run_interruptible_checked<I, S>(
         &self,
         program: &str,
         args: I,
         timeout: Option<Duration>,
+        check_interval: Duration,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<CommandOutput>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.run_inner(program, args, timeout, true)
+        check()?;
+        self.run_inner(program, args, timeout, true, Some((check_interval, check)))
     }
 
     fn run_inner<I, S>(
@@ -66,11 +69,15 @@ impl CommandRunner {
         args: I,
         timeout: Option<Duration>,
         interruptible: bool,
+        mut check: Option<(Duration, &mut dyn FnMut() -> Result<()>)>,
     ) -> Result<CommandOutput>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        if interruptible && crate::coordinator::stop_requested() {
+            return Err(Error::new(format!("{program} stopped by shutdown request")));
+        }
         let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
         let mut child = Command::new(program)
             .args(&args)
@@ -91,6 +98,8 @@ impl CommandRunner {
         let stderr = read_pipe(child.stderr.take().expect("stderr was piped"));
         let started = Instant::now();
         let mut interrupted = false;
+        let mut check_error = None;
+        let mut last_check = started;
         let (status, timed_out) = loop {
             let status = child.try_wait()?;
             if stdout.is_finished() && stderr.is_finished() {
@@ -108,10 +117,23 @@ impl CommandRunner {
                 kill_process_group(child.id())?;
                 break (child.wait()?, true);
             }
+            if let Some((interval, callback)) = &mut check {
+                if last_check.elapsed() >= *interval {
+                    if let Err(error) = callback() {
+                        check_error = Some(error);
+                        kill_process_group(child.id())?;
+                        break (child.wait()?, false);
+                    }
+                    last_check = Instant::now();
+                }
+            }
             thread::sleep(Duration::from_millis(50));
         };
         let stdout = join_reader(stdout)?;
         let stderr = join_reader(stderr)?;
+        if let Some(error) = check_error {
+            return Err(error);
+        }
         if interrupted {
             return Err(Error::new(format!("{program} stopped by shutdown request")));
         }
@@ -133,19 +155,34 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let args_vec: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
-        let output = self.run(program, args_vec.iter().map(String::as_str), timeout)?;
-        if output.success() {
-            Ok(output)
-        } else if output.timed_out {
-            Err(Error::new(format!("{} timed out", program)))
-        } else {
-            Err(Error::new(format!(
-                "{} failed: {}",
-                program,
-                output.last_error_line()
-            )))
-        }
+        check_output(program, self.run(program, args, timeout)?)
+    }
+
+    pub fn check_interruptible<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        timeout: Option<Duration>,
+    ) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        check_output(program, self.run_inner(program, args, timeout, true, None)?)
+    }
+}
+
+fn check_output(program: &str, output: CommandOutput) -> Result<CommandOutput> {
+    if output.success() {
+        Ok(output)
+    } else if output.timed_out {
+        Err(Error::new(format!("{} timed out", program)))
+    } else {
+        Err(Error::new(format!(
+            "{} failed: {}",
+            program,
+            output.last_error_line()
+        )))
     }
 }
 
@@ -291,6 +328,25 @@ mod tests {
             .unwrap();
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn expired_timeout_takes_precedence_over_periodic_checks() {
+        let mut checks = 0;
+        let output = CommandRunner
+            .run_interruptible_checked(
+                "sh",
+                ["-c", "sleep 30"],
+                Some(Duration::ZERO),
+                Duration::ZERO,
+                &mut || {
+                    checks += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(output.timed_out);
+        assert_eq!(checks, 1, "only the preflight check should run");
     }
 
     #[test]

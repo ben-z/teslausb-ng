@@ -201,6 +201,7 @@ Required minimum versions are rclone 1.50.0, XFS tools 4.9.0, and GNU coreutils
 | `ARCHIVE_SYSTEM` | `rclone` or `none` | `none` |
 | `RCLONE_DRIVE` | rclone remote name | |
 | `RCLONE_PATH` | Path within the remote | |
+| `ARCHIVE_PAUSED_SSIDS` | JSON array of Wi-Fi network names on which uploads pause | `[]` |
 | `RCLONE_FLAGS` | Extra rclone flags, separated by whitespace | |
 | `ARCHIVE_SAVEDCLIPS` | Archive SavedClips | `true` |
 | `ARCHIVE_SENTRYCLIPS` | Archive SentryClips | `true` |
@@ -220,6 +221,35 @@ can be removed from the camera disk. `RCLONE_FLAGS` must not contain `--checksum
 `--retries`. Their native `RCLONE_*` environment variables must also be unset.
 Each copy batch has one high-level attempt; rclone retains its low-level request
 retries, and teslausb retries the pending snapshot after a failed archive.
+
+### Pause Uploads on Mobile Hotspots
+
+Add the exact Wi-Fi names to `/etc/teslausb.conf`, for example:
+
+```text
+ARCHIVE_PAUSED_SSIDS='["Ben’s iPhone", "Travel Hotspot"]'
+```
+
+Install `iw` (`sudo apt install iw`) and restart the service after changing the
+configuration. Names are case-sensitive; spaces, punctuation, and Unicode are
+preserved. The setting also works as an environment variable. An empty list
+keeps uploads unrestricted and requires no additional tools.
+
+The service pauses uploads whenever any connected Wi-Fi interface uses a listed
+SSID, even if Ethernet is also connected. USB recording continues and pending
+archive snapshots remain available for retry. The service checks again every
+five seconds and resumes automatically on an allowed network. Manual
+`teslausb archive` exits unsuccessfully with a pause message on a listed network.
+`status` also avoids contacting the archive on a listed network.
+
+The policy uses `iw dev` and `iw dev <interface> link`, independently of the
+network manager. Failed or unrecognized network detection stops uploads with an
+error. Running transfers are checked every five seconds and terminated when a
+listed network is detected; bytes can still transfer between checks or while
+`iw` is running. This is a Wi-Fi name policy, not a data cap: it does not detect
+cellular connections through Ethernet, USB tethering, or a router using the
+same SSID for multiple uplinks. Recordings remain subject to the car's normal
+rolling buffer and available local storage while uploads are paused.
 
 ## Initialize
 

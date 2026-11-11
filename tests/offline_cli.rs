@@ -100,6 +100,7 @@ impl Harness {
         let mut command = Command::new(env!("CARGO_BIN_EXE_teslausb"));
         command
             .args(args)
+            .env_remove("ARCHIVE_PAUSED_SSIDS")
             .env_remove("CAM_FILESYSTEM")
             .env_remove("RCLONE_IGNORE_SIZE")
             .env_remove("RCLONE_SIZE_ONLY")
@@ -123,6 +124,15 @@ impl Harness {
             command.env(key, value);
         }
         command.spawn().unwrap()
+    }
+
+    fn pause_uploads_on_ssids(&self, ssids: &[&str]) {
+        let mut content = fs::read_to_string(&self.config).unwrap();
+        content.push_str(&format!(
+            "ARCHIVE_PAUSED_SSIDS={}\n",
+            serde_json::to_string(ssids).unwrap()
+        ));
+        fs::write(&self.config, content).unwrap();
     }
 
     fn config_arg(&self) -> String {
@@ -821,6 +831,377 @@ fn offline_archive_snapshots_and_clean_with_fake_rclone() {
 }
 
 #[test]
+fn offline_paused_wifi_prevents_network_requests_and_new_snapshots() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
+    fs::write(harness.state.join("iw-wlan1"), "Hotspot").unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+
+    let paused = harness.run(&["--config", &config, "archive"]);
+    assert!(!paused.status.success(), "{}", describe(&paused));
+    assert!(stderr(&paused).contains("Hotspot"), "{}", describe(&paused));
+    let log = harness.command_log();
+    assert!(!log.contains("rclone\tlsf"), "{log}");
+    assert!(!log.contains("rclone\tcopy"), "{log}");
+    assert!(!harness.backingfiles.join("snapshots/snap-000000").exists());
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SavedClips/event/front.mp4")
+        .exists());
+
+    fs::remove_file(harness.state.join("iw-wlan1")).unwrap();
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert!(harness.archive_path("SavedClips/event/front.mp4").is_file());
+}
+
+#[test]
+fn offline_paused_wifi_preserves_pending_upload_until_an_allowed_connection() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    let failed = harness.run_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_FAIL", "SavedClips")],
+    );
+    assert!(!failed.status.success(), "{}", describe(&failed));
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    let retained = recovery_files(&snapshot);
+    let next_id = fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    fs::write(harness.state.join("iw-wlan0"), "Hotspot").unwrap();
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+
+    let paused = harness.run(&["--config", &config, "archive"]);
+    assert!(!paused.status.success(), "{}", describe(&paused));
+    assert_eq!(recovery_files(&snapshot), retained);
+    assert!(!harness.command_log().contains("rclone\tlsf"));
+    assert!(!harness.command_log().contains("rclone\tcopy"));
+    assert_eq!(
+        fs::read(harness.backingfiles.join("snapshots/.next-id")).unwrap(),
+        next_id
+    );
+
+    fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert!(!snapshot.exists());
+    assert!(harness.archive_path("SavedClips/event/front.mp4").is_file());
+}
+
+#[test]
+fn offline_paused_wifi_matches_exact_decoded_ssids() {
+    for (ssid, paused) in [
+        (r"Ben\xe2\x80\x99s iPhone", true),
+        (r"\x20Hotspot\x20", true),
+        (r"\x48otspot", true),
+        ("Hotspot guest", false),
+        ("hotspot", false),
+    ] {
+        let harness = Harness::new("rclone");
+        let config = harness.config_arg();
+        harness.pause_uploads_on_ssids(&["Ben’s iPhone", " Hotspot ", "Hotspot"]);
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+        fs::write(harness.state.join("iw-wlan0"), ssid).unwrap();
+        let archive = harness.run(&["--config", &config, "archive"]);
+        assert_eq!(
+            !archive.status.success(),
+            paused,
+            "SSID {ssid:?}: {}",
+            describe(&archive)
+        );
+        assert_eq!(harness.command_log().contains("rclone\tcopy"), !paused);
+    }
+}
+
+#[test]
+fn offline_wifi_detection_errors_prevent_uploads() {
+    for fault in ["iw-error", "iw-malformed"] {
+        let harness = Harness::new("rclone");
+        let config = harness.config_arg();
+        harness.pause_uploads_on_ssids(&["Hotspot"]);
+        assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+        fs::write(harness.state.join(fault), "").unwrap();
+        fs::write(harness.state.join("commands.log"), "").unwrap();
+        let archive = harness.run(&["--config", &config, "archive"]);
+        assert!(!archive.status.success(), "{fault}: {}", describe(&archive));
+        assert!(!harness.command_log().contains("rclone\tlsf"));
+        assert!(!harness.command_log().contains("rclone\tcopy"));
+        assert!(!harness.backingfiles.join("snapshots/snap-000000").exists());
+    }
+}
+
+#[test]
+fn offline_wifi_change_stops_active_copy_and_preserves_pending_upload() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    let mut child = harness.spawn_with_env(
+        &["--config", &config, "archive"],
+        &[("TESLAUSB_FAKE_RCLONE_SLEEP", "true")],
+    );
+    let pid_file = harness.state.join("rclone.pid");
+    if !wait_until(|| pid_file.exists(), Duration::from_secs(30)) {
+        terminate_child(&mut child);
+        panic!(
+            "copy did not start: {}",
+            describe(&child.wait_with_output().unwrap())
+        );
+    }
+    let copy_pid: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    fs::write(harness.state.join("iw-wlan0"), "Hotspot").unwrap();
+    let stopped = wait_until(
+        || child.try_wait().unwrap().is_some(),
+        Duration::from_secs(10),
+    );
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let copy_still_running = unsafe { kill(-copy_pid, 0) } == 0;
+    if copy_still_running {
+        assert_eq!(unsafe { kill(-copy_pid, 9) }, 0);
+    }
+    if !stopped {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(stopped, "{}", describe(&output));
+    assert!(
+        !copy_still_running,
+        "copy process group survived paused Wi-Fi detection"
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(stderr(&output).contains("Hotspot"), "{}", describe(&output));
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    assert!(snapshot.join("snap.toc").is_file());
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SavedClips/event/front.mp4")
+        .exists());
+    assert!(!harness.command_log().contains("mount\t-o\trw"));
+
+    fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
+    assert_success(&harness.run(&["--config", &config, "archive"]));
+    assert!(!snapshot.exists());
+    assert!(harness.archive_path("SavedClips/event/front.mp4").is_file());
+}
+
+#[test]
+fn offline_wifi_query_sigterm_reaps_query_before_starting_archive() {
+    assert_sigterm_during_wifi_query("archive", false);
+}
+
+#[test]
+fn offline_wifi_query_sigterm_reaps_query_and_active_copy() {
+    assert_sigterm_during_wifi_query("archive", true);
+}
+
+#[test]
+fn offline_wifi_query_sigterm_stops_service_cleanly_and_turns_off_led() {
+    assert_sigterm_during_wifi_query("run", false);
+}
+
+fn assert_sigterm_during_wifi_query(command: &str, active_copy: bool) {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    let ssid = if command == "run" { "Hotspot" } else { "Home" };
+    fs::write(harness.state.join("iw-wlan0"), ssid).unwrap();
+    let led_path = harness.root.join("led");
+    let thermal_path = harness.root.join("thermal/temp");
+    if command == "run" {
+        write_led_fixture(&led_path);
+        write_file(thermal_path.clone(), "45000");
+    }
+    let led_path_s = led_path.display().to_string();
+    let thermal_path_s = thermal_path.display().to_string();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    if !active_copy {
+        fs::write(harness.state.join("iw-sleep"), "").unwrap();
+    }
+    let mut child = harness.spawn_with_env(
+        &["--config", &config, command],
+        &[
+            ("TESLAUSB_FAKE_RCLONE_SLEEP", "true"),
+            ("TESLAUSB_LED_PATH", &led_path_s),
+            ("TESLAUSB_THERMAL_PATH", &thermal_path_s),
+        ],
+    );
+    let copy_pid_file = harness.state.join("rclone.pid");
+    if active_copy {
+        if !wait_until(|| copy_pid_file.exists(), Duration::from_secs(30)) {
+            terminate_child(&mut child);
+            panic!(
+                "copy did not start: {}",
+                describe(&child.wait_with_output().unwrap())
+            );
+        }
+        fs::write(harness.state.join("iw-sleep"), "").unwrap();
+    }
+    let query_pid_file = harness.state.join("iw.pid");
+    if !wait_until(|| query_pid_file.exists(), Duration::from_secs(30)) {
+        terminate_child(&mut child);
+        panic!(
+            "Wi-Fi query did not start: {}",
+            describe(&child.wait_with_output().unwrap())
+        );
+    }
+
+    terminate_child(&mut child);
+    let stopped = wait_until(
+        || child.try_wait().unwrap().is_some(),
+        Duration::from_secs(3),
+    );
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let mut process_groups: Vec<i32> = fs::read_to_string(harness.state.join("iw.pids"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    if active_copy {
+        process_groups.push(
+            fs::read_to_string(&copy_pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+    }
+    let surviving_groups: Vec<_> = process_groups
+        .into_iter()
+        .filter(|pid| unsafe { kill(-pid, 0) } == 0)
+        .collect();
+    for pid in &surviving_groups {
+        assert_eq!(unsafe { kill(-pid, 9) }, 0);
+    }
+    if !stopped {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        stopped,
+        "shutdown exceeded three seconds: {}",
+        describe(&output)
+    );
+    assert!(
+        surviving_groups.is_empty(),
+        "child process groups survived shutdown: {surviving_groups:?}"
+    );
+    if command == "run" {
+        assert_success(&output);
+        assert_eq!(
+            fs::read_to_string(led_path.join("trigger")).unwrap(),
+            "none"
+        );
+        assert_eq!(
+            fs::read_to_string(led_path.join("brightness")).unwrap(),
+            "0"
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+        assert!(
+            stderr(&output).contains("stopped by shutdown request"),
+            "{}",
+            describe(&output)
+        );
+    }
+    let log = harness.command_log();
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    if active_copy {
+        assert!(snapshot.join("snap.toc").is_file());
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with("rclone\tcopy\t"))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log
+            .lines()
+            .any(|line| line.starts_with("umount\t") && line.contains("teslausb-mount-")));
+        assert!(!log.contains("mount\t-o\trw"), "{log}");
+    } else {
+        assert!(!log.contains("rclone\tlsf"), "{log}");
+        assert!(!log.contains("rclone\tcopy"), "{log}");
+        assert!(!snapshot.exists());
+    }
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SavedClips/event/front.mp4")
+        .is_file());
+}
+
+#[test]
+fn offline_wifi_service_resumes_without_restart_after_leaving_paused_network() {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    fs::write(harness.state.join("iw-wlan0"), "Hotspot").unwrap();
+    let led_path = harness.root.join("led");
+    let thermal_path = harness.root.join("thermal/temp");
+    write_led_fixture(&led_path);
+    write_file(thermal_path.clone(), "45000");
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    let led_path = led_path.display().to_string();
+    let thermal_path = thermal_path.display().to_string();
+    let mut child = harness.spawn_with_env(
+        &["--config", &config, "run"],
+        &[
+            ("TESLAUSB_LED_PATH", &led_path),
+            ("TESLAUSB_THERMAL_PATH", &thermal_path),
+            ("TESLAUSB_IDLE_TIMEOUT_SECS", "1"),
+        ],
+    );
+    let inspected = wait_until(
+        || harness.command_log().contains("iw\tdev\twlan0\tlink"),
+        Duration::from_secs(10),
+    );
+    if !inspected {
+        terminate_child(&mut child);
+        panic!(
+            "service did not inspect Wi-Fi: {}",
+            describe(&child.wait_with_output().unwrap())
+        );
+    }
+    assert!(!harness.command_log().contains("rclone\tlsf"));
+    assert!(!harness.command_log().contains("rclone\tcopy"));
+    fs::write(harness.state.join("iw-wlan0"), "Home").unwrap();
+    let resumed = wait_until(
+        || {
+            harness.archive_path("Photobooth/photo.jpg").is_file()
+                && !harness.backingfiles.join("snapshots/snap-000000").exists()
+        },
+        Duration::from_secs(30),
+    );
+    terminate_child(&mut child);
+    let output = child.wait_with_output().unwrap();
+    assert!(resumed, "service did not resume: {}", describe(&output));
+    assert_success(&output);
+    assert!(
+        stderr(&output).contains("uploads paused"),
+        "{}",
+        describe(&output)
+    );
+    assert!(
+        stderr(&output).contains("archive complete"),
+        "{}",
+        describe(&output)
+    );
+}
+
+#[test]
 fn offline_archive_failure_returns_nonzero_without_privileged_tools() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -1471,6 +1852,39 @@ last_arg() {
 }
 
 case "$tool" in
+    iw)
+        if [ "${1:-}" = "--version" ]; then
+            printf 'iw version 6.9\n'
+            exit 0
+        fi
+        if [ -f "$state/iw-sleep" ]; then
+            printf '%s\n' "$$" >> "$state/iw.pids"
+            printf '%s\n' "$$" > "$state/iw.pid"
+            sleep 30
+        fi
+        if [ -f "$state/iw-error" ]; then
+            printf 'injected Wi-Fi query failure\n' >&2
+            exit 1
+        fi
+        if [ "$#" = 1 ] && [ "$1" = dev ]; then
+            printf 'phy#0\n\tInterface wlan0\n\t\ttype managed\nphy#1\n\tInterface wlan1\n\t\ttype managed\n'
+            exit 0
+        fi
+        if [ "$#" = 3 ] && [ "$1" = dev ] && [ "$3" = link ]; then
+            if [ -f "$state/iw-malformed" ]; then
+                printf 'Connected to 00:11:22:33:44:55 (on %s)\n\tfreq: 2412\n' "$2"
+            elif [ -s "$state/iw-$2" ]; then
+                printf 'Connected to 00:11:22:33:44:55 (on %s)\n\tSSID: ' "$2"
+                cat "$state/iw-$2"
+                printf '\n'
+            else
+                printf 'Not connected.\n'
+            fi
+            exit 0
+        fi
+        printf 'unexpected iw command\n' >&2
+        exit 2
+        ;;
     rclone)
         if [ "${1:-}" = "version" ]; then
             printf 'rclone v%s\n' "${TESLAUSB_FAKE_RCLONE_VERSION:-1.65.0}"
@@ -1766,6 +2180,7 @@ exit 127
 "#;
 
     for tool in [
+        "iw",
         "blkid",
         "blockdev",
         "cp",
