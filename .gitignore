@@ -7,4 +7,5 @@
 
 # Runtime configuration should live on the target device.
 /.env
+**/private.conf
 /*.log

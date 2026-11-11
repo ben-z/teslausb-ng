@@ -197,3 +197,18 @@ successful filesystem check before enabling it again.
 Stopping a service already awaiting automatic restart does not run another stop
 hook. Disk maintenance must explicitly turn off the gadget after stopping the
 service; service uninstallation removes the gadget before disabling the unit.
+
+## Device Configuration and Wi-Fi Priorities
+
+The repository holds shared appliance policy and a systemd drop-in. Private
+archive destinations and network identities remain in a device-owned file.
+Configuration installation validates the two saved sources, rejects overlapping
+keys, and writes their combined runtime file privately and atomically. It does
+not obtain missing saved settings from the installer's environment.
+
+Netplan continues to own Wi-Fi authentication and connection management. Before
+supplicant start or reload, the drop-in runs the priority command against
+Netplan's generated file. The command classifies each saved network using the
+same private paused-SSID list as archive gating and replaces only its priority.
+Normal networks rank above paused networks; credentials are preserved. No
+additional network monitor or SSID inventory is maintained.

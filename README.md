@@ -227,7 +227,7 @@ retries, and teslausb retries the pending snapshot after a failed archive.
 Add the exact Wi-Fi names to `/etc/teslausb.conf`, for example:
 
 ```text
-ARCHIVE_PAUSED_SSIDS='["Ben’s iPhone", "Travel Hotspot"]'
+ARCHIVE_PAUSED_SSIDS='["Example Mobile Wi-Fi"]'
 ```
 
 Install `iw` (`sudo apt install iw`) and restart the service after changing the
@@ -250,6 +250,78 @@ listed network is detected; bytes can still transfer between checks or while
 cellular connections through Ethernet, USB tethering, or a router using the
 same SSID for multiple uplinks. Recordings remain subject to the car's normal
 rolling buffer and available local storage while uploads are paused.
+
+### Deploy Shared Settings with Private Values
+
+[`deploy/teslausb.conf`](deploy/teslausb.conf) contains the shared appliance
+settings. Keep real network names, archive destinations, transfer flags, and
+credentials out of the checkout. Store the device's private values in
+`/etc/teslausb/private.conf`, owned by root with mode `0600`; the
+[`private configuration example`](deploy/private.conf.example) uses fictional
+values. Wi-Fi passwords remain in the device's existing Netplan files, and
+rclone credentials remain in its existing configuration.
+
+For a new device, create the private file on the device:
+
+```bash
+sudo install -d -m 0700 /etc/teslausb
+sudoedit /etc/teslausb/private.conf
+sudo chown root:root /etc/teslausb/private.conf
+sudo chmod 0600 /etc/teslausb/private.conf
+```
+
+For an existing installation, preserve its private values in that file before
+installing the shared settings. Shared and private files must use different
+keys. The installer rejects overlapping keys and network identities in the
+shared file, validates the saved values independently of the shell environment,
+and atomically writes the combined runtime file with mode `0600`:
+
+```bash
+sudo /usr/local/bin/teslausb config install \
+  --base deploy/teslausb.conf \
+  --private /etc/teslausb/private.conf \
+  --output /etc/teslausb.conf
+```
+
+Change the shared file or private input and reinstall them to update the device;
+direct edits to the combined `/etc/teslausb.conf` are replaced by installation.
+Populated private files are never deployment artifacts in the public repository.
+
+### Persist Wi-Fi Priorities
+
+On systems using Netplan with `networkd`, the priority command gives networks in
+`ARCHIVE_PAUSED_SSIDS` the `WIFI_PAUSED_PRIORITY` value and gives every other saved
+network `WIFI_DEFAULT_PRIORITY`. The normal priority must be greater than the
+paused priority. The shared deployment file owns the appliance's numeric policy;
+the SSID list stays in the private file, so no second network list is needed.
+
+For an installation whose Wi-Fi interface is `wlan0`, install the tracked systemd
+drop-in after updating the binary and installing the combined configuration:
+
+```bash
+sudo install -D -m 0644 \
+  deploy/systemd/netplan-wpa-wlan0.service.d/50-teslausb-priorities.conf \
+  /etc/systemd/system/netplan-wpa-wlan0.service.d/50-teslausb-priorities.conf
+sudo systemctl daemon-reload
+sudo netplan apply
+sudo systemctl restart teslausb
+```
+
+Applying Wi-Fi settings can briefly disconnect SSH. The drop-in applies priorities
+before the supplicant starts and before `systemctl reload netplan-wpa-wlan0`
+reconfigures it. Netplan application and system restarts regenerate the network
+file and run the same hook. The command preserves authentication settings and
+writes the file privately; it does not print network names or passwords.
+Preferences affect the supplicant's network selection; they do not introduce a
+separate roaming service. Adapt the unit name and supplicant path together when
+using an interface other than `wlan0`.
+
+To inspect the effective settings without displaying passwords:
+
+```bash
+sudo wpa_cli -i wlan0 list_networks
+sudo wpa_cli -i wlan0 get_network NETWORK_ID priority
+```
 
 ## Initialize
 
@@ -366,6 +438,8 @@ Run device commands as root.
 | `teslausb clean [--dry-run]` | Remove incomplete snapshots; preserve pending uploads |
 | `teslausb gadget on/off/status` | Manage USB gadget mode |
 | `teslausb service install/uninstall/status` | Manage the systemd service |
+| `teslausb config install --base PATH --private PATH --output PATH` | Install shared settings with private device values |
+| `teslausb wifi-priorities --supplicant-config PATH` | Apply saved network priorities before supplicant start or reload |
 | `teslausb doctor [--startup]` | Check external dependencies |
 
 ## Troubleshooting
