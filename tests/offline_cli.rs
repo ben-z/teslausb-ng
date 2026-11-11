@@ -995,6 +995,154 @@ fn offline_wifi_change_stops_active_copy_and_preserves_pending_upload() {
 }
 
 #[test]
+fn offline_wifi_query_sigterm_reaps_query_before_starting_archive() {
+    assert_sigterm_during_wifi_query("archive", false);
+}
+
+#[test]
+fn offline_wifi_query_sigterm_reaps_query_and_active_copy() {
+    assert_sigterm_during_wifi_query("archive", true);
+}
+
+#[test]
+fn offline_wifi_query_sigterm_stops_service_cleanly_and_turns_off_led() {
+    assert_sigterm_during_wifi_query("run", false);
+}
+
+fn assert_sigterm_during_wifi_query(command: &str, active_copy: bool) {
+    let harness = Harness::new("rclone");
+    let config = harness.config_arg();
+    harness.pause_uploads_on_ssids(&["Hotspot"]);
+    let ssid = if command == "run" { "Hotspot" } else { "Home" };
+    fs::write(harness.state.join("iw-wlan0"), ssid).unwrap();
+    let led_path = harness.root.join("led");
+    let thermal_path = harness.root.join("thermal/temp");
+    if command == "run" {
+        write_led_fixture(&led_path);
+        write_file(thermal_path.clone(), "45000");
+    }
+    let led_path_s = led_path.display().to_string();
+    let thermal_path_s = thermal_path.display().to_string();
+    assert_success(&harness.run(&["--config", &config, "init", "--reserve", "20G"]));
+    fs::write(harness.state.join("commands.log"), "").unwrap();
+    if !active_copy {
+        fs::write(harness.state.join("iw-sleep"), "").unwrap();
+    }
+    let mut child = harness.spawn_with_env(
+        &["--config", &config, command],
+        &[
+            ("TESLAUSB_FAKE_RCLONE_SLEEP", "true"),
+            ("TESLAUSB_LED_PATH", &led_path_s),
+            ("TESLAUSB_THERMAL_PATH", &thermal_path_s),
+        ],
+    );
+    let copy_pid_file = harness.state.join("rclone.pid");
+    if active_copy {
+        if !wait_until(|| copy_pid_file.exists(), Duration::from_secs(30)) {
+            terminate_child(&mut child);
+            panic!(
+                "copy did not start: {}",
+                describe(&child.wait_with_output().unwrap())
+            );
+        }
+        fs::write(harness.state.join("iw-sleep"), "").unwrap();
+    }
+    let query_pid_file = harness.state.join("iw.pid");
+    if !wait_until(|| query_pid_file.exists(), Duration::from_secs(30)) {
+        terminate_child(&mut child);
+        panic!(
+            "Wi-Fi query did not start: {}",
+            describe(&child.wait_with_output().unwrap())
+        );
+    }
+
+    terminate_child(&mut child);
+    let stopped = wait_until(
+        || child.try_wait().unwrap().is_some(),
+        Duration::from_secs(3),
+    );
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let mut process_groups: Vec<i32> = fs::read_to_string(harness.state.join("iw.pids"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    if active_copy {
+        process_groups.push(
+            fs::read_to_string(&copy_pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+    }
+    let surviving_groups: Vec<_> = process_groups
+        .into_iter()
+        .filter(|pid| unsafe { kill(-pid, 0) } == 0)
+        .collect();
+    for pid in &surviving_groups {
+        assert_eq!(unsafe { kill(-pid, 9) }, 0);
+    }
+    if !stopped {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        stopped,
+        "shutdown exceeded three seconds: {}",
+        describe(&output)
+    );
+    assert!(
+        surviving_groups.is_empty(),
+        "child process groups survived shutdown: {surviving_groups:?}"
+    );
+    if command == "run" {
+        assert_success(&output);
+        assert_eq!(
+            fs::read_to_string(led_path.join("trigger")).unwrap(),
+            "none"
+        );
+        assert_eq!(
+            fs::read_to_string(led_path.join("brightness")).unwrap(),
+            "0"
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+        assert!(
+            stderr(&output).contains("stopped by shutdown request"),
+            "{}",
+            describe(&output)
+        );
+    }
+    let log = harness.command_log();
+    let snapshot = harness.backingfiles.join("snapshots/snap-000000");
+    if active_copy {
+        assert!(snapshot.join("snap.toc").is_file());
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with("rclone\tcopy\t"))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log
+            .lines()
+            .any(|line| line.starts_with("umount\t") && line.contains("teslausb-mount-")));
+        assert!(!log.contains("mount\t-o\trw"), "{log}");
+    } else {
+        assert!(!log.contains("rclone\tlsf"), "{log}");
+        assert!(!log.contains("rclone\tcopy"), "{log}");
+        assert!(!snapshot.exists());
+    }
+    assert!(harness
+        .cam_source
+        .join("TeslaCam/SavedClips/event/front.mp4")
+        .is_file());
+}
+
+#[test]
 fn offline_wifi_service_resumes_without_restart_after_leaving_paused_network() {
     let harness = Harness::new("rclone");
     let config = harness.config_arg();
@@ -1708,6 +1856,11 @@ case "$tool" in
         if [ "${1:-}" = "--version" ]; then
             printf 'iw version 6.9\n'
             exit 0
+        fi
+        if [ -f "$state/iw-sleep" ]; then
+            printf '%s\n' "$$" >> "$state/iw.pids"
+            printf '%s\n' "$$" > "$state/iw.pid"
+            sleep 30
         fi
         if [ -f "$state/iw-error" ]; then
             printf 'injected Wi-Fi query failure\n' >&2

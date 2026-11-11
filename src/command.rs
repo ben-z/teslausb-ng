@@ -75,6 +75,9 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        if interruptible && crate::coordinator::stop_requested() {
+            return Err(Error::new(format!("{program} stopped by shutdown request")));
+        }
         let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
         let mut child = Command::new(program)
             .args(&args)
@@ -104,16 +107,6 @@ impl CommandRunner {
                     break (status, false);
                 }
             }
-            if let Some((interval, callback)) = &mut check {
-                if last_check.elapsed() >= *interval {
-                    if let Err(error) = callback() {
-                        check_error = Some(error);
-                        kill_process_group(child.id())?;
-                        break (child.wait()?, false);
-                    }
-                    last_check = Instant::now();
-                }
-            }
             if interruptible && crate::coordinator::stop_requested() {
                 interrupted = true;
                 kill_process_group(child.id())?;
@@ -123,6 +116,16 @@ impl CommandRunner {
                 // Descendants can hold the pipes open after the direct child is killed.
                 kill_process_group(child.id())?;
                 break (child.wait()?, true);
+            }
+            if let Some((interval, callback)) = &mut check {
+                if last_check.elapsed() >= *interval {
+                    if let Err(error) = callback() {
+                        check_error = Some(error);
+                        kill_process_group(child.id())?;
+                        break (child.wait()?, false);
+                    }
+                    last_check = Instant::now();
+                }
             }
             thread::sleep(Duration::from_millis(50));
         };
@@ -152,19 +155,34 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let args_vec: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
-        let output = self.run(program, args_vec.iter().map(String::as_str), timeout)?;
-        if output.success() {
-            Ok(output)
-        } else if output.timed_out {
-            Err(Error::new(format!("{} timed out", program)))
-        } else {
-            Err(Error::new(format!(
-                "{} failed: {}",
-                program,
-                output.last_error_line()
-            )))
-        }
+        check_output(program, self.run(program, args, timeout)?)
+    }
+
+    pub fn check_interruptible<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        timeout: Option<Duration>,
+    ) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        check_output(program, self.run_inner(program, args, timeout, true, None)?)
+    }
+}
+
+fn check_output(program: &str, output: CommandOutput) -> Result<CommandOutput> {
+    if output.success() {
+        Ok(output)
+    } else if output.timed_out {
+        Err(Error::new(format!("{} timed out", program)))
+    } else {
+        Err(Error::new(format!(
+            "{} failed: {}",
+            program,
+            output.last_error_line()
+        )))
     }
 }
 
@@ -310,6 +328,25 @@ mod tests {
             .unwrap();
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn expired_timeout_takes_precedence_over_periodic_checks() {
+        let mut checks = 0;
+        let output = CommandRunner
+            .run_interruptible_checked(
+                "sh",
+                ["-c", "sleep 30"],
+                Some(Duration::ZERO),
+                Duration::ZERO,
+                &mut || {
+                    checks += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(output.timed_out);
+        assert_eq!(checks, 1, "only the preflight check should run");
     }
 
     #[test]

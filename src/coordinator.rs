@@ -118,7 +118,11 @@ impl<F: FileSystem> Coordinator<F> {
         self.set_led(LedPattern::SlowBlink)?;
         let mut backoff = Backoff::new(self.poll_interval, self.max_idle_interval);
         while !stop.load(Ordering::SeqCst) {
-            if let Some(ssid) = self.archive_manager.backend().paused_network()? {
+            let paused_network = self.archive_manager.backend().paused_network();
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(ssid) = paused_network? {
                 eprintln!("uploads paused on Wi-Fi network {ssid:?}");
                 wait_interruptible(self.poll_interval, stop);
                 continue;

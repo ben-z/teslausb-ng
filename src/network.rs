@@ -51,8 +51,11 @@ impl NetworkPolicy {
     }
 
     fn iw(&self, args: &[&str]) -> Result<String> {
-        let output =
-            CommandRunner.check("iw", args.iter().copied(), Some(self.config.check_timeout))?;
+        let output = CommandRunner.check_interruptible(
+            "iw",
+            args.iter().copied(),
+            Some(self.config.check_timeout),
+        )?;
         Ok(output.stdout)
     }
 }
