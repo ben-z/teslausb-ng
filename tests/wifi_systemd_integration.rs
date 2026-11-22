@@ -162,9 +162,11 @@ impl Harness {
                 & 0o777,
             0o600
         );
-        assert!(!fs::read_to_string(&self.supplicant_config)
-            .unwrap()
-            .contains("priority="));
+        let generated = fs::read_to_string(&self.supplicant_config).unwrap();
+        assert!(!generated.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("priority=") || line.starts_with("bgscan=")
+        }));
     }
 
     fn action(&self, action: &str) {
@@ -190,9 +192,9 @@ impl Harness {
         )
     }
 
-    fn assert_observed(&self, name: &str, generated: &str) {
+    fn assert_observed(&self, name: &str, generated: &str, paused_scan_interval: u32) {
         let observed = fs::read_to_string(self.root.join(name)).unwrap();
-        assert_eq!(without_priorities(&observed), generated);
+        assert_eq!(without_owned_wifi_settings(&observed), generated);
         for (ssid, priority) in [("ExampleHome", "100"), ("ExampleMobile", "0")] {
             let blocks: Vec<_> = observed
                 .split("network={")
@@ -213,6 +215,27 @@ impl Harness {
                 .filter_map(|line| line.trim().strip_prefix("priority="))
                 .collect();
             assert_eq!(priorities, [priority], "{ssid}");
+            let scans: Vec<_> = blocks[0]
+                .split('}')
+                .next()
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("bgscan="))
+                .collect();
+            if ssid == "ExampleMobile" {
+                assert_eq!(
+                    scans,
+                    [format!(
+                        "\"simple:{paused_scan_interval}:0:{paused_scan_interval}\""
+                    )],
+                    "{ssid}"
+                );
+            } else {
+                assert!(
+                    scans.is_empty(),
+                    "permitted profile retained a background scan override"
+                );
+            }
         }
         assert_eq!(
             fs::metadata(&self.supplicant_config)
@@ -261,32 +284,48 @@ fn netplan_dropin_sets_priorities_before_start_restart_and_reload() {
     let generated = fs::read_to_string(&harness.supplicant_config).unwrap();
     harness.action("start");
     harness.wait_for_start();
-    harness.assert_observed("start-observed.conf", &generated);
+    harness.assert_observed("start-observed.conf", &generated, 60);
 
     harness.generate();
     fs::remove_file(harness.root.join("start-ready")).unwrap();
     harness.action("restart");
     harness.wait_for_start();
-    harness.assert_observed("start-observed.conf", &generated);
+    harness.assert_observed("start-observed.conf", &generated, 60);
 
     harness.generate();
     harness.action("reload");
-    harness.assert_observed("reload-observed.conf", &generated);
+    harness.assert_observed("reload-observed.conf", &generated, 60);
+    let config = fs::read_to_string(&harness.config).unwrap();
+    fs::write(
+        &harness.config,
+        format!("{config}WIFI_PAUSED_SCAN_INTERVAL_SECS=17\n"),
+    )
+    .unwrap();
+    harness.generate();
+    harness.action("reload");
+    harness.assert_observed("reload-observed.conf", &generated, 17);
     assert!(!harness.root.join("legacy-ran").exists());
     assert_eq!(
         fs::read_to_string(harness.root.join("events")).unwrap(),
-        "start\nstart\nreload\n"
+        "start\nstart\nreload\nreload\n"
     );
 }
 
 #[test]
 #[ignore = "requires root, netplan, and a running Linux systemd manager"]
 fn netplan_dropin_refuses_to_start_without_valid_private_configuration() {
-    for malformed in [false, true] {
+    for (invalid, expected_error) in [
+        (None, "config file not found or unreadable"),
+        (Some("ARCHIVE_PAUSED_SSIDS=[\n"), "ARCHIVE_PAUSED_SSIDS"),
+        (
+            Some("WIFI_PAUSED_SCAN_INTERVAL_SECS=0\n"),
+            "WIFI_PAUSED_SCAN_INTERVAL_SECS",
+        ),
+    ] {
         let harness = Harness::new();
         let generated = fs::read_to_string(&harness.supplicant_config).unwrap();
-        if malformed {
-            fs::write(&harness.config, "ARCHIVE_PAUSED_SSIDS=[\n").unwrap();
+        if let Some(invalid) = invalid {
+            fs::write(&harness.config, invalid).unwrap();
         } else {
             fs::remove_file(&harness.config).unwrap();
         }
@@ -298,14 +337,7 @@ fn netplan_dropin_refuses_to_start_without_valid_private_configuration() {
         assert!(!harness.root.join("start-observed.conf").exists());
         assert!(!harness.root.join("events").exists());
         let journal = harness.journal();
-        assert!(
-            journal.contains(if malformed {
-                "ARCHIVE_PAUSED_SSIDS"
-            } else {
-                "config file not found or unreadable"
-            }),
-            "{journal}"
-        );
+        assert!(journal.contains(expected_error), "{journal}");
         assert_eq!(
             fs::read_to_string(&harness.supplicant_config).unwrap(),
             generated
@@ -324,39 +356,47 @@ fn netplan_dropin_refuses_to_start_without_valid_private_configuration() {
 #[test]
 #[ignore = "requires root, netplan, and a running Linux systemd manager"]
 fn netplan_dropin_refuses_to_reconfigure_when_priority_configuration_is_invalid() {
-    let harness = Harness::new();
-    harness.action("start");
-    harness.wait_for_start();
-    harness.generate();
-    let generated = fs::read_to_string(&harness.supplicant_config).unwrap();
-    fs::write(&harness.config, "ARCHIVE_PAUSED_SSIDS=[\n").unwrap();
-    let result = Command::new("systemctl")
-        .args(["reload", &harness.unit])
-        .output()
-        .unwrap();
-    assert!(!result.status.success(), "{result:?}");
-    assert!(!harness.root.join("reload-observed.conf").exists());
-    assert_eq!(
-        fs::read_to_string(&harness.supplicant_config).unwrap(),
-        generated
-    );
-    assert_eq!(
-        run(
-            "systemctl",
-            &["show", &harness.unit, "--property=ActiveState", "--value"]
-        )
-        .trim(),
-        "active"
-    );
-    assert_eq!(
-        fs::read_to_string(harness.root.join("events")).unwrap(),
-        "start\n"
-    );
+    for invalid in [
+        "ARCHIVE_PAUSED_SSIDS=[\n",
+        "WIFI_PAUSED_SCAN_INTERVAL_SECS=0\n",
+    ] {
+        let harness = Harness::new();
+        harness.action("start");
+        harness.wait_for_start();
+        harness.generate();
+        let generated = fs::read_to_string(&harness.supplicant_config).unwrap();
+        fs::write(&harness.config, invalid).unwrap();
+        let result = Command::new("systemctl")
+            .args(["reload", &harness.unit])
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{result:?}");
+        assert!(!harness.root.join("reload-observed.conf").exists());
+        assert_eq!(
+            fs::read_to_string(&harness.supplicant_config).unwrap(),
+            generated
+        );
+        assert_eq!(
+            run(
+                "systemctl",
+                &["show", &harness.unit, "--property=ActiveState", "--value"]
+            )
+            .trim(),
+            "active"
+        );
+        assert_eq!(
+            fs::read_to_string(harness.root.join("events")).unwrap(),
+            "start\n"
+        );
+    }
 }
 
-fn without_priorities(text: &str) -> String {
+fn without_owned_wifi_settings(text: &str) -> String {
     text.split_inclusive('\n')
-        .filter(|line| !line.trim_start().starts_with("priority="))
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("priority=") && !line.starts_with("bgscan=")
+        })
         .collect()
 }
 

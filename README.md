@@ -295,6 +295,19 @@ network `WIFI_DEFAULT_PRIORITY`. The normal priority must be greater than the
 paused priority. The shared deployment file owns the appliance's numeric policy;
 the SSID list stays in the private file, so no second network list is needed.
 
+Paused profiles also use wpa_supplicant's built-in `simple` background scanner.
+It keeps looking for permitted networks even while the paused hotspot has a
+strong signal. Set `WIFI_PAUSED_SCAN_INTERVAL_SECS` to change the interval in
+positive whole seconds. Once a higher-priority permitted network is discovered,
+the supplicant selects it and the archiver resumes automatically.
+
+This requires a wpa_supplicant build with the `simple` background-scan module.
+Discovery covers permitted networks that broadcast their SSID; the scanner's
+directed probes use the current SSID, including a hidden paused hotspot.
+Returning hidden permitted networks are not reliably discovered by this module.
+The command owns per-profile `priority` and `bgscan` values, removing background
+scanning from profiles that are no longer paused. Other settings are preserved.
+
 For an installation whose Wi-Fi interface is `wlan0`, install the tracked systemd
 drop-in after updating the binary and installing the combined configuration:
 

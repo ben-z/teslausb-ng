@@ -209,6 +209,14 @@ not obtain missing saved settings from the installer's environment.
 Netplan continues to own Wi-Fi authentication and connection management. Before
 supplicant start or reload, the drop-in runs the priority command against
 Netplan's generated file. The command classifies each saved network using the
-same private paused-SSID list as archive gating and replaces only its priority.
-Normal networks rank above paused networks; credentials are preserved. No
-additional network monitor or SSID inventory is maintained.
+same private paused-SSID list as archive gating and updates its priority and
+background scanning policy.
+Normal networks rank above paused networks. The command also owns per-profile
+`bgscan`: paused profiles use wpa_supplicant's `simple` module with equal short
+and long intervals and a zero signal threshold. This keeps discovery running
+at strong signal without depending on driver signal monitoring. Permitted
+profiles have no per-profile background scanner, including after reclassification.
+Scan results feed the supplicant's existing priority-based network selection.
+The native module probes the current SSID; rediscovery of other hidden SSIDs is
+not guaranteed. Credentials are preserved, and no additional network monitor or
+SSID inventory is maintained.

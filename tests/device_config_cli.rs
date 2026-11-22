@@ -282,7 +282,10 @@ network={
     let updated = fs::read_to_string(&fixture.supplicant).unwrap();
     let expected = original
         .replace("    priority=-50\n", "    priority=100\n")
-        .replace("    priority=999\n", "    priority=0\n");
+        .replace(
+            "    priority=999\n",
+            "    priority=0\n    bgscan=\"simple:60:0:60\"\n",
+        );
     // The third profile has no earlier priority and uses the normal preference.
     let last_close = expected.rfind("}\n").unwrap();
     let expected = format!(
@@ -291,12 +294,10 @@ network={
         &expected[last_close..]
     );
     assert_eq!(updated, expected);
-    let without_priorities = |text: &str| {
-        text.split_inclusive('\n')
-            .filter(|line| !line.trim_start().starts_with("priority="))
-            .collect::<String>()
-    };
-    assert_eq!(without_priorities(&updated), without_priorities(original));
+    assert_eq!(
+        without_owned_wifi_settings(&updated),
+        without_owned_wifi_settings(original)
+    );
     assert_eq!(
         fs::metadata(&fixture.supplicant).unwrap().mode() & 0o777,
         0o600
@@ -314,6 +315,133 @@ network={
     ] {
         assert!(!diagnostic.contains(value));
     }
+}
+
+#[test]
+fn paused_wifi_scans_use_the_configured_interval_and_follow_reclassification() {
+    let fixture = Fixture::new();
+    let config = "ARCHIVE_SYSTEM=none\nARCHIVE_PAUSED_SSIDS='[\"Example Mobile\"]'\nWIFI_DEFAULT_PRIORITY=100\nWIFI_PAUSED_PRIORITY=0\nWIFI_PAUSED_SCAN_INTERVAL_SECS=17\n";
+    write_private(&fixture.private, config);
+    let original = r#"ctrl_interface=/run/wpa_supplicant
+network={
+    ssid="Example Trusted"
+    psk="fictional-trusted-password"
+    id_str="fictional-private-attribute"
+    bgscan="simple:30:-50:300"
+    priority=-50
+}
+network={
+    ssid=P"Example Mobile"
+    psk="fictional-mobile-password"
+    scan_ssid=1
+    bgscan="simple:45:-40:900"
+    priority=999
+}
+"#;
+    write_private(&fixture.supplicant, original);
+    assert_success(&fixture.apply_priorities());
+    let updated = fs::read_to_string(&fixture.supplicant).unwrap();
+    assert_eq!(
+        profile_settings(&updated, "Example Trusted"),
+        ["priority=100"]
+    );
+    assert_eq!(
+        profile_settings(&updated, "Example Mobile"),
+        ["priority=0", "bgscan=\"simple:17:0:17\""]
+    );
+    assert_eq!(
+        without_owned_wifi_settings(&updated),
+        without_owned_wifi_settings(original)
+    );
+    let inode = fs::metadata(&fixture.supplicant).unwrap().ino();
+    assert_success(&fixture.apply_priorities());
+    assert_eq!(fs::read_to_string(&fixture.supplicant).unwrap(), updated);
+    assert_eq!(fs::metadata(&fixture.supplicant).unwrap().ino(), inode);
+
+    write_private(
+        &fixture.private,
+        &config.replace("Example Mobile", "Example Trusted"),
+    );
+    assert_success(&fixture.apply_priorities());
+    let reclassified = fs::read_to_string(&fixture.supplicant).unwrap();
+    assert_eq!(
+        profile_settings(&reclassified, "Example Trusted"),
+        ["priority=0", "bgscan=\"simple:17:0:17\""]
+    );
+    assert_eq!(
+        profile_settings(&reclassified, "Example Mobile"),
+        ["priority=100"]
+    );
+    assert_eq!(
+        without_owned_wifi_settings(&reclassified),
+        without_owned_wifi_settings(original)
+    );
+    let inode = fs::metadata(&fixture.supplicant).unwrap().ino();
+    assert_success(&fixture.apply_priorities());
+    assert_eq!(
+        fs::read_to_string(&fixture.supplicant).unwrap(),
+        reclassified
+    );
+    assert_eq!(fs::metadata(&fixture.supplicant).unwrap().ino(), inode);
+}
+
+#[test]
+fn invalid_paused_wifi_scan_intervals_leave_saved_networks_unchanged() {
+    let fixture = Fixture::new();
+    let original = "network={\nssid=\"Example Mobile\"\npsk=\"fictional-password\"\n}\n";
+    write_private(&fixture.supplicant, original);
+    for value in [
+        "0",
+        "-1",
+        "2147483648",
+        "18446744073709551616",
+        "1.5",
+        "PRIVATE-SENTINEL",
+    ] {
+        write_private(
+            &fixture.private,
+            &format!("ARCHIVE_PAUSED_SSIDS='[\"Example Mobile\"]'\nWIFI_PAUSED_SCAN_INTERVAL_SECS={value}\n"),
+        );
+        let output = fixture.apply_priorities();
+        assert_private_error(
+            &output,
+            &["Example Mobile", "fictional-password", "PRIVATE-SENTINEL"],
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("WIFI_PAUSED_SCAN_INTERVAL_SECS"),
+            "{}",
+            describe(&output)
+        );
+        assert_eq!(fs::read_to_string(&fixture.supplicant).unwrap(), original);
+    }
+}
+
+fn without_owned_wifi_settings(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("priority=") && !line.starts_with("bgscan=")
+        })
+        .collect()
+}
+
+fn profile_settings<'a>(text: &'a str, ssid: &str) -> Vec<&'a str> {
+    let blocks: Vec<_> = text
+        .split("network={")
+        .skip(1)
+        .filter(|block| {
+            block.lines().any(|line| {
+                line.trim() == format!("ssid=\"{ssid}\"")
+                    || line.trim() == format!("ssid=P\"{ssid}\"")
+            })
+        })
+        .collect();
+    assert_eq!(blocks.len(), 1);
+    blocks[0]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("priority=") || line.starts_with("bgscan="))
+        .collect()
 }
 
 #[test]

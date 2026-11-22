@@ -57,6 +57,7 @@ pub struct NetworkConfig {
     pub paused_ssids: Vec<String>,
     pub wifi_default_priority: i32,
     pub wifi_paused_priority: i32,
+    pub wifi_paused_scan_interval: Duration,
     pub check_timeout: Duration,
     pub check_interval: Duration,
 }
@@ -67,9 +68,28 @@ impl Default for NetworkConfig {
             paused_ssids: Vec::new(),
             wifi_default_priority: 0,
             wifi_paused_priority: -10,
+            wifi_paused_scan_interval: Duration::from_secs(60),
             check_timeout: Duration::from_secs(10),
             check_interval: Duration::from_secs(5),
         }
+    }
+}
+
+impl NetworkConfig {
+    pub(crate) fn validate_wifi_preferences(&self) -> Result<()> {
+        if self.wifi_paused_priority >= self.wifi_default_priority {
+            return Err(Error::new(
+                "WIFI_PAUSED_PRIORITY must be lower than WIFI_DEFAULT_PRIORITY",
+            ));
+        }
+        let seconds = self.wifi_paused_scan_interval.as_secs();
+        if seconds == 0 || seconds > i32::MAX as u64 {
+            return Err(Error::new(format!(
+                "WIFI_PAUSED_SCAN_INTERVAL_SECS must be between 1 and {}",
+                i32::MAX
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -136,9 +156,8 @@ impl Config {
         if self.archive.system == "rclone" && self.archive.rclone_drive.trim().is_empty() {
             warnings.push("ARCHIVE_SYSTEM=rclone requires RCLONE_DRIVE".to_string());
         }
-        if self.archive.network.wifi_paused_priority >= self.archive.network.wifi_default_priority {
-            warnings
-                .push("WIFI_PAUSED_PRIORITY must be lower than WIFI_DEFAULT_PRIORITY".to_string());
+        if let Err(error) = self.archive.network.validate_wifi_preferences() {
+            warnings.push(error.to_string());
         }
         warnings
     }
@@ -311,6 +330,13 @@ fn load_values(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
                 .parse()
                 .map_err(|error| Error::new(format!("invalid {key}: {error}")))?;
         }
+    }
+
+    if let Some(value) = get("WIFI_PAUSED_SCAN_INTERVAL_SECS") {
+        let seconds = value.parse().map_err(|error| {
+            Error::new(format!("invalid WIFI_PAUSED_SCAN_INTERVAL_SECS: {error}"))
+        })?;
+        archive.network.wifi_paused_scan_interval = Duration::from_secs(seconds);
     }
 
     archive.archive_recent = get_bool(&get, "ARCHIVE_RECENTCLIPS", archive.archive_recent)?;
@@ -562,6 +588,39 @@ BACKINGFILES_PATH=/mnt/backing
                     .to_string()
                     .contains(key));
             }
+        }
+    }
+
+    #[test]
+    fn paused_wifi_scan_interval_requires_positive_supplicant_seconds() {
+        assert_eq!(
+            NetworkConfig::default().wifi_paused_scan_interval,
+            Duration::from_secs(60)
+        );
+        for seconds in [1, 17, i32::MAX as u64] {
+            let values =
+                HashMap::from([("WIFI_PAUSED_SCAN_INTERVAL_SECS".into(), seconds.to_string())]);
+            let config = load_from_file_values(&values).unwrap();
+            assert!(config.warnings().is_empty());
+            assert_eq!(
+                config.archive.network.wifi_paused_scan_interval,
+                Duration::from_secs(seconds)
+            );
+        }
+        for seconds in [0, i32::MAX as u64 + 1] {
+            let values =
+                HashMap::from([("WIFI_PAUSED_SCAN_INTERVAL_SECS".into(), seconds.to_string())]);
+            assert!(load_from_file_values(&values)
+                .unwrap()
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("WIFI_PAUSED_SCAN_INTERVAL_SECS")));
+        }
+        for value in ["-1", "PRIVATE-SENTINEL", "18446744073709551616"] {
+            let values = HashMap::from([("WIFI_PAUSED_SCAN_INTERVAL_SECS".into(), value.into())]);
+            let error = load_from_file_values(&values).unwrap_err().to_string();
+            assert!(error.contains("WIFI_PAUSED_SCAN_INTERVAL_SECS"));
+            assert!(!error.contains("PRIVATE-SENTINEL"));
         }
     }
 

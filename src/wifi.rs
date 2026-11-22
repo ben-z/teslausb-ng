@@ -14,13 +14,9 @@ pub fn apply_priorities(path: &Path, config: &NetworkConfig) -> Result<usize> {
 }
 
 // Netplan emits one assignment per line and escapes newlines inside values.
-// Treat authentication settings as opaque text: only SSID and priority matter here.
+// Authentication settings are opaque; this command owns priority and bgscan.
 fn prioritize(input: &str, config: &NetworkConfig) -> Result<(String, usize)> {
-    if config.wifi_paused_priority >= config.wifi_default_priority {
-        return Err(Error::new(
-            "WIFI_PAUSED_PRIORITY must be lower than WIFI_DEFAULT_PRIORITY",
-        ));
-    }
+    config.validate_wifi_preferences()?;
     let mut output = String::with_capacity(input.len());
     let mut in_network = false;
     let mut ssid = None;
@@ -53,6 +49,12 @@ fn prioritize(input: &str, config: &NetworkConfig) -> Result<(String, usize)> {
                 config.wifi_default_priority
             };
             output.push_str(&format!("    priority={priority}\n"));
+            if paused {
+                let seconds = config.wifi_paused_scan_interval.as_secs();
+                // Zero disables signal monitoring; equal intervals keep discovery
+                // running even when the paused hotspot has a strong signal.
+                output.push_str(&format!("    bgscan=\"simple:{seconds}:0:{seconds}\"\n"));
+            }
             count += 1;
             in_network = false;
         } else if in_network {
@@ -67,6 +69,13 @@ fn prioritize(input: &str, config: &NetworkConfig) -> Result<(String, usize)> {
                 priority
                     .parse::<i32>()
                     .map_err(|_| Error::new("invalid existing Wi-Fi priority"))?;
+                continue;
+            } else if let Some(bgscan) = value.strip_prefix("bgscan=") {
+                if !bgscan.starts_with('"') || !bgscan.ends_with('"') || bgscan.len() < 2 {
+                    return Err(Error::new(
+                        "expected a quoted Wi-Fi background scan setting",
+                    ));
+                }
                 continue;
             }
         }
@@ -163,7 +172,7 @@ mod tests {
                 .replacen("}\nnetwork", "    priority=100\n}\nnetwork", 1)
                 .trim_end_matches("}\n")
                 .to_string()
-                + "    priority=0\n}\n"
+                + "    priority=0\n    bgscan=\"simple:60:0:60\"\n}\n"
         );
         assert_eq!(prioritize(&output, &policy()).unwrap(), (output, 2));
     }
@@ -174,7 +183,7 @@ mod tests {
             "network={\n ssid=P\"Caf\\303\\251 \\\"#{}\\\\\"\n psk=\"fictional-password\"\n}\n";
         let (output, count) = prioritize(input, &policy()).unwrap();
         assert_eq!(count, 1);
-        assert!(output.ends_with("    priority=0\n}\n"));
+        assert!(output.ends_with("    priority=0\n    bgscan=\"simple:60:0:60\"\n}\n"));
         assert_eq!(
             decode_ssid(r#"P"s\040t\tl\nr\rb\bf\fv\v""#).unwrap(),
             b"s t\tl\nr\rb\x08f\x0cv\x0b"
@@ -202,7 +211,9 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(output.matches("priority=0").count(), 1);
         assert_eq!(output.matches("priority=100").count(), 1);
-        assert!(output.starts_with("network={\nssid=\"Example\\040Mobile\"\n    priority=0\n}"));
+        assert!(output.starts_with(
+            "network={\nssid=\"Example\\040Mobile\"\n    priority=0\n    bgscan=\"simple:60:0:60\"\n}"
+        ));
     }
 
     #[test]
@@ -217,6 +228,7 @@ mod tests {
             "network={\nssid=P\"PRIVATE-SENTINEL\"\nssid=P\"second\"\n}\n",
             "network={\nssid=PRIVATE-SENTINEL\n}\n",
             "network={\nssid=P\"PRIVATE-SENTINEL\"\npriority=PRIVATE-SENTINEL\n}\n",
+            "network={\nssid=P\"PRIVATE-SENTINEL\"\nbgscan=PRIVATE-SENTINEL\n}\n",
         ] {
             let error = prioritize(input, &policy()).unwrap_err().to_string();
             assert!(!error.contains("PRIVATE-SENTINEL"));
@@ -239,5 +251,12 @@ mod tests {
         let mut config = policy();
         config.wifi_paused_priority = config.wifi_default_priority;
         assert!(prioritize("network={\nssid=P\"Example\"\n}\n", &config).is_err());
+        for seconds in [0, i32::MAX as u64 + 1] {
+            let config = NetworkConfig {
+                wifi_paused_scan_interval: std::time::Duration::from_secs(seconds),
+                ..policy()
+            };
+            assert!(prioritize("network={\nssid=P\"Example\"\n}\n", &config).is_err());
+        }
     }
 }
